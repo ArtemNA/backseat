@@ -1,0 +1,31 @@
+# Local only: agent rules, plans, notes, everything personal
+/CLAUDE.md
+/CLAUDE.local.md
+/AGENTS.md
+/GEMINI.md
+/PLAN.md
+/PROMPT.md
+/COMMITS.md
+/ORCHESTRATION.md
+/AGENT_TEMPLATE.md
+/tasks/
+/KNOWLEDGE/
+/reference/
+/.claude/
+
+# Project-local tools, clones, scratch output
+/.toolchain/
+/vendor/
+/.scratch/
+/target/
+/dist/
+node_modules/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local research and plan
+/docs/
