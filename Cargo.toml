@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/media", "crates/host", "crates/viewer"]
+exclude = ["probes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+gst = { package = "gstreamer", version = "0.25" }
+gst-app = { package = "gstreamer-app", version = "0.25" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.25" }
+gst-sdp = { package = "gstreamer-sdp", version = "0.25" }
+gst-rtp = { package = "gstreamer-rtp", version = "0.25" }
+media = { path = "crates/media" }
