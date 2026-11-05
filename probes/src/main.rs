@@ -165,6 +165,13 @@ impl LossProxy {
         }
         *slot = Some(addr);
         parts[5] = relay.local_addr().unwrap().port().to_string();
+        drop(slot);
+        // The relay runs on the host machine: a remote viewer's candidate must point there.
+        if let From_::Viewer = from {
+            if let Some(h) = *self.host_addr.lock().unwrap() {
+                parts[4] = h.ip().to_string();
+            }
+        }
         Some(parts.join(" "))
     }
 }
@@ -348,8 +355,8 @@ fn add_ice_forward(from: &gst::Element, to: &gst::Element, relay: Option<(Arc<Lo
 enum Peer {
     /// Viewer in this process, optionally behind the lossy relay.
     Local(gst::Element, Option<Arc<LossProxy>>),
-    /// Viewer in another process, reached over the signaling link.
-    Remote(Arc<net::Link>),
+    /// Viewer in another process, reached over the signaling link, optionally lossy.
+    Remote(Arc<net::Link>, Option<Arc<LossProxy>>),
     /// Offer is never answered.
     Stuck,
 }
@@ -358,7 +365,7 @@ enum Peer {
 fn add_host_branch(a: &Args, pipeline: &gst::Pipeline, index: usize, peer: Peer) -> gst::Element {
     let (viewer, relay, link) = match peer {
         Peer::Local(v, r) => (Some(v), r, None),
-        Peer::Remote(l) => (None, None, Some(l)),
+        Peer::Remote(l, r) => (None, r, Some(l)),
         Peer::Stuck => (None, None, None),
     };
     let queue = gst::ElementFactory::make("queue")
@@ -380,13 +387,19 @@ fn add_host_branch(a: &Args, pipeline: &gst::Pipeline, index: usize, peer: Peer)
     let webrtc = make_webrtc(format!("host-webrtc-{index}"));
     if let Some(viewer) = &viewer {
         add_ice_forward(&webrtc, viewer, relay.clone().map(|r| (r, From_::Host)));
-        add_ice_forward(viewer, &webrtc, relay.map(|r| (r, From_::Viewer)));
+        add_ice_forward(viewer, &webrtc, relay.clone().map(|r| (r, From_::Viewer)));
     }
     if let Some(link) = &link {
-        let link = link.clone();
+        let (link, relay) = (link.clone(), relay.clone());
         webrtc.connect("on-ice-candidate", false, move |values| {
             let mline = values[1].get::<u32>().unwrap();
-            let candidate = values[2].get::<String>().unwrap();
+            let mut candidate = values[2].get::<String>().unwrap();
+            if let Some(r) = &relay {
+                match r.rewrite(From_::Host, &candidate) {
+                    Some(c) => candidate = c,
+                    None => return None,
+                }
+            }
             link.send("ice", &format!("{mline} {candidate}"));
             None
         });
@@ -761,9 +774,10 @@ fn run_host(a: &Args, peer: &str) {
     let stream = std::net::TcpStream::connect(peer).expect("cannot reach the viewer");
     let (link, mut reader) = net::Link::new(stream);
     let link = Arc::new(link);
-    let branch = add_host_branch(a, &host, 0, Peer::Remote(link.clone()));
+    let proxy = (a.loss_pct > 0.0).then(|| LossProxy::start(a.loss_pct));
+    let branch = add_host_branch(a, &host, 0, Peer::Remote(link.clone(), proxy.clone()));
 
-    let (webrtc, host_weak, link2) = (branch.clone(), host.downgrade(), link.clone());
+    let (webrtc, host_weak, link2, relay) = (branch.clone(), host.downgrade(), link.clone(), proxy.clone());
     std::thread::spawn(move || {
         while let Some((kind, payload)) = net::recv(&mut reader) {
             match kind.as_str() {
@@ -771,7 +785,16 @@ fn run_host(a: &Args, peer: &str) {
                     "set-remote-description",
                     &[&sdp(WebRTCSDPType::Answer, &payload), &None::<gst::Promise>],
                 ),
-                "ice" => add_remote_ice(&webrtc, &payload),
+                "ice" => match &relay {
+                    None => add_remote_ice(&webrtc, &payload),
+                    Some(r) => {
+                        if let Some((mline, cand)) = payload.split_once(' ') {
+                            if let Some(c) = r.rewrite(From_::Viewer, cand) {
+                                add_remote_ice(&webrtc, &format!("{mline} {c}"));
+                            }
+                        }
+                    }
+                },
                 "ping" => {
                     let now = host_weak.upgrade().and_then(|h| host_running(&h)).unwrap_or(0);
                     link2.send("pong", &format!("{payload} {now}"));
@@ -786,6 +809,10 @@ fn run_host(a: &Args, peer: &str) {
     std::thread::sleep(Duration::from_secs(a.seconds));
     print_host(&stats, begin);
     print_outbound(&branch);
+    if let Some(p) = &proxy {
+        let (d, f) = (p.dropped.load(Ordering::Relaxed), p.forwarded.load(Ordering::Relaxed));
+        println!("proxy: dropped {d}, forwarded {f}, loss {:.2}%", d as f64 * 100.0 / (d + f).max(1) as f64);
+    }
     link.send("bye", "");
     std::thread::sleep(Duration::from_millis(500));
     host.set_state(gst::State::Null).ok();
