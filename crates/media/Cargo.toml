@@ -11,7 +11,8 @@ gst-webrtc.workspace = true
 gst-sdp.workspace = true
 gst-rtp.workspace = true
 protocol = { path = "../protocol" }
-tungstenite = "0.30"
+# wss:// for a signaling server behind TLS, using the system's own TLS stack.
+tungstenite = { version = "0.30", features = ["native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

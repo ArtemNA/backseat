@@ -9,6 +9,15 @@ use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
+/// The TCP socket under a plain or TLS WebSocket stream.
+fn tcp(s: &mut MaybeTlsStream<std::net::TcpStream>) -> Option<&mut std::net::TcpStream> {
+    match s {
+        MaybeTlsStream::Plain(t) => Some(t),
+        MaybeTlsStream::NativeTls(t) => Some(t.get_mut()),
+        _ => None,
+    }
+}
+
 pub struct ServerClient {
     out: mpsc::Sender<ClientMsg>,
     pub id: PeerId,
@@ -19,7 +28,7 @@ impl ServerClient {
     /// Connects, joins the room and returns the client plus the stream of server messages.
     pub fn join(url: &str, room: &str, name: &str) -> Result<(Arc<Self>, mpsc::Receiver<ServerMsg>), String> {
         let (mut ws, _) = tungstenite::connect(url).map_err(|e| format!("cannot reach server {url}: {e}"))?;
-        if let MaybeTlsStream::Plain(s) = ws.get_mut() {
+        if let Some(s) = tcp(ws.get_mut()) {
             s.set_nodelay(true).ok();
         }
         let join = ClientMsg::Join { room: room.into(), name: name.into() };
@@ -36,7 +45,7 @@ impl ServerClient {
         };
         // Outgoing messages wait for the read timeout. A long timeout delays our pings one
         // way only, which skews the clock estimate (10 ms gave 0 ms "latency" in stage 2).
-        if let MaybeTlsStream::Plain(s) = ws.get_mut() {
+        if let Some(s) = tcp(ws.get_mut()) {
             s.set_read_timeout(Some(Duration::from_millis(1))).ok();
         }
 
