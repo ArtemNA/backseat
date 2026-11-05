@@ -13,16 +13,38 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: viewer (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] [--watch STREAMER] | \
---listen 0.0.0.0:7700) [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--decoder NAME] \
+--listen 0.0.0.0:7700) [--stun stun://HOST:PORT|none] [--turn turn://USER:PASS@HOST:PORT] [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--decoder NAME] \
 [--seconds 0] [--report-secs 5]";
+
+/// Test only: withholds our ICE candidates, so together with ignoring the host's no path
+/// can exist and the failure report can be checked.
+struct WithoutIce(Arc<dyn Outbox>);
+
+impl Outbox for WithoutIce {
+    fn send(&self, kind: &str, payload: &str) {
+        if kind != "ice" {
+            self.0.send(kind, payload);
+        }
+    }
+}
 
 fn main() {
     let mut listen = "0.0.0.0:7700".to_string();
     let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
     let mut subscribe = None;
     let mut never_answer = false;
+    let mut no_ice = false;
     let mut cfg =
-        ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true, headless: false, loss_pct: 0.0 };
+        ViewerConfig {
+            latency_ms: 40,
+            audio: true,
+            wait_keyframe: false,
+            decoder: None,
+            audio_sync: true,
+            headless: false,
+            loss_pct: 0.0,
+            ice: media::config::IceConfig::default(),
+        };
     let (mut seconds, mut report_secs) = (0u64, 5u64);
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -33,6 +55,8 @@ fn main() {
             "--audio-nosync" => cfg.audio_sync = false,
             // Test only: subscribes but never answers the offer, like a stuck peer.
             "--debug-never-answer" => never_answer = true,
+            // Test only: ignore the host's ICE candidates, so no path can be found.
+            "--debug-no-ice" => no_ice = true,
             // Test only: no window and no decoding, so the process does not touch the GPU.
             "--headless" => cfg.headless = true,
             key => {
@@ -59,6 +83,14 @@ fn main() {
                     }
                     "--watch" => {
                         watch = Some(val.clone());
+                        true
+                    }
+                    "--stun" => {
+                        cfg.ice.stun = (val != "none").then(|| val.clone());
+                        true
+                    }
+                    "--turn" => {
+                        cfg.ice.turn = Some(val.clone());
                         true
                     }
                     "--latency" => val.parse().map(|v| cfg.latency_ms = v).is_ok(),
@@ -152,6 +184,7 @@ fn main() {
         }
     };
     let clock = HostClock::default();
+    let link: Arc<dyn Outbox> = if no_ice { Arc::new(WithoutIce(link)) } else { link };
 
     let viewer = match Viewer::new(cfg, clock.clone(), link.clone()) {
         Ok(v) => Arc::new(v),
@@ -184,6 +217,9 @@ fn main() {
                     break;
                 }
                 if never_answer && kind == "offer" {
+                    continue;
+                }
+                if no_ice && kind == "ice" {
                     continue;
                 }
                 viewer.on_message(&link, &clock, &kind, &payload);
@@ -252,6 +288,9 @@ fn main() {
         }
         last_frames = frames;
         last_t = Instant::now();
+        if viewer.ice_failed.load(Ordering::SeqCst) {
+            break;
+        }
         if gone.load(Ordering::SeqCst) || viewer.window_closed() || (seconds > 0 && started.elapsed().as_secs() >= seconds) {
             break;
         }

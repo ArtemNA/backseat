@@ -35,6 +35,8 @@ pub struct Viewer {
     render: Arc<crate::present::RenderStats>,
     /// Test-only loss on the path from the host.
     pub relay: Option<Arc<crate::netsim::LossRelay>>,
+    /// Set when no direct connection could be made.
+    pub ice_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Receive-side RTP counters for video, since the session started.
@@ -61,6 +63,12 @@ impl Viewer {
         crate::drain_bus(&pipeline, "viewer");
         let webrtc = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
+        crate::ice::configure(&webrtc, &cfg.ice);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = failed.clone();
+        crate::ice::watch(&webrtc, "the streamer".into(), cfg.ice.turn.is_some(), move || {
+            f.store(true, Ordering::SeqCst)
+        });
         webrtc.set_property("latency", cfg.latency_ms);
         pipeline.add(&webrtc).unwrap();
 
@@ -135,6 +143,7 @@ impl Viewer {
             #[cfg(windows)]
             render: renderer.map(|r| r.stats).unwrap_or_default(),
             relay,
+            ice_failed: failed,
         })
     }
 

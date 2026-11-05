@@ -371,6 +371,8 @@ impl Host {
             .build()
             .unwrap();
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
+        crate::ice::configure(&webrtc, &self.cfg.ice);
+        crate::ice::watch(&webrtc, format!("viewer {id}"), self.cfg.ice.turn.is_some(), || {});
 
         let l = link.clone();
         webrtc.connect("on-ice-candidate", false, move |v| {

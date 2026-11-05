@@ -2,7 +2,7 @@
 //! signaling server and serves every viewer that subscribes, or connects directly to one
 //! viewer that listens on IP:PORT.
 
-use media::config::{Codec, HostConfig, Source, VideoMode};
+use media::config::{Codec, HostConfig, IceConfig, Source, VideoMode};
 use media::host::Host;
 use media::server_client::ServerClient;
 use media::signal::{self, Link, Outbox};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: host (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] | --peer IP:PORT) \
 [--mode 1080p60] [--kbit 20000] [--codec h264|h265] [--keyframe-secs 2] [--source capture|bars|noise] \
-[--monitor -1] [--no-audio] [--seconds 0] [--report-secs 5]";
+[--monitor -1] [--no-audio] [--stun stun://HOST:PORT|none] [--turn turn://USER:PASS@HOST:PORT] [--seconds 0] [--report-secs 5]";
 
 enum Target {
     Direct(String),
@@ -38,6 +38,7 @@ fn parse() -> Result<Args, String> {
         keyframe_secs: 2,
         audio: true,
         source: Source::Capture { monitor: -1 },
+        ice: IceConfig::default(),
     };
     let (mut seconds, mut report_secs, mut monitor) = (0, 5, -1);
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -56,6 +57,8 @@ fn parse() -> Result<Args, String> {
             "--server" => server = Some(val.clone()),
             "--room" => room = val.clone(),
             "--name" => name = val.clone(),
+            "--stun" => cfg.ice.stun = (val != "none").then(|| val.clone()),
+            "--turn" => cfg.ice.turn = Some(val.clone()),
             "--mode" => cfg.mode = VideoMode::parse(val)?,
             "--kbit" => cfg.kbit = num(val)? as u32,
             "--codec" => cfg.codec = Codec::parse(val)?,

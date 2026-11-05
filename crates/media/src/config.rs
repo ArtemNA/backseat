@@ -64,6 +64,21 @@ pub enum Source {
     Noise,
 }
 
+/// How peers find a path to each other.
+#[derive(Clone, Debug)]
+pub struct IceConfig {
+    /// Public STUN server, as stun://host:port, or None for local candidates only.
+    pub stun: Option<String>,
+    /// The user's own TURN server, as turn(s)://user:pass@host:port. Never logged.
+    pub turn: Option<String>,
+}
+
+impl Default for IceConfig {
+    fn default() -> Self {
+        Self { stun: Some("stun://stun.l.google.com:19302".into()), turn: None }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HostConfig {
     pub mode: VideoMode,
@@ -73,6 +88,7 @@ pub struct HostConfig {
     pub keyframe_secs: u32,
     pub audio: bool,
     pub source: Source,
+    pub ice: IceConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -90,4 +106,5 @@ pub struct ViewerConfig {
     pub headless: bool,
     /// Tests only: drop this share of the host's RTP packets, in percent.
     pub loss_pct: f64,
+    pub ice: IceConfig,
 }
