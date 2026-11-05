@@ -4,7 +4,37 @@
 
 use gst::prelude::*;
 use gst_webrtc::{WebRTCRTPTransceiver, WebRTCRTPTransceiverDirection, WebRTCSDPType, WebRTCSessionDescription};
+mod net;
+#[cfg(windows)]
 mod swapchain;
+
+/// Stand-in so the shared viewer code compiles where the own swapchain does not exist.
+#[cfg(not(windows))]
+mod swapchain {
+    use std::sync::{mpsc, Arc};
+    pub const WIDTH: u32 = 1920;
+    pub const HEIGHT: u32 = 1080;
+    pub type OnPresent = Arc<dyn Fn(Option<u64>) + Send + Sync>;
+    pub struct Renderer {
+        pub context: gst::Context,
+        pub sinks: mpsc::Sender<(gst_app::AppSink, OnPresent)>,
+        pub tearing: bool,
+    }
+    pub fn start() -> Renderer {
+        panic!("--display own is Windows only")
+    }
+}
+
+/// Host running time in ns, as seen by the viewer. None until the clock is known.
+type HostClock = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+fn decoder_name(codec: &str) -> String {
+    if cfg!(target_os = "macos") {
+        "vtdec_hw".into()
+    } else {
+        format!("d3d11{codec}dec")
+    }
+}
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
@@ -31,8 +61,12 @@ struct Args {
     delay_ms: u64,
     loss_pct: f64,
     wait_keyframe: bool,
-    /// "fake", "d3d11" or "d3d12": the sink of viewer 0. Other viewers always use fakesink.
+    /// "fake", "d3d11", "d3d12" or "own": the sink of viewer 0. Other viewers use fakesink.
     display: String,
+    /// "local" (host and viewers in one process), "host" or "viewer".
+    role: String,
+    peer: Option<String>,
+    listen: Option<String>,
 }
 
 /// Lossy relay between one host branch and viewer 0. Drops RTP only (host to viewer):
@@ -151,6 +185,9 @@ fn parse_args() -> Args {
         loss_pct: 0.0,
         wait_keyframe: false,
         display: "fake".into(),
+        role: "local".into(),
+        peer: None,
+        listen: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -182,6 +219,9 @@ fn parse_args() -> Args {
             "--delay-ms" => a.delay_ms = val.parse().unwrap(),
             "--loss" => a.loss_pct = val.parse().unwrap(),
             "--display" => a.display = val.clone(),
+            "--role" => a.role = val.clone(),
+            "--peer" => a.peer = Some(val.clone()),
+            "--listen" => a.listen = Some(val.clone()),
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -208,6 +248,11 @@ fn host_pipeline(a: &Args, stats: Arc<HostStats>) -> gst::Pipeline {
         ),
         "snow" => format!(
             "videotestsrc is-live=true pattern=snow ! video/x-raw,format=NV12,width={},height={},framerate={}/1 ! d3d11upload",
+            a.width, a.height, a.fps
+        ),
+        // Known colours and layout, moving: checks colour order and geometry by eye.
+        "bars" => format!(
+            "videotestsrc is-live=true pattern=smpte horizontal-speed=4 ! video/x-raw,format=NV12,width={},height={},framerate={}/1 ! d3d11upload",
             a.width, a.height, a.fps
         ),
         other => panic!("unknown source {other}"),
@@ -296,14 +341,22 @@ fn add_ice_forward(from: &gst::Element, to: &gst::Element, relay: Option<(Arc<Lo
     });
 }
 
-/// Adds one host branch. With `viewer` absent the offer is never answered: a stuck peer.
-fn add_host_branch(
-    a: &Args,
-    pipeline: &gst::Pipeline,
-    index: usize,
-    viewer: Option<gst::Element>,
-    relay: Option<Arc<LossProxy>>,
-) -> gst::Element {
+enum Peer {
+    /// Viewer in this process, optionally behind the lossy relay.
+    Local(gst::Element, Option<Arc<LossProxy>>),
+    /// Viewer in another process, reached over the signaling link.
+    Remote(Arc<net::Link>),
+    /// Offer is never answered.
+    Stuck,
+}
+
+/// Adds one host branch for one viewer.
+fn add_host_branch(a: &Args, pipeline: &gst::Pipeline, index: usize, peer: Peer) -> gst::Element {
+    let (viewer, relay, link) = match peer {
+        Peer::Local(v, r) => (Some(v), r, None),
+        Peer::Remote(l) => (None, None, Some(l)),
+        Peer::Stuck => (None, None, None),
+    };
     let queue = gst::ElementFactory::make("queue")
         .property("max-size-buffers", 4u32)
         .property("max-size-bytes", 0u32)
@@ -325,8 +378,18 @@ fn add_host_branch(
         add_ice_forward(&webrtc, viewer, relay.clone().map(|r| (r, From_::Host)));
         add_ice_forward(viewer, &webrtc, relay.map(|r| (r, From_::Viewer)));
     }
+    if let Some(link) = &link {
+        let link = link.clone();
+        webrtc.connect("on-ice-candidate", false, move |values| {
+            let mline = values[1].get::<u32>().unwrap();
+            let candidate = values[2].get::<String>().unwrap();
+            link.send("ice", &format!("{mline} {candidate}"));
+            None
+        });
+    }
 
     let viewer_for_nego = viewer.clone();
+    let link_for_nego = link.clone();
     webrtc.connect("on-negotiation-needed", false, move |values| {
         let host = values[0].get::<gst::Element>().unwrap();
         let t = host.emit_by_name::<Option<WebRTCRTPTransceiver>>("get-transceiver", &[&0i32]);
@@ -334,6 +397,7 @@ fn add_host_branch(
             t.set_property("do-nack", true);
         }
         let viewer = viewer_for_nego.clone();
+        let link = link_for_nego.clone();
         let host2 = host.clone();
         let promise = gst::Promise::with_change_func(move |reply| {
             let reply = reply.expect("offer reply").expect("offer structure");
@@ -341,6 +405,9 @@ fn add_host_branch(
             host2.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
             if let Some(viewer) = viewer {
                 answer(&host2, &viewer, &offer);
+            }
+            if let Some(link) = link {
+                link.send("offer", &offer.sdp().as_text().unwrap());
             }
         });
         host.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
@@ -378,6 +445,7 @@ fn answer(host: &gst::Element, viewer: &gst::Element, offer: &WebRTCSessionDescr
 struct ViewerStats {
     intervals_ns: Vec<u64>,
     latency_ns: Vec<u64>,
+    before_decoder_ns: Vec<u64>,
     last: Option<Instant>,
 }
 
@@ -389,7 +457,7 @@ struct Viewer {
     present_latency: Arc<Mutex<Vec<u64>>>,
 }
 
-fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
+fn build_viewer(a: &Args, index: usize, clock: HostClock) -> Viewer {
     let pipeline = gst::Pipeline::with_name(&format!("viewer-{index}"));
     let webrtc = make_webrtc(format!("viewer-webrtc-{index}"));
     webrtc.set_property("latency", a.latency_ms);
@@ -425,7 +493,7 @@ fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
         None
     };
     let pipeline_weak = pipeline.downgrade();
-    let host_weak = host.downgrade();
+    let host_weak = clock;
     let stats2 = stats.clone();
     let started = Instant::now();
     webrtc.connect_pad_added(move |_, pad| {
@@ -439,7 +507,7 @@ fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
             depay.set_property("wait-for-keyframe", true);
         }
         let parse = make(&format!("{codec}parse"));
-        let dec = make(&format!("d3d11{codec}dec"));
+        let dec = make(&decoder_name(&codec));
         let sink = match (index, display.as_str()) {
             (0, "d3d11") => {
                 let s = gst::ElementFactory::make("d3d11videosink")
@@ -502,10 +570,18 @@ fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
         let by_pts_in = by_pts.clone();
         let by_pts_present = by_pts.clone();
         let host_weak_present = host_weak.clone();
+        let (clock_net, stats_net) = (host_weak.clone(), stats2.clone());
         depay.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+                let rtp_ns = last_rtp_ns.load(Ordering::Relaxed);
+                // Latency before the decoder: network, jitterbuffer and depayloading only.
+                if Instant::now().duration_since(started) > WARMUP {
+                    if let Some(now) = clock_net() {
+                        stats_net.lock().unwrap().before_decoder_ns.push(now.saturating_sub(rtp_ns));
+                    }
+                }
                 let mut q = by_pts_in.lock().unwrap();
-                q.push_back((pts.nseconds(), last_rtp_ns.load(Ordering::Relaxed)));
+                q.push_back((pts.nseconds(), rtp_ns));
                 if q.len() > 600 {
                     q.pop_front();
                 }
@@ -527,8 +603,7 @@ fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
                 if let Some(last) = s.last {
                     s.intervals_ns.push(now.duration_since(last).as_nanos() as u64);
                 }
-                if let (Some(sent), Some(host)) = (sent, host_weak.upgrade()) {
-                    let running = host.clock().unwrap().time().nseconds() - host.base_time().unwrap().nseconds();
+                if let (Some(sent), Some(running)) = (sent, host_weak()) {
                     s.latency_ns.push(running.saturating_sub(sent));
                 }
             }
@@ -552,8 +627,7 @@ fn build_viewer(a: &Args, index: usize, host: &gst::Pipeline) -> Viewer {
                     presents.lock().unwrap().push(now.duration_since(prev).as_nanos() as u64);
                 }
                 let sent = pts.and_then(|p| by_pts.lock().unwrap().iter().rev().find(|(k, _)| *k == p).map(|(_, v)| *v));
-                if let (Some(sent), Some(host)) = (sent, host_weak.upgrade()) {
-                    let running = host.clock().unwrap().time().nseconds() - host.base_time().unwrap().nseconds();
+                if let (Some(sent), Some(running)) = (sent, host_weak()) {
                     lat.lock().unwrap().push(running.saturating_sub(sent));
                 }
             });
@@ -611,10 +685,264 @@ fn field_u64(s: &gst::StructureRef, name: &str) -> i64 {
         .unwrap_or(-1)
 }
 
+fn host_running(host: &gst::Pipeline) -> Option<u64> {
+    Some(host.clock()?.time().nseconds() - host.base_time()?.nseconds())
+}
+
+fn sdp(kind: WebRTCSDPType, text: &str) -> WebRTCSessionDescription {
+    WebRTCSessionDescription::new(kind, gst_sdp::SDPMessage::parse_buffer(text.as_bytes()).unwrap())
+}
+
+fn add_remote_ice(webrtc: &gst::Element, payload: &str) {
+    if let Some((mline, cand)) = payload.split_once(' ') {
+        webrtc.emit_by_name::<()>("add-ice-candidate", &[&mline.parse::<u32>().unwrap(), &cand.to_string()]);
+    }
+}
+
+fn print_host(stats: &HostStats, begin: (u64, u64, u64, Instant)) {
+    let elapsed = begin.3.elapsed().as_secs_f64();
+    let frames = stats.frames.load(Ordering::Relaxed) - begin.0;
+    let bytes = stats.bytes.load(Ordering::Relaxed) - begin.1;
+    println!(
+        "host: {:.1} fps, {:.2} Mbit/s, key frames {}, key requests seen {}",
+        frames as f64 / elapsed,
+        bytes as f64 * 8.0 / elapsed / 1e6,
+        stats.key_frames.load(Ordering::Relaxed) - begin.2,
+        stats.key_requests.load(Ordering::Relaxed),
+    );
+}
+
+fn snapshot(s: &HostStats) -> (u64, u64, u64, Instant) {
+    (
+        s.frames.load(Ordering::Relaxed),
+        s.bytes.load(Ordering::Relaxed),
+        s.key_frames.load(Ordering::Relaxed),
+        Instant::now(),
+    )
+}
+
+fn print_outbound(branch: &gst::Element) {
+    for st in get_stats(branch) {
+        if st.has_field("packets-sent") && st.has_field("nack-count") {
+            println!(
+                "  outbound: sent {} nack {} pli {}",
+                field_u64(&st, "packets-sent"),
+                field_u64(&st, "nack-count"),
+                field_u64(&st, "pli-count"),
+            );
+        }
+        if st.has_field("round-trip-time") {
+            println!(
+                "  remote-inbound: lost {} rtt ms {:.2} jitter ms {:.2}",
+                field_u64(&st, "packets-lost"),
+                st.get::<f64>("round-trip-time").unwrap_or(f64::NAN) * 1000.0,
+                st.get::<f64>("jitter").unwrap_or(f64::NAN) * 1000.0,
+            );
+        }
+    }
+}
+
+/// Host process: connects to a listening viewer and streams to it.
+fn run_host(a: &Args, peer: &str) {
+    let stats = Arc::new(HostStats::default());
+    let host = host_pipeline(a, stats.clone());
+    let failed = Arc::new(AtomicBool::new(false));
+    watch_bus(&host, "host".into(), failed.clone());
+    host.set_state(gst::State::Playing).unwrap();
+
+    let stream = std::net::TcpStream::connect(peer).expect("cannot reach the viewer");
+    let (link, mut reader) = net::Link::new(stream);
+    let link = Arc::new(link);
+    let branch = add_host_branch(a, &host, 0, Peer::Remote(link.clone()));
+
+    let (webrtc, host_weak, link2) = (branch.clone(), host.downgrade(), link.clone());
+    std::thread::spawn(move || {
+        while let Some((kind, payload)) = net::recv(&mut reader) {
+            match kind.as_str() {
+                "answer" => webrtc.emit_by_name::<()>(
+                    "set-remote-description",
+                    &[&sdp(WebRTCSDPType::Answer, &payload), &None::<gst::Promise>],
+                ),
+                "ice" => add_remote_ice(&webrtc, &payload),
+                "ping" => {
+                    let now = host_weak.upgrade().and_then(|h| host_running(&h)).unwrap_or(0);
+                    link2.send("pong", &format!("{payload} {now}"));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    std::thread::sleep(WARMUP);
+    let begin = snapshot(&stats);
+    std::thread::sleep(Duration::from_secs(a.seconds));
+    print_host(&stats, begin);
+    print_outbound(&branch);
+    link.send("bye", "");
+    std::thread::sleep(Duration::from_millis(500));
+    host.set_state(gst::State::Null).ok();
+    println!("result: {}", if failed.load(Ordering::SeqCst) { "ERRORS" } else { "no pipeline errors" });
+}
+
+/// Viewer process: listens for the host, answers, and estimates the host clock by pings.
+fn run_viewer(a: &Args, listen: &str) {
+    let listener = std::net::TcpListener::bind(listen).expect("cannot listen");
+    println!("viewer listening on {listen}");
+    let (stream, from) = listener.accept().unwrap();
+    println!("host connected from {from}");
+    let (link, mut reader) = net::Link::new(stream);
+    let link = Arc::new(link);
+
+    // Offset such that host_running = local + offset, from the ping with the lowest RTT.
+    let base = Instant::now();
+    let offset = Arc::new(AtomicU64::new(0));
+    let best_rtt = Arc::new(AtomicU64::new(u64::MAX));
+    let clock: HostClock = {
+        let (offset, best_rtt) = (offset.clone(), best_rtt.clone());
+        Arc::new(move || {
+            if best_rtt.load(Ordering::Relaxed) == u64::MAX {
+                return None;
+            }
+            let local = base.elapsed().as_nanos() as i64;
+            Some((local + offset.load(Ordering::Relaxed) as i64) as u64)
+        })
+    };
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let v = build_viewer(a, 0, clock);
+    watch_bus(&v.pipeline, "viewer".into(), failed.clone());
+    v.pipeline.set_state(gst::State::Playing).unwrap();
+
+    {
+        let link = link.clone();
+        v.webrtc.connect("on-ice-candidate", false, move |values| {
+            let mline = values[1].get::<u32>().unwrap();
+            let candidate = values[2].get::<String>().unwrap();
+            link.send("ice", &format!("{mline} {candidate}"));
+            None
+        });
+    }
+    {
+        let link = link.clone();
+        std::thread::spawn(move || loop {
+            link.send("ping", &base.elapsed().as_nanos().to_string());
+            std::thread::sleep(Duration::from_millis(100));
+        });
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let (webrtc, link2, done2) = (v.webrtc.clone(), link.clone(), done.clone());
+    let rtts: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let rtts2 = rtts.clone();
+    std::thread::spawn(move || {
+        while let Some((kind, payload)) = net::recv(&mut reader) {
+            match kind.as_str() {
+                "offer" => {
+                    webrtc.emit_by_name::<()>(
+                        "set-remote-description",
+                        &[&sdp(WebRTCSDPType::Offer, &payload), &None::<gst::Promise>],
+                    );
+                    let (w, l) = (webrtc.clone(), link2.clone());
+                    let promise = gst::Promise::with_change_func(move |reply| {
+                        let reply = reply.expect("answer reply").expect("answer structure");
+                        let ans = reply.get::<WebRTCSessionDescription>("answer").expect("answer");
+                        w.emit_by_name::<()>("set-local-description", &[&ans, &None::<gst::Promise>]);
+                        l.send("answer", &ans.sdp().as_text().unwrap());
+                    });
+                    webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
+                }
+                "ice" => add_remote_ice(&webrtc, &payload),
+                "pong" => {
+                    let now = base.elapsed().as_nanos() as u64;
+                    if let Some((sent, host_ns)) = payload.split_once(' ') {
+                        let (sent, host_ns): (u64, u64) = (sent.parse().unwrap(), host_ns.parse().unwrap());
+                        let rtt = now - sent;
+                        rtts2.lock().unwrap().push(rtt);
+                        if rtt < best_rtt.load(Ordering::Relaxed) {
+                            best_rtt.store(rtt, Ordering::Relaxed);
+                            let est = host_ns as i64 + rtt as i64 / 2 - now as i64;
+                            offset.store(est as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+                "bye" => break,
+                _ => {}
+            }
+        }
+        done2.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = Instant::now() + WARMUP + Duration::from_secs(a.seconds + 30);
+    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut r = rtts.lock().unwrap().clone();
+    r.sort_unstable();
+    println!(
+        "clock: pings {} | rtt ms p50 {:.2} min {:.2} | offset uncertainty up to +-{:.2} ms",
+        r.len(),
+        percentile(&r, 0.5),
+        percentile(&r, 0.0),
+        percentile(&r, 0.0) / 2.0,
+    );
+    print_viewer(0, &v);
+    v.pipeline.set_state(gst::State::Null).ok();
+    println!("result: {}", if failed.load(Ordering::SeqCst) { "ERRORS" } else { "no pipeline errors" });
+}
+
+fn print_viewer(i: usize, v: &Viewer) {
+    let s = v.stats.lock().unwrap();
+    let (mut iv, mut lat, mut pre) = (s.intervals_ns.clone(), s.latency_ns.clone(), s.before_decoder_ns.clone());
+    drop(s);
+    pre.sort_unstable();
+    println!(
+        "  before decoder: latency ms p50 {:.2} p95 {:.2} p99 {:.2}",
+        percentile(&pre, 0.5),
+        percentile(&pre, 0.95),
+        percentile(&pre, 0.99),
+    );
+    iv.sort_unstable();
+    lat.sort_unstable();
+    println!(
+        "viewer {i}: decoded {} | interval ms p50 {:.2} p99 {:.2} max {:.2} | latency ms p50 {:.2} p95 {:.2} p99 {:.2}",
+        iv.len(),
+        percentile(&iv, 0.5),
+        percentile(&iv, 0.99),
+        percentile(&iv, 1.0),
+        percentile(&lat, 0.5),
+        percentile(&lat, 0.95),
+        percentile(&lat, 0.99),
+    );
+    for st in get_stats(&v.webrtc) {
+        if st.has_field("packets-received") && st.has_field("packets-lost") {
+            println!(
+                "  inbound: received {} lost {} repaired {} nack {} pli {} fir {}",
+                field_u64(&st, "packets-received"),
+                field_u64(&st, "packets-lost"),
+                field_u64(&st, "packets-repaired"),
+                field_u64(&st, "nack-count"),
+                field_u64(&st, "pli-count"),
+                field_u64(&st, "fir-count"),
+            );
+        }
+    }
+}
+
 fn main() {
     let a = parse_args();
+    // Windows timers default to ~15.6 ms; jitterbuffer timers then fire late.
+    #[cfg(windows)]
+    if std::env::var_os("PROBE_DEFAULT_TIMER").is_none() {
+        unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        println!("timer: 1 ms");
+    }
     gst::init().unwrap();
     println!("args: {a:?}");
+    match a.role.as_str() {
+        "host" => return run_host(&a, &a.peer.clone().expect("--peer IP:PORT")),
+        "viewer" => return run_viewer(&a, &a.listen.clone().expect("--listen IP:PORT")),
+        _ => {}
+    }
 
     let host_stats = Arc::new(HostStats::default());
     let host = host_pipeline(&a, host_stats.clone());
@@ -626,16 +954,18 @@ fn main() {
     let proxy = (a.loss_pct > 0.0).then(|| LossProxy::start(a.loss_pct));
     let mut viewers = vec![];
     for i in 0..a.viewers {
-        let v = build_viewer(&a, i, &host);
+        let hw = host.downgrade();
+        let clock: HostClock = Arc::new(move || hw.upgrade().and_then(|h| host_running(&h)));
+        let v = build_viewer(&a, i, clock);
         watch_bus(&v.pipeline, format!("viewer-{i}"), failed.clone());
         v.pipeline.set_state(gst::State::Playing).unwrap();
         v.pipeline.use_clock(host.clock().as_ref());
         let relay = if i == 0 { proxy.clone() } else { None };
-        let branch = add_host_branch(&a, &host, i, Some(v.webrtc.clone()), relay);
+        let branch = add_host_branch(&a, &host, i, Peer::Local(v.webrtc.clone(), relay));
         viewers.push((v, branch));
     }
     for i in 0..a.stuck {
-        add_host_branch(&a, &host, a.viewers + i, None, None);
+        add_host_branch(&a, &host, a.viewers + i, Peer::Stuck);
     }
 
     let begin = (
