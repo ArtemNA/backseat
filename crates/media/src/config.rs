@@ -86,4 +86,6 @@ pub struct ViewerConfig {
     pub decoder: Option<String>,
     /// Audio sink follows stream timing (drift correction). Video never syncs.
     pub audio_sync: bool,
+    /// Tests only: receive video but do not decode or show it.
+    pub headless: bool,
 }

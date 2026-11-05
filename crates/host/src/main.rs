@@ -2,7 +2,6 @@
 //! signaling server and serves every viewer that subscribes, or connects directly to one
 //! viewer that listens on IP:PORT.
 
-use gst::prelude::*;
 use media::config::{Codec, HostConfig, Source, VideoMode};
 use media::host::Host;
 use media::server_client::ServerClient;
@@ -125,11 +124,6 @@ fn main() {
         host.encoder,
         args.cfg.audio
     );
-    if let Err(e) = host.start() {
-        eprintln!("host: {e}");
-        std::process::exit(1);
-    }
-
     let gone = Arc::new(AtomicBool::new(false));
     let mut direct: Option<Arc<Link>> = None;
     match &args.target {
@@ -140,7 +134,10 @@ fn main() {
             });
             let (link, mut reader) = Link::new(stream);
             let link = Arc::new(link);
-            let webrtc = host.add_viewer(0, link.clone());
+            if let Err(e) = host.add_viewer(0, link.clone()) {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            }
             println!("host: viewer connected, negotiating");
             let (host, l, gone) = (host.clone(), link.clone(), gone.clone());
             std::thread::spawn(move || {
@@ -148,7 +145,7 @@ fn main() {
                     if kind == "bye" {
                         break;
                     }
-                    host.on_message(&webrtc, l.as_ref(), &kind, &payload);
+                    host.on_message(0, l.as_ref(), &kind, &payload);
                 }
                 gone.store(true, Ordering::SeqCst);
             });
@@ -163,23 +160,34 @@ fn main() {
             println!("host: joined room {room} as {name} (id {}), streaming", client.id);
             let (host, gone) = (host.clone(), gone.clone());
             std::thread::spawn(move || {
-                let mut viewers: HashMap<PeerId, (gst::Element, Arc<dyn Outbox>)> = HashMap::new();
+                let mut outboxes: HashMap<PeerId, Arc<dyn Outbox>> = HashMap::new();
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         ServerMsg::SubscribeRequest { viewer } => {
                             let out = client.to_peer(viewer);
-                            let webrtc = host.add_viewer(viewer as usize, out.clone());
-                            viewers.insert(viewer, (webrtc, out));
-                            println!("host: viewer {viewer} subscribed, negotiating ({} viewers)", viewers.len());
-                        }
-                        ServerMsg::Signal { from, kind, payload } => {
-                            if let Some((webrtc, out)) = viewers.get(&from) {
-                                host.on_message(webrtc, out.as_ref(), &kind, &payload);
+                            match host.add_viewer(viewer, out.clone()) {
+                                Ok(()) => {
+                                    outboxes.insert(viewer, out);
+                                    println!("host: viewer {viewer} subscribed ({} viewers)", host.viewer_count());
+                                }
+                                Err(e) => eprintln!("host: cannot add viewer {viewer}: {e}"),
                             }
                         }
-                        ServerMsg::UnsubscribeRequest { viewer } => {
-                            // Removing the branch at runtime is stage 3.
-                            println!("host: viewer {viewer} unsubscribed (branch kept until stage 3)");
+                        ServerMsg::Signal { from, kind, payload } => {
+                            if let Some(out) = outboxes.get(&from) {
+                                host.on_message(from, out.as_ref(), &kind, &payload);
+                            }
+                        }
+                        ServerMsg::UnsubscribeRequest { viewer } | ServerMsg::PeerLeft { id: viewer } => {
+                            if outboxes.remove(&viewer).is_some() {
+                                let t = Instant::now();
+                                host.remove_viewer(viewer);
+                                println!(
+                                    "host: viewer {viewer} removed in {} ms ({} viewers)",
+                                    t.elapsed().as_millis(),
+                                    host.viewer_count()
+                                );
+                            }
                         }
                         ServerMsg::Error { message } => eprintln!("host: server error: {message}"),
                         _ => {}
@@ -210,10 +218,14 @@ fn main() {
         let (frames, bytes, keys, key_bytes) = (now.0 - last.0, now.1 - last.1, now.2 - last.2, now.3 - last.3);
         let delta_avg = (bytes - key_bytes) as f64 / (frames.saturating_sub(keys)).max(1) as f64 / 1000.0;
         let key_avg = key_bytes as f64 / keys.max(1) as f64 / 1000.0;
+        let iv = s.frame_interval.take();
         println!(
-            "host t={:>4}s | {:.1} fps | {:.2} Mbit/s | key frame {:.0} KB vs delta {:.0} KB (x{:.1}) | max frame {} KB | key requests dropped {}",
+            "host t={:>4}s | viewers {} | {:.1} fps | encoded gap p99 {:.1} max {:.1} ms | {:.2} Mbit/s | key frame {:.0} KB vs delta {:.0} KB (x{:.1}) | max frame {} KB | key requests dropped {}",
             started.elapsed().as_secs(),
+            host.viewer_count(),
             frames as f64 / dt,
+            iv.ms(0.99),
+            iv.ms(1.0),
             bytes as f64 * 8.0 / dt / 1e6,
             key_avg,
             delta_avg,
@@ -227,6 +239,6 @@ fn main() {
         link.send("bye", "");
     }
     std::thread::sleep(Duration::from_millis(300));
-    let _ = host.pipeline.set_state(gst::State::Null);
+    host.stop();
     println!("host: stopped");
 }

@@ -46,6 +46,7 @@ pub struct RenderReport {
 impl Viewer {
     pub fn new(cfg: ViewerConfig, clock: HostClock, link: Arc<dyn Outbox>) -> Result<Self, String> {
         let pipeline = gst::Pipeline::with_name("viewer");
+        crate::drain_bus(&pipeline, "viewer");
         let webrtc = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
         webrtc.set_property("latency", cfg.latency_ms);
@@ -66,18 +67,19 @@ impl Viewer {
         });
 
         #[cfg(windows)]
-        let renderer = {
+        // Headless (tests only): no window, no D3D device, no decoding.
+        let renderer = (!cfg.headless).then(|| {
             let r = crate::present::start();
             pipeline.set_context(&r.context);
             r
-        };
+        });
 
         let stats = ViewerStats::default();
         let started = Instant::now();
         let pipeline_weak = pipeline.downgrade();
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
         #[cfg(windows)]
-        let frames_tx = renderer.frames.clone();
+        let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
@@ -88,9 +90,10 @@ impl Viewer {
             let media = s.get::<&str>("media").unwrap_or("");
             let encoding = s.get::<&str>("encoding-name").unwrap_or("").to_ascii_lowercase();
             let result = match media {
+                "video" if cfg2.headless => add_fakesink(&pipeline, pad),
                 "video" => {
                     #[cfg(windows)]
-                    let tail = video_tail(Some(frames_tx.clone()));
+                    let tail = video_tail(frames_tx.clone());
                     #[cfg(not(windows))]
                     let tail = video_tail();
                     add_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, tail)
@@ -108,9 +111,9 @@ impl Viewer {
             webrtc,
             stats,
             #[cfg(windows)]
-            window_closed: renderer.closed,
+            window_closed: renderer.as_ref().map(|r| r.closed.clone()).unwrap_or_default(),
             #[cfg(windows)]
-            render: renderer.stats,
+            render: renderer.map(|r| r.stats).unwrap_or_default(),
         })
     }
 

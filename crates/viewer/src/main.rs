@@ -20,7 +20,9 @@ fn main() {
     let mut listen = "0.0.0.0:7700".to_string();
     let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
     let mut subscribe = None;
-    let mut cfg = ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true };
+    let mut never_answer = false;
+    let mut cfg =
+        ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true, headless: false };
     let (mut seconds, mut report_secs) = (0u64, 5u64);
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -29,6 +31,10 @@ fn main() {
             "--wait-keyframe" => cfg.wait_keyframe = true,
             "--no-audio" => cfg.audio = false,
             "--audio-nosync" => cfg.audio_sync = false,
+            // Test only: subscribes but never answers the offer, like a stuck peer.
+            "--debug-never-answer" => never_answer = true,
+            // Test only: no window and no decoding, so the process does not touch the GPU.
+            "--headless" => cfg.headless = true,
             key => {
                 let Some(val) = argv.get(i + 1) else {
                     eprintln!("missing value for {key}\n{USAGE}");
@@ -174,6 +180,9 @@ fn main() {
             while let Ok((kind, payload)) = in_rx.recv() {
                 if kind == "bye" {
                     break;
+                }
+                if never_answer && kind == "offer" {
+                    continue;
                 }
                 viewer.on_message(&link, &clock, &kind, &payload);
             }

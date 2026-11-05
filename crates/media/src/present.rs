@@ -98,6 +98,45 @@ unsafe fn display_adapter(factory: &IDXGIFactory6) -> IDXGIAdapter1 {
     panic!("no adapter with a display output");
 }
 
+/// One BGRA texture seen from both devices, handed over with a keyed mutex:
+/// key 0 = the decoder side may write, key 1 = the presentation side may read.
+struct Shared {
+    dec: ID3D11Texture2D,
+    km_dec: IDXGIKeyedMutex,
+    present: ID3D11Texture2D,
+    km_present: IDXGIKeyedMutex,
+}
+
+impl Shared {
+    unsafe fn new(dec_device: &ID3D11Device, present_device: &ID3D11Device, size: (u32, u32)) -> Self {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: size.0,
+            Height: size.1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 as u32,
+        };
+        let mut dec = None;
+        dec_device.CreateTexture2D(&desc, None, Some(&mut dec)).unwrap();
+        let dec: ID3D11Texture2D = dec.unwrap();
+        let handle = dec.cast::<IDXGIResource>().unwrap().GetSharedHandle().unwrap();
+        let mut present: Option<ID3D11Texture2D> = None;
+        present_device.OpenSharedResource(handle, &mut present).unwrap();
+        let present = present.unwrap();
+        Shared {
+            km_dec: dec.cast().unwrap(),
+            km_present: present.cast().unwrap(),
+            dec,
+            present,
+        }
+    }
+}
+
 fn frame_size(sample: &gst::SampleRef) -> Option<(u32, u32)> {
     let s = sample.caps()?.structure(0)?;
     Some((s.get::<i32>("width").ok()? as u32, s.get::<i32>("height").ok()? as u32))
@@ -129,6 +168,26 @@ unsafe fn run(
     let gst_device = gst_d3d11_device_new_wrapped(device.as_raw());
     assert!(!gst_device.is_null(), "gst_d3d11_device_new_wrapped failed");
     let gst_context: gst::Context = gst::glib::translate::from_glib_full(gst_d3d11_context_new(gst_device));
+
+    // A second device only for presentation. DWM throttles partly covered windows and
+    // Present then blocks for whole refreshes while holding its device's lock; on a shared
+    // device that stalled the decoder (stage 3: 30 fps, latency growing to tens of seconds).
+    // Frames cross over through a shared texture guarded by a keyed mutex.
+    let (mut pdevice, mut pcontext) = (None, None);
+    D3D11CreateDevice(
+        &adapter,
+        D3D_DRIVER_TYPE_UNKNOWN,
+        Default::default(),
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        None,
+        D3D11_SDK_VERSION,
+        Some(&mut pdevice),
+        None,
+        Some(&mut pcontext),
+    )
+    .unwrap();
+    let pdevice: ID3D11Device = pdevice.unwrap();
+    let pcontext: ID3D11DeviceContext = pcontext.unwrap();
 
     let mut allow = windows::core::BOOL(0);
     let tearing = factory
@@ -179,8 +238,12 @@ unsafe fn run(
 
     let swap_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
         | if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 };
-    let present_flags = if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
+    // DO_NOT_WAIT: DWM throttles partly covered windows and Present then blocks for whole
+    // refreshes while D3D11 holds the device lock the decoder needs (stage 3: 33 ms per
+    // frame, decoder at 30 fps, latency growing without bound). Busy means skip instead.
+    let present_flags = DXGI_PRESENT_DO_NOT_WAIT | if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
     let mut swapchain: Option<IDXGISwapChain1> = None;
+    let mut shared: Option<Shared> = None;
     let mut waitable = windows::Win32::Foundation::HANDLE::default();
     let mut size = (0u32, 0u32);
     let mut sink: Option<gst_app::AppSink> = None;
@@ -206,6 +269,8 @@ unsafe fn run(
 
         if swapchain.is_none() || frame != size {
             gst_d3d11_device_lock(gst_device);
+            shared = Some(Shared::new(&device, &pdevice, frame));
+            gst_d3d11_device_unlock(gst_device);
             if let Some(sc) = &swapchain {
                 let _ = sc.ResizeBuffers(0, frame.0, frame.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(swap_flags as i32));
             } else {
@@ -224,7 +289,7 @@ unsafe fn run(
                     AlphaMode: DXGI_ALPHA_MODE_IGNORE,
                     Flags: swap_flags,
                 };
-                let sc = factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None).unwrap();
+                let sc = factory.CreateSwapChainForHwnd(&pdevice, hwnd, &desc, None, None).unwrap();
                 // A frame queue slot is free when this handle is signalled; checking it with a
                 // zero timeout lets us skip a frame instead of blocking inside Present.
                 if let Ok(sc2) = sc.cast::<IDXGISwapChain2>() {
@@ -237,10 +302,10 @@ unsafe fn run(
                     let _ = SetWindowPos(hwnd, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
                 }
             }
-            gst_d3d11_device_unlock(gst_device);
             size = frame;
         }
         let sc = swapchain.as_ref().unwrap();
+        let sh = shared.as_ref().unwrap();
 
         if !waitable.is_invalid()
             && windows::Win32::System::Threading::WaitForSingleObjectEx(waitable, 0, false)
@@ -262,27 +327,38 @@ unsafe fn run(
         let raw = gst_d3d11_memory_get_resource_handle(mem as *mut c_void);
         let sub = gst_d3d11_memory_get_subresource_index(mem as *mut c_void);
         let src = ID3D11Resource::from_raw_borrowed(&raw).unwrap();
-        let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
         let src_box = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
-        // GStreamer's lock is held only for the copy, never for Present: a slow Present must
-        // not stall the decoder (stage 1: stalls grew latency without bound).
+        // On the decoder's device only the copy into the shared texture happens, under
+        // GStreamer's lock (stage 1: holding it during Present grew latency without bound).
         let locked = std::time::Instant::now();
         gst_d3d11_device_lock(gst_device);
-        context.CopySubresourceRegion(&back, 0, 0, 0, 0, src, sub, Some(&src_box));
+        let _ = sh.km_dec.AcquireSync(0, 100);
+        context.CopySubresourceRegion(&sh.dec, 0, 0, 0, 0, src, sub, Some(&src_box));
+        let _ = sh.km_dec.ReleaseSync(1);
         if slow_in_lock && slow_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(slow_ms));
         }
         gst_d3d11_device_unlock(gst_device);
         stats.max_lock_us.fetch_max(locked.elapsed().as_micros() as u64, Ordering::Relaxed);
         gst::ffi::gst_memory_unmap(mem, info.as_mut_ptr());
+
+        // Everything below runs on the presentation device and cannot stall the decoder.
+        let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
+        let _ = sh.km_present.AcquireSync(1, 100);
+        pcontext.CopyResource(&back, &sh.present);
+        let _ = sh.km_present.ReleaseSync(0);
         drop(back);
 
         let presenting = std::time::Instant::now();
-        let _ = sc.Present(0, present_flags);
+        let hr = sc.Present(0, present_flags);
         if !slow_in_lock && slow_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(slow_ms));
         }
         stats.max_present_us.fetch_max(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
-        stats.presented.fetch_add(1, Ordering::Relaxed);
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats.presented.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
