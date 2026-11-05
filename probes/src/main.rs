@@ -67,6 +67,8 @@ struct Args {
     role: String,
     peer: Option<String>,
     listen: Option<String>,
+    /// Decoder element for the viewer, instead of the platform default.
+    decoder: Option<String>,
 }
 
 /// Lossy relay between one host branch and viewer 0. Drops RTP only (host to viewer):
@@ -188,6 +190,7 @@ fn parse_args() -> Args {
         role: "local".into(),
         peer: None,
         listen: None,
+        decoder: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -222,6 +225,7 @@ fn parse_args() -> Args {
             "--role" => a.role = val.clone(),
             "--peer" => a.peer = Some(val.clone()),
             "--listen" => a.listen = Some(val.clone()),
+            "--decoder" => a.decoder = Some(val.clone()),
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -479,6 +483,7 @@ fn build_viewer(a: &Args, index: usize, clock: HostClock) -> Viewer {
     let stats = Arc::new(Mutex::new(ViewerStats::default()));
     let codec = a.codec.clone();
     let wait_keyframe = a.wait_keyframe;
+    let decoder_override = a.decoder.clone();
     let display = a.display.clone();
     let present_ns: Arc<Mutex<Vec<u64>>> = Arc::default();
     let presents_out = present_ns.clone();
@@ -507,7 +512,10 @@ fn build_viewer(a: &Args, index: usize, clock: HostClock) -> Viewer {
             depay.set_property("wait-for-keyframe", true);
         }
         let parse = make(&format!("{codec}parse"));
-        let dec = make(&decoder_name(&codec));
+        let dec = match &decoder_override {
+            Some(name) => make(name),
+            None => make(&decoder_name(&codec)),
+        };
         let sink = match (index, display.as_str()) {
             (0, "d3d11") => {
                 let s = gst::ElementFactory::make("d3d11videosink")
