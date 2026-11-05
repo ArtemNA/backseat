@@ -10,6 +10,8 @@ gst-app.workspace = true
 gst-webrtc.workspace = true
 gst-sdp.workspace = true
 gst-rtp.workspace = true
+protocol = { path = "../protocol" }
+tungstenite = "0.30"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

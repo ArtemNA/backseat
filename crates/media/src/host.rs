@@ -3,7 +3,7 @@
 use crate::clock;
 use crate::config::{HostConfig, Source};
 use crate::platform;
-use crate::signal::Link;
+use crate::signal::Outbox;
 use gst::prelude::*;
 use gst_webrtc::{WebRTCRTPTransceiver, WebRTCSDPType, WebRTCSessionDescription};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -170,7 +170,7 @@ impl Host {
     }
 
     /// Adds one viewer branch and starts negotiation over the link. Returns its webrtcbin.
-    pub fn add_viewer(&self, index: usize, link: Arc<Link>) -> gst::Element {
+    pub fn add_viewer(&self, index: usize, link: Arc<dyn Outbox>) -> gst::Element {
         let webrtc = gst::ElementFactory::make("webrtcbin")
             .name(format!("viewer-{index}"))
             .build()
@@ -237,7 +237,7 @@ impl Host {
     }
 
     /// Applies one signaling message for the viewer behind `webrtc`.
-    pub fn on_message(&self, webrtc: &gst::Element, link: &Link, kind: &str, payload: &str) {
+    pub fn on_message(&self, webrtc: &gst::Element, link: &dyn Outbox, kind: &str, payload: &str) {
         match kind {
             "answer" => {
                 if let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/media", "crates/host", "crates/viewer"]
+members = ["crates/protocol", "crates/server", "crates/media", "crates/host", "crates/viewer"]
 exclude = ["probes"]
 
 [workspace.package]

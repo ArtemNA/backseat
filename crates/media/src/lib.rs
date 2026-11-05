@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod host;
 pub mod platform;
+pub mod server_client;
 pub mod signal;
 pub mod stats;
 pub mod viewer;

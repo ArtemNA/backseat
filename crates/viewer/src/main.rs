@@ -1,19 +1,25 @@
-//! Stage 1 viewer: listens on IP:PORT, the host connects, then plays its stream.
+//! Viewer: joins a room on the signaling server and watches one streamer, or listens on
+//! IP:PORT for a host that connects directly.
 
 use gst::prelude::*;
 use media::clock::HostClock;
 use media::config::ViewerConfig;
-use media::signal::{self, Link};
+use media::server_client::ServerClient;
+use media::signal::{self, Link, Outbox};
 use media::viewer::Viewer;
+use protocol::{ClientMsg, PeerInfo, ServerMsg};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: viewer [--listen 0.0.0.0:7700] [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] \
-[--decoder NAME] [--seconds 0] [--report-secs 5]";
+const USAGE: &str = "usage: viewer (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] [--watch STREAMER] | \
+--listen 0.0.0.0:7700) [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--decoder NAME] \
+[--seconds 0] [--report-secs 5]";
 
 fn main() {
     let mut listen = "0.0.0.0:7700".to_string();
+    let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
+    let mut subscribe = None;
     let mut cfg = ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true };
     let (mut seconds, mut report_secs) = (0u64, 5u64);
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -31,6 +37,22 @@ fn main() {
                 let ok = match key {
                     "--listen" => {
                         listen = val.clone();
+                        true
+                    }
+                    "--server" => {
+                        server = Some(val.clone());
+                        true
+                    }
+                    "--room" => {
+                        room = val.clone();
+                        true
+                    }
+                    "--name" => {
+                        name = val.clone();
+                        true
+                    }
+                    "--watch" => {
+                        watch = Some(val.clone());
                         true
                     }
                     "--latency" => val.parse().map(|v| cfg.latency_ms = v).is_ok(),
@@ -53,15 +75,74 @@ fn main() {
     }
 
     media::init();
-    let listener = std::net::TcpListener::bind(&listen).unwrap_or_else(|e| {
-        eprintln!("viewer: cannot listen on {listen}: {e}");
-        std::process::exit(1);
-    });
-    println!("viewer: waiting for the host on {listen}");
-    let (stream, from) = listener.accept().expect("accept");
-    println!("viewer: host connected from {}", from.ip());
-    let (link, mut reader) = Link::new(stream);
-    let link = Arc::new(link);
+    // Messages from the host, as (kind, payload), whichever way we reach it.
+    let (in_tx, in_rx) = mpsc::channel::<(String, String)>();
+    let link: Arc<dyn Outbox> = match &server {
+        None => {
+            let listener = std::net::TcpListener::bind(&listen).unwrap_or_else(|e| {
+                eprintln!("viewer: cannot listen on {listen}: {e}");
+                std::process::exit(1);
+            });
+            println!("viewer: waiting for the host on {listen}");
+            let (stream, from) = listener.accept().expect("accept");
+            println!("viewer: host connected from {}", from.ip());
+            let (link, mut reader) = Link::new(stream);
+            std::thread::spawn(move || {
+                while let Some(m) = signal::recv(&mut reader) {
+                    if in_tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                let _ = in_tx.send(("bye".into(), String::new()));
+            });
+            Arc::new(link)
+        }
+        Some(url) => {
+            let (client, rx) = ServerClient::join(url, &room, &name).unwrap_or_else(|e| {
+                eprintln!("viewer: {e}");
+                std::process::exit(1);
+            });
+            println!("viewer: joined room {room} as {name} (id {})", client.id);
+            let pick = |p: &PeerInfo| p.streaming && watch.as_ref().is_none_or(|w| *w == p.name);
+            let mut streamer = client.peers.iter().find(|p| pick(p)).map(|p| p.id);
+            while streamer.is_none() {
+                println!("viewer: waiting for a streamer{}", watch.as_ref().map(|w| format!(" named {w}")).unwrap_or_default());
+                match rx.recv() {
+                    Ok(ServerMsg::PeerJoined { peer } | ServerMsg::PeerUpdated { peer }) if pick(&peer) => streamer = Some(peer.id),
+                    Ok(_) => {}
+                    Err(_) => {
+                        eprintln!("viewer: lost the signaling server");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let streamer = streamer.unwrap();
+            println!("viewer: watching peer {streamer}");
+            let out = client.to_peer(streamer);
+            let c = client.clone();
+            std::thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    let forward = match msg {
+                        ServerMsg::Signal { from, kind, payload } if from == streamer => (kind, payload),
+                        ServerMsg::PeerLeft { id } if id == streamer => ("bye".into(), String::new()),
+                        ServerMsg::PeerUpdated { peer } if peer.id == streamer && !peer.streaming => ("bye".into(), String::new()),
+                        ServerMsg::Error { message } => {
+                            eprintln!("viewer: server error: {message}");
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    if in_tx.send(forward).is_err() {
+                        break;
+                    }
+                }
+                let _ = in_tx.send(("bye".into(), String::new()));
+            });
+            // The subscription goes out once the pipeline exists, so the offer finds it.
+            subscribe = Some((c, streamer));
+            out
+        }
+    };
     let clock = HostClock::default();
 
     let viewer = match Viewer::new(cfg, clock.clone(), link.clone()) {
@@ -75,6 +156,9 @@ fn main() {
         eprintln!("viewer: {e}");
         std::process::exit(1);
     }
+    if let Some((client, streamer)) = subscribe.take() {
+        client.send(ClientMsg::Subscribe { streamer });
+    }
 
     {
         let (link, clock) = (link.clone(), clock.clone());
@@ -87,7 +171,7 @@ fn main() {
     {
         let (viewer, link, clock, gone) = (viewer.clone(), link.clone(), clock.clone(), gone.clone());
         std::thread::spawn(move || {
-            while let Some((kind, payload)) = signal::recv(&mut reader) {
+            while let Ok((kind, payload)) = in_rx.recv() {
                 if kind == "bye" {
                     break;
                 }

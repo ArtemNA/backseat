@@ -4,7 +4,7 @@ use crate::clock::HostClock;
 use crate::config::ViewerConfig;
 use crate::host::add_ice;
 use crate::platform;
-use crate::signal::Link;
+use crate::signal::Outbox;
 use crate::stats::Series;
 use gst::prelude::*;
 use gst_webrtc::{WebRTCSDPType, WebRTCSessionDescription};
@@ -44,7 +44,7 @@ pub struct RenderReport {
 }
 
 impl Viewer {
-    pub fn new(cfg: ViewerConfig, clock: HostClock, link: Arc<Link>) -> Result<Self, String> {
+    pub fn new(cfg: ViewerConfig, clock: HostClock, link: Arc<dyn Outbox>) -> Result<Self, String> {
         let pipeline = gst::Pipeline::with_name("viewer");
         let webrtc = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
@@ -144,7 +144,7 @@ impl Viewer {
     }
 
     /// Applies one signaling message from the host.
-    pub fn on_message(&self, link: &Arc<Link>, clock: &HostClock, kind: &str, payload: &str) {
+    pub fn on_message(&self, link: &Arc<dyn Outbox>, clock: &HostClock, kind: &str, payload: &str) {
         match kind {
             "offer" => {
                 let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) else { return };

@@ -1,19 +1,29 @@
-//! Stage 1 host: streams the screen (or test bars) and system audio to one viewer,
-//! connecting directly to a viewer that listens on IP:PORT.
+//! Host: streams the screen (or a test source) and system audio. Joins a room on the
+//! signaling server and serves every viewer that subscribes, or connects directly to one
+//! viewer that listens on IP:PORT.
 
 use gst::prelude::*;
 use media::config::{Codec, HostConfig, Source, VideoMode};
 use media::host::Host;
-use media::signal::{self, Link};
+use media::server_client::ServerClient;
+use media::signal::{self, Link, Outbox};
+use protocol::{ClientMsg, PeerId, ServerMsg};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: host --peer IP:PORT [--mode 1080p60] [--kbit 20000] [--codec h264|h265] \
-[--keyframe-secs 2] [--source capture|bars|noise] [--monitor -1] [--no-audio] [--seconds 0] [--report-secs 5]";
+const USAGE: &str = "usage: host (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] | --peer IP:PORT) \
+[--mode 1080p60] [--kbit 20000] [--codec h264|h265] [--keyframe-secs 2] [--source capture|bars|noise] \
+[--monitor -1] [--no-audio] [--seconds 0] [--report-secs 5]";
+
+enum Target {
+    Direct(String),
+    Server { url: String, room: String, name: String },
+}
 
 struct Args {
-    peer: String,
+    target: Target,
     cfg: HostConfig,
     seconds: u64,
     report_secs: u64,
@@ -21,6 +31,7 @@ struct Args {
 
 fn parse() -> Result<Args, String> {
     let mut peer = None;
+    let (mut server, mut room, mut name) = (None, "default".to_string(), "host".to_string());
     let mut cfg = HostConfig {
         mode: VideoMode::parse("1080p60")?,
         kbit: 20000,
@@ -43,6 +54,9 @@ fn parse() -> Result<Args, String> {
         let num = |v: &str| v.parse::<i64>().map_err(|_| format!("bad number for {key}: {v}"));
         match key {
             "--peer" => peer = Some(val.clone()),
+            "--server" => server = Some(val.clone()),
+            "--room" => room = val.clone(),
+            "--name" => name = val.clone(),
             "--mode" => cfg.mode = VideoMode::parse(val)?,
             "--kbit" => cfg.kbit = num(val)? as u32,
             "--codec" => cfg.codec = Codec::parse(val)?,
@@ -65,7 +79,12 @@ fn parse() -> Result<Args, String> {
     if let Source::Capture { monitor: m } = &mut cfg.source {
         *m = monitor;
     }
-    Ok(Args { peer: peer.ok_or("--peer is required")?, cfg, seconds, report_secs })
+    let target = match (server, peer) {
+        (Some(url), None) => Target::Server { url, room, name },
+        (None, Some(p)) => Target::Direct(p),
+        _ => return Err("give exactly one of --server or --peer".into()),
+    };
+    Ok(Args { target, cfg, seconds, report_secs })
 }
 
 fn connect(peer: &str) -> Result<std::net::TcpStream, String> {
@@ -111,30 +130,65 @@ fn main() {
         std::process::exit(1);
     }
 
-    let stream = match connect(&args.peer) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("host: {e}");
-            std::process::exit(1);
-        }
-    };
-    let (link, mut reader) = Link::new(stream);
-    let link = Arc::new(link);
-    let webrtc = host.add_viewer(0, link.clone());
-    println!("host: viewer connected, negotiating");
-
     let gone = Arc::new(AtomicBool::new(false));
-    {
-        let (host, link, webrtc, gone) = (host.clone(), link.clone(), webrtc.clone(), gone.clone());
-        std::thread::spawn(move || {
-            while let Some((kind, payload)) = signal::recv(&mut reader) {
-                if kind == "bye" {
-                    break;
+    let mut direct: Option<Arc<Link>> = None;
+    match &args.target {
+        Target::Direct(peer) => {
+            let stream = connect(peer).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            });
+            let (link, mut reader) = Link::new(stream);
+            let link = Arc::new(link);
+            let webrtc = host.add_viewer(0, link.clone());
+            println!("host: viewer connected, negotiating");
+            let (host, l, gone) = (host.clone(), link.clone(), gone.clone());
+            std::thread::spawn(move || {
+                while let Some((kind, payload)) = signal::recv(&mut reader) {
+                    if kind == "bye" {
+                        break;
+                    }
+                    host.on_message(&webrtc, l.as_ref(), &kind, &payload);
                 }
-                host.on_message(&webrtc, &link, &kind, &payload);
-            }
-            gone.store(true, Ordering::SeqCst);
-        });
+                gone.store(true, Ordering::SeqCst);
+            });
+            direct = Some(link);
+        }
+        Target::Server { url, room, name } => {
+            let (client, rx) = ServerClient::join(url, room, name).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            });
+            client.send(ClientMsg::SetStreaming { streaming: true });
+            println!("host: joined room {room} as {name} (id {}), streaming", client.id);
+            let (host, gone) = (host.clone(), gone.clone());
+            std::thread::spawn(move || {
+                let mut viewers: HashMap<PeerId, (gst::Element, Arc<dyn Outbox>)> = HashMap::new();
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        ServerMsg::SubscribeRequest { viewer } => {
+                            let out = client.to_peer(viewer);
+                            let webrtc = host.add_viewer(viewer as usize, out.clone());
+                            viewers.insert(viewer, (webrtc, out));
+                            println!("host: viewer {viewer} subscribed, negotiating ({} viewers)", viewers.len());
+                        }
+                        ServerMsg::Signal { from, kind, payload } => {
+                            if let Some((webrtc, out)) = viewers.get(&from) {
+                                host.on_message(webrtc, out.as_ref(), &kind, &payload);
+                            }
+                        }
+                        ServerMsg::UnsubscribeRequest { viewer } => {
+                            // Removing the branch at runtime is stage 3.
+                            println!("host: viewer {viewer} unsubscribed (branch kept until stage 3)");
+                        }
+                        ServerMsg::Error { message } => eprintln!("host: server error: {message}"),
+                        _ => {}
+                    }
+                }
+                eprintln!("host: lost the signaling server");
+                gone.store(true, Ordering::SeqCst);
+            });
+        }
     }
 
     let started = Instant::now();
@@ -169,7 +223,9 @@ fn main() {
         );
         last = now;
     }
-    link.send("bye", "");
+    if let Some(link) = direct {
+        link.send("bye", "");
+    }
     std::thread::sleep(Duration::from_millis(300));
     let _ = host.pipeline.set_state(gst::State::Null);
     println!("host: stopped");

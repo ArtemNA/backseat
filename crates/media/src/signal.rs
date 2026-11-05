@@ -5,8 +5,19 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 
+/// Where host and viewer send their signaling messages: a direct link or the server.
+pub trait Outbox: Send + Sync {
+    fn send(&self, kind: &str, payload: &str);
+}
+
 pub struct Link {
     writer: Mutex<TcpStream>,
+}
+
+impl Outbox for Link {
+    fn send(&self, kind: &str, payload: &str) {
+        Link::send(self, kind, payload)
+    }
 }
 
 pub type Reader = BufReader<TcpStream>;
