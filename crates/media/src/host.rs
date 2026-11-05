@@ -35,6 +35,19 @@ pub struct Host {
     viewers: Mutex<HashMap<u64, Branch>>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ViewerQuality {
+    pub id: u64,
+    /// Share of packets lost in the viewer's last receiver report, 0..1.
+    pub fraction_lost: f64,
+    pub rtt_ms: f64,
+    pub nack: u64,
+    pub pli: u64,
+    /// Retransmission requests received, and packets actually resent.
+    pub rtx_requests: u64,
+    pub rtx_packets: u64,
+}
+
 /// Everything one viewer adds to the pipeline.
 struct Branch {
     webrtc: gst::Element,
@@ -166,7 +179,9 @@ impl Host {
             gst::PadProbeReturn::Ok
         });
         // Decision D1: a viewer's keyframe request never reaches the shared encoder.
+        // STREAMER_DEBUG_FORWARD_KEY_REQUESTS is the spoiled variant for the isolation gate.
         let s = stats.clone();
+        let forward = std::env::var_os("STREAMER_DEBUG_FORWARD_KEY_REQUESTS").is_some();
         tee_sink.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
             let is_request = info
                 .event()
@@ -174,7 +189,9 @@ impl Host {
                 .is_some_and(|st| st.name() == "GstForceKeyUnit");
             if is_request {
                 s.key_requests_dropped.fetch_add(1, Ordering::Relaxed);
-                return gst::PadProbeReturn::Drop;
+                if !forward {
+                    return gst::PadProbeReturn::Drop;
+                }
             }
             gst::PadProbeReturn::Ok
         });
@@ -189,6 +206,49 @@ impl Host {
 
     pub fn viewer_count(&self) -> usize {
         self.viewers.lock().unwrap().len()
+    }
+
+    /// What each viewer reports back about the video it receives (RTCP), for marking a
+    /// viewer with problems. Only that viewer is affected by them (decision D1).
+    pub fn viewer_quality(&self) -> Vec<ViewerQuality> {
+        let webrtcs: Vec<(u64, gst::Element)> =
+            self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone())).collect();
+        webrtcs
+            .into_iter()
+            .map(|(id, w)| {
+                let mut q = ViewerQuality { id, ..Default::default() };
+                let promise = gst::Promise::new();
+                w.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+                if promise.wait() == gst::PromiseResult::Replied {
+                    if let Some(reply) = promise.get_reply() {
+                        for s in reply.iter().filter_map(|(_, v)| v.get::<gst::Structure>().ok()) {
+                            let kind = s.get::<&str>("kind").unwrap_or("video");
+                            if kind != "video" {
+                                continue;
+                            }
+                            if s.has_field("round-trip-time") && s.has_field("fraction-lost") {
+                                q.fraction_lost = s.get::<f64>("fraction-lost").unwrap_or(0.0);
+                                q.rtt_ms = s.get::<f64>("round-trip-time").unwrap_or(0.0) * 1000.0;
+                            }
+                            if s.has_field("packets-sent") && s.has_field("nack-count") {
+                                q.nack = s.get::<u32>("nack-count").map(u64::from).unwrap_or(0);
+                                q.pli = s.get::<u32>("pli-count").map(u64::from).unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                // Retransmission requests received and packets resent, from rtprtxsend.
+                if let Some(bin) = w.downcast_ref::<gst::Bin>() {
+                    for e in bin.iterate_recurse().into_iter().flatten() {
+                        if e.factory().is_some_and(|f| f.name() == "rtprtxsend") {
+                            q.rtx_requests += e.property::<u32>("num-rtx-requests") as u64;
+                            q.rtx_packets += e.property::<u32>("num-rtx-packets") as u64;
+                        }
+                    }
+                }
+                q
+            })
+            .collect()
     }
 
     /// Adds one viewer branch and starts negotiation over the link. The first viewer starts

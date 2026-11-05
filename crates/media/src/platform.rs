@@ -11,6 +11,28 @@ pub fn init_timer() {
     }
 }
 
+/// Experiment for the host: raise this process's GPU scheduling priority so that other GPU
+/// work (for example a viewer starting to decode) delays capture and encoding less.
+/// STREAMER_GPU_PRIORITY=high|above|normal; returns a description of what happened.
+pub fn set_gpu_priority_from_env() -> Option<String> {
+    let want = std::env::var("STREAMER_GPU_PRIORITY").ok()?;
+    #[cfg(windows)]
+    {
+        use windows::Wdk::Graphics::Direct3D::*;
+        let class = match want.as_str() {
+            "high" => D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
+            "above" => D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
+            _ => D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
+        };
+        let status = unsafe {
+            D3DKMTSetProcessSchedulingPriorityClass(windows::Win32::System::Threading::GetCurrentProcess(), class)
+        };
+        Some(format!("GPU scheduling priority {want}: NTSTATUS {:#x}", status.0))
+    }
+    #[cfg(not(windows))]
+    Some(format!("GPU priority {want} is not supported on this platform"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderKind {
     Nvenc,

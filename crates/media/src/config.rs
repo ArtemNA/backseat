@@ -88,4 +88,6 @@ pub struct ViewerConfig {
     pub audio_sync: bool,
     /// Tests only: receive video but do not decode or show it.
     pub headless: bool,
+    /// Tests only: drop this share of the host's RTP packets, in percent.
+    pub loss_pct: f64,
 }

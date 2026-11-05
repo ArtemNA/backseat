@@ -106,6 +106,9 @@ fn main() {
         }
     };
     media::init();
+    if let Some(msg) = media::platform::set_gpu_priority_from_env() {
+        println!("host: {msg}");
+    }
     let host = match Host::new(args.cfg.clone()) {
         Ok(h) => Arc::new(h),
         Err(e) => {
@@ -220,19 +223,33 @@ fn main() {
         let key_avg = key_bytes as f64 / keys.max(1) as f64 / 1000.0;
         let iv = s.frame_interval.take();
         println!(
-            "host t={:>4}s | viewers {} | {:.1} fps | encoded gap p99 {:.1} max {:.1} ms | {:.2} Mbit/s | key frame {:.0} KB vs delta {:.0} KB (x{:.1}) | max frame {} KB | key requests dropped {}",
+            "host t={:>4}s | viewers {} | {:.1} fps | encoded gap p99 {:.1} max {:.1} ms | {:.2} Mbit/s | {} key frames, {:.0} KB vs delta {:.0} KB (x{:.1}) | max frame {} KB | key requests seen {}",
             started.elapsed().as_secs(),
             host.viewer_count(),
             frames as f64 / dt,
             iv.ms(0.99),
             iv.ms(1.0),
             bytes as f64 * 8.0 / dt / 1e6,
+            keys,
             key_avg,
             delta_avg,
             key_avg / delta_avg.max(0.001),
             s.max_frame_bytes.swap(0, Ordering::Relaxed) / 1000,
             s.key_requests_dropped.load(Ordering::Relaxed),
         );
+        for q in host.viewer_quality() {
+            let mark = if q.fraction_lost > 0.02 { "  <- PROBLEMS" } else { "" };
+            println!(
+                "host   viewer {} | lost {:.1}% | rtt {:.1} ms | nack {} | pli {} | rtx requests {} resent {}{mark}",
+                q.id,
+                q.fraction_lost * 100.0,
+                q.rtt_ms,
+                q.nack,
+                q.pli,
+                q.rtx_requests,
+                q.rtx_packets
+            );
+        }
         last = now;
     }
     if let Some(link) = direct {

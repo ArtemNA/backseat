@@ -4,6 +4,7 @@
 pub mod clock;
 pub mod config;
 pub mod host;
+pub mod netsim;
 pub mod platform;
 pub mod server_client;
 pub mod signal;

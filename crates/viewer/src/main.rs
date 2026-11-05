@@ -22,7 +22,7 @@ fn main() {
     let mut subscribe = None;
     let mut never_answer = false;
     let mut cfg =
-        ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true, headless: false };
+        ViewerConfig { latency_ms: 40, audio: true, wait_keyframe: false, decoder: None, audio_sync: true, headless: false, loss_pct: 0.0 };
     let (mut seconds, mut report_secs) = (0u64, 5u64);
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -62,6 +62,8 @@ fn main() {
                         true
                     }
                     "--latency" => val.parse().map(|v| cfg.latency_ms = v).is_ok(),
+                    // Test only: drop this percentage of the host's RTP packets.
+                    "--debug-loss" => val.parse().map(|v| cfg.loss_pct = v).is_ok(),
                     "--decoder" => {
                         cfg.decoder = Some(val.clone());
                         true
@@ -221,6 +223,23 @@ fn main() {
             alat.ms(0.5),
             clock.best_rtt_ns().map(|r| r as f64 / 2e6).unwrap_or(f64::NAN),
         );
+        if let Some(i) = viewer.inbound() {
+            let (dropped, forwarded) = viewer
+                .relay
+                .as_ref()
+                .map(|r| (r.dropped.load(Ordering::Relaxed), r.forwarded.load(Ordering::Relaxed)))
+                .unwrap_or((0, 0));
+            println!(
+                "viewer rtp | received {} lost {} repaired {} nack {} pli {} | test relay dropped {} of {}",
+                i.received,
+                i.lost,
+                i.repaired,
+                i.nack,
+                i.pli,
+                dropped,
+                dropped + forwarded,
+            );
+        }
         if let Some(r) = viewer.render_report() {
             println!(
                 "viewer present | shown {:.1} fps | skipped total {} | Present max {:.1} ms | decoder lock held max {:.1} ms",

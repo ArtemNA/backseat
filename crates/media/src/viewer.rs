@@ -33,6 +33,18 @@ pub struct Viewer {
     pub window_closed: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(windows)]
     render: Arc<crate::present::RenderStats>,
+    /// Test-only loss on the path from the host.
+    pub relay: Option<Arc<crate::netsim::LossRelay>>,
+}
+
+/// Receive-side RTP counters for video, since the session started.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Inbound {
+    pub received: i64,
+    pub lost: i64,
+    pub repaired: i64,
+    pub nack: i64,
+    pub pli: i64,
 }
 
 /// Presentation counters since start, and the longest Present and lock hold since last call.
@@ -58,13 +70,21 @@ impl Viewer {
             }
             None
         });
-        let l = link.clone();
+        let relay = (cfg.loss_pct > 0.0).then(|| crate::netsim::LossRelay::start(cfg.loss_pct));
+        let (l, r) = (link.clone(), relay.clone());
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
-            let cand = v[2].get::<String>().unwrap();
+            let mut cand = v[2].get::<String>().unwrap();
+            if let Some(r) = &r {
+                match r.rewrite_local(&cand) {
+                    Some(c) => cand = c,
+                    None => return None,
+                }
+            }
             l.send("ice", &format!("{mline} {cand}"));
             None
         });
+        tune_jitterbuffer(&webrtc);
 
         #[cfg(windows)]
         // Headless (tests only): no window, no D3D device, no decoding.
@@ -90,7 +110,7 @@ impl Viewer {
             let media = s.get::<&str>("media").unwrap_or("");
             let encoding = s.get::<&str>("encoding-name").unwrap_or("").to_ascii_lowercase();
             let result = match media {
-                "video" if cfg2.headless => add_fakesink(&pipeline, pad),
+                "video" if cfg2.headless => add_headless_video(&pipeline, pad, &encoding),
                 "video" => {
                     #[cfg(windows)]
                     let tail = video_tail(frames_tx.clone());
@@ -114,6 +134,35 @@ impl Viewer {
             window_closed: renderer.as_ref().map(|r| r.closed.clone()).unwrap_or_default(),
             #[cfg(windows)]
             render: renderer.map(|r| r.stats).unwrap_or_default(),
+            relay,
+        })
+    }
+
+    /// Video receive counters from webrtcbin, or None before the stream starts.
+    pub fn inbound(&self) -> Option<Inbound> {
+        let promise = gst::Promise::new();
+        self.webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        if promise.wait() != gst::PromiseResult::Replied {
+            return None;
+        }
+        let reply = promise.get_reply()?;
+        let num = |s: &gst::StructureRef, f: &str| {
+            s.get::<u64>(f)
+                .map(|v| v as i64)
+                .or_else(|_| s.get::<i64>(f))
+                .or_else(|_| s.get::<u32>(f).map(i64::from))
+                .or_else(|_| s.get::<i32>(f).map(i64::from))
+                .unwrap_or(0)
+        };
+        reply.iter().filter_map(|(_, v)| v.get::<gst::Structure>().ok()).find_map(|s| {
+            let video = s.get::<&str>("kind").map(|k| k == "video").unwrap_or(true);
+            (video && s.has_field("packets-received") && s.has_field("packets-lost") && s.has_field("nack-count")).then(|| Inbound {
+                received: num(&s, "packets-received"),
+                lost: num(&s, "packets-lost"),
+                repaired: num(&s, "packets-repaired"),
+                nack: num(&s, "nack-count"),
+                pli: num(&s, "pli-count"),
+            })
         })
     }
 
@@ -162,13 +211,66 @@ impl Viewer {
                 });
                 self.webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
             }
-            "ice" => add_ice(&self.webrtc, payload),
+            "ice" => match &self.relay {
+                None => add_ice(&self.webrtc, payload),
+                Some(r) => {
+                    if let Some((mline, cand)) = payload.split_once(' ') {
+                        if let Some(c) = r.rewrite_remote(cand) {
+                            add_ice(&self.webrtc, &format!("{mline} {c}"));
+                        }
+                    }
+                }
+            },
             "pong" => {
                 clock.on_pong(payload);
             }
             _ => {}
         }
     }
+}
+
+/// The receiving RTP session does not know the stream's bitrate, so its RTCP budget was tiny
+/// and retransmission requests waited past their deadline: only 72-87% of 5% losses were
+/// repaired. A session bandwidth at the top of our range (a cap, not traffic) fixed it.
+const SESSION_DEFAULTS: &str = "bandwidth=50000000,rtcp-fraction=0.05";
+
+/// Session defaults above, plus experiment overrides: STREAMER_JB_PROPS for rtpjitterbuffer
+/// and STREAMER_SESSION_PROPS for RTPSession, both as "name=value,...".
+fn tune_jitterbuffer(webrtc: &gst::Element) {
+    let jb_props = std::env::var("STREAMER_JB_PROPS").unwrap_or_default();
+    let session_props = format!("{SESSION_DEFAULTS},{}", std::env::var("STREAMER_SESSION_PROPS").unwrap_or_default());
+    let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) else {
+        eprintln!("viewer: no rtpbin inside webrtcbin, tuning ignored");
+        return;
+    };
+    let apply = |obj: &gst::glib::Object, props: &str| {
+        for kv in props.split(',').filter(|s| !s.is_empty()) {
+            if let Some((k, val)) = kv.split_once('=') {
+                obj.set_property_from_str(k.trim(), val.trim());
+            }
+        }
+    };
+    rtpbin.connect("new-jitterbuffer", false, move |v| {
+        let rtpbin = v[0].get::<gst::Element>().unwrap();
+        let jb = v[1].get::<gst::Element>().unwrap();
+        let session = v[2].get::<u32>().unwrap();
+        apply(jb.upcast_ref(), &jb_props);
+        if !session_props.is_empty() {
+            if let Some(s) = rtpbin.emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&session]) {
+                apply(&s, &session_props);
+            }
+        }
+        None
+    });
+}
+
+/// Test-only video branch: depayloads and asks for keyframes on loss, like a decoder would,
+/// but never touches the GPU.
+fn add_headless_video(pipeline: &gst::Pipeline, pad: &gst::Pad, encoding: &str) -> Result<(), String> {
+    let codec = crate::config::Codec::parse(encoding)?;
+    let depay = make(&format!("rtp{}depay", codec.short()))?;
+    depay.set_property("request-keyframe", true);
+    link_branch(pipeline, pad, &[depay, make("fakesink")?])
 }
 
 fn make(factory: &str) -> Result<gst::Element, String> {
