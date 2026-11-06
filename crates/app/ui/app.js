@@ -115,6 +115,7 @@ async function joinRoom(r) {
   await call('connect', r, $('join-error'));
   state.current = r;
   rememberRoom(r);
+  try { localStorage.setItem('lastRoom', JSON.stringify(r)); } catch {}
   try { localStorage.setItem('join', JSON.stringify(r)); } catch {}
   state.joinOpen = false;
   state.cardsKey = '';
@@ -216,6 +217,7 @@ function render(s) {
   if (!state.current || state.current.room !== s.room) {
     state.current = { server: $('f-server').value.trim(), room: s.room, name: me.name };
     rememberRoom(state.current);
+    try { localStorage.setItem('lastRoom', JSON.stringify(state.current)); } catch {}
   }
   $('room-name').textContent = s.room;
   $('me-avatar').replaceWith(Object.assign(avatar(me.name), { id: 'me-avatar' }));
@@ -545,6 +547,20 @@ invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
 fillLanguages();
 loadForm();
+// With a saved room, start in the last one opened; the join form is only for new rooms.
+// Not when a test joins on its own (STREAMER_APP_AUTOJOIN).
+invoke('snapshot').then(async (s) => {
+  if (s.connected) return;
+  if (await invoke('test_autojoin')) return;
+  let last = null;
+  try { last = JSON.parse(localStorage.getItem('lastRoom') || 'null'); } catch {}
+  const list = savedRooms();
+  const r = list.find((x) => sameRoom(x, last)) || list[list.length - 1];
+  if (!r) return;
+  // A build for one server always uses it, whatever was saved.
+  const fixed = await invoke('built_in_server');
+  switchRoom(fixed ? { ...r, server: fixed } : r);
+});
 applyStrings();
 tick();
 setInterval(tick, 1000);

@@ -253,6 +253,12 @@ fn test_open_golive() -> bool {
 /// Tests only: STREAMER_APP_TEST_ROOMS="room B" makes the page go to room B after a
 /// while, then back to the first room through its button in the rail, then open the
 /// menu of room B.
+/// Whether a test joins a room by itself (then the page does not open the last room).
+#[tauri::command]
+fn test_autojoin() -> bool {
+    std::env::var_os("STREAMER_APP_AUTOJOIN").is_some()
+}
+
 #[tauri::command]
 fn test_rooms() -> Option<String> {
     std::env::var("STREAMER_APP_TEST_ROOMS").ok()
@@ -471,7 +477,7 @@ fn main() {
             Ok(())
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
