@@ -12,7 +12,7 @@ const el = (tag, attrs = {}, ...kids) => {
   return e;
 };
 
-const PRESETS = [2000, 4000, 8000, 12000, 20000, 35000, 50000];
+const PRESETS = [2000, 4000, 8000, 12000, 15000, 20000, 35000, 50000];
 // The streamer's own upload limit in Mbit/s, or 0 when unknown.
 function uploadLimit() {
   try { return Math.max(0, +localStorage.getItem('uploadLimit') || 0); } catch { return 0; }
@@ -580,8 +580,23 @@ function renderGoLive() {
   seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; renderGoLive(); });
   seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
   seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
-  seg($('gl-codec'), [['h265', 'H.265'], ['h264', 'H.264']], g.codec, (v) => { g.codec = v; renderGoLive(); });
-  $('gl-codec-note').textContent = t(g.codec === 'h264' ? 'golive.codec_h264' : 'golive.codec_h265');
+  // Only codecs this machine encodes in hardware; AV1 needs a recent GPU.
+  // AV1 first and chosen when the GPU encodes it, with its own default bitrate.
+  const codecs = [['av1', 'AV1'], ['h265', 'H.265'], ['h264', 'H.264']].filter(([c]) => (g.codecs || ['h265', 'h264']).includes(c));
+  if (!g.codecPicked && codecs.length && g.codec !== codecs[0][0]) {
+    if (codecs[0][0] === 'av1' && g.kbit === 20000) g.kbit = 15000;
+    g.codec = codecs[0][0];
+  }
+  if (!codecs.some(([c]) => c === g.codec) && codecs.length) g.codec = codecs[0][0];
+  seg($('gl-codec'), codecs, g.codec, (v) => {
+    // AV1 gives about the same picture with fewer bits: 15 where the others use 20.
+    if (v === 'av1' && g.codec !== 'av1' && g.kbit === 20000) g.kbit = 15000;
+    if (v !== 'av1' && g.codec === 'av1' && g.kbit === 15000) g.kbit = 20000;
+    g.codec = v;
+    g.codecPicked = true;
+    renderGoLive();
+  });
+  $('gl-codec-note').textContent = t(g.codec === 'h264' ? 'golive.codec_h264' : g.codec === 'av1' ? 'golive.codec_av1' : 'golive.codec_h265');
   const n = Math.max(s.peers.length - 1, 1);
   const need = (g.kbit * n) / 1000;
   const limit = uploadLimit();
@@ -599,6 +614,7 @@ function renderGoLive() {
 $('go-live').addEventListener('click', async () => {
   $('gl-error').classList.add('hidden');
   state.gl.sources = await invoke('sources');
+  if (!state.gl.codecs) state.gl.codecs = await invoke('codecs');
   state.gl.thumbs = {};
   renderGoLive();
   $('golive').showModal();

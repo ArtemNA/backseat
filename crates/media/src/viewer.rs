@@ -60,6 +60,8 @@ pub struct Viewer {
     pub offered: Arc<std::sync::atomic::AtomicBool>,
     /// Sound off for this stream (the stream itself keeps coming).
     muted: Arc<std::sync::atomic::AtomicBool>,
+    /// The video codec and the decoder in use ("AV1", "dav1ddec"), once video arrives.
+    pub video_codec: Arc<Mutex<Option<(String, String)>>>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
     /// How far behind the video is, and catch-up requests sent.
     pub lag: Arc<crate::catchup::LagWatch>,
@@ -162,6 +164,8 @@ impl Viewer {
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
         let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let muted2 = muted.clone();
+        let video_codec: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+        let video_codec2 = video_codec.clone();
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         #[cfg(windows)]
@@ -182,6 +186,10 @@ impl Viewer {
                     let tail = video_tail(frames_tx.clone());
                     #[cfg(not(windows))]
                     let tail = video_tail();
+                    if let Ok(c) = crate::config::Codec::parse(&encoding) {
+                        let dec = cfg2.decoder.clone().unwrap_or_else(|| platform::video_decoder(c));
+                        *video_codec2.lock().unwrap() = Some((c.rtp_name().to_string(), dec));
+                    }
                     add_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, tail)
                 }
                 "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, muted2.load(Ordering::SeqCst)),
@@ -206,6 +214,7 @@ impl Viewer {
             ice_failed: failed,
             offered,
             muted,
+            video_codec,
             jitterbuffers,
             lag,
             never_answer: cfg.debug_never_answer,
@@ -483,8 +492,21 @@ fn add_video(
         depay.set_property("wait-for-keyframe", true);
     }
     let parse = make(&format!("{}parse", codec.short()))?;
-    let decoder = make(cfg.decoder.as_deref().unwrap_or(&platform::video_decoder(codec)))?;
+    let decoder_name = cfg.decoder.clone().unwrap_or_else(|| platform::video_decoder(codec));
+    let decoder = make(&decoder_name)?;
     let mut chain = vec![depay.clone(), parse, decoder.clone()];
+    if decoder_name == "dav1ddec" {
+        // Software AV1: no frames held back (one frame of delay), all in-loop filters (a
+        // correct picture whatever the plugin's default), then one copy up to the GPU for the
+        // D3D11 presenter.
+        decoder.set_property_from_str("max-frame-delay", "1");
+        decoder.set_property_from_str("inloop-filters", "deblock+cdef+restoration");
+        #[cfg(windows)]
+        chain.push(make("d3d11upload")?);
+    }
+    if std::env::var_os("STREAMER_DEBUG_DECODER").is_some() {
+        eprintln!("viewer: video decoder {decoder_name}");
+    }
     chain.extend(tail?);
     link_branch(pipeline, pad, &chain)?;
 

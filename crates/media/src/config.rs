@@ -2,6 +2,9 @@
 pub enum Codec {
     H264,
     H265,
+    /// Needs a hardware AV1 encoder at the host (NVIDIA RTX 40+, AMD RX 7000+, Intel Arc);
+    /// any viewer decodes it, on the GPU when it can, else with dav1d on the CPU.
+    Av1,
 }
 
 impl Codec {
@@ -9,15 +12,17 @@ impl Codec {
         match s.to_ascii_lowercase().as_str() {
             "h264" => Ok(Self::H264),
             "h265" | "hevc" => Ok(Self::H265),
-            _ => Err(format!("unknown codec {s}, use h264 or h265")),
+            "av1" => Ok(Self::Av1),
+            _ => Err(format!("unknown codec {s}, use h264, h265 or av1")),
         }
     }
 
-    /// Lower-case name used in element names: h264, h265.
+    /// Lower-case name used in element names: h264, h265, av1.
     pub fn short(self) -> &'static str {
         match self {
             Self::H264 => "h264",
             Self::H265 => "h265",
+            Self::Av1 => "av1",
         }
     }
 
@@ -25,6 +30,7 @@ impl Codec {
         match self {
             Self::H264 => "H264",
             Self::H265 => "H265",
+            Self::Av1 => "AV1",
         }
     }
 }
@@ -66,7 +72,8 @@ pub struct Quality {
 
 /// Bitrates a viewer may ask for, kbit/s. Few on purpose: viewers asking for similar
 /// qualities share one encoder instead of each starting their own (user, 2026-11-06).
-pub const KBIT_PRESETS: [u32; 7] = [2000, 4000, 8000, 12000, 20000, 35000, 50000];
+/// 15 is AV1's default: about the picture H.265 gives at 20.
+pub const KBIT_PRESETS: [u32; 8] = [2000, 4000, 8000, 12000, 15000, 20000, 35000, 50000];
 
 impl Quality {
     pub fn new(mode: VideoMode, kbit: u32) -> Self {

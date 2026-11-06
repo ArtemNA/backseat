@@ -50,16 +50,28 @@ pub fn encoder_candidates(codec: Codec) -> Vec<(String, EncoderKind)> {
     ]
 }
 
+/// Codecs this machine can stream: those with a hardware encoder.
+pub fn encodable_codecs() -> Vec<Codec> {
+    [Codec::Av1, Codec::H265, Codec::H264]
+        .into_iter()
+        .filter(|c| encoder_candidates(*c).iter().any(|(name, _)| gst::ElementFactory::find(name).is_some()))
+        // Tests only: act like a GPU without an AV1 encoder.
+        .filter(|c| !(*c == Codec::Av1 && std::env::var_os("STREAMER_DEBUG_NO_AV1").is_some()))
+        .collect()
+}
+
 /// Low-latency CBR settings without B-frames, per encoder family.
-pub fn encoder_properties(kind: EncoderKind, kbit: u32, fps: u32, gop: u32) -> String {
+pub fn encoder_properties(kind: EncoderKind, codec: Codec, kbit: u32, fps: u32, gop: u32) -> String {
     match kind {
         // Sunshine-like: ultra-low-latency, CBR, VBV of one frame, no reordering.
         // The element multiplies its kbit value by 1024, so convert to get 1000-based kbit/s.
         EncoderKind::Nvenc => {
             let k = (kbit as u64 * 1000 / 1024) as u32;
+            // AV1 repeats its sequence header with every key frame and has no AUDs.
+            let h26x = if codec == Codec::Av1 { "" } else { " repeat-sequence-header=true aud=false" };
             format!(
                 "preset=p4 tune=ultra-low-latency rc-mode=cbr bitrate={k} vbv-buffer-size={} gop-size={gop} \
-                 bframes=0 zerolatency=true repeat-sequence-header=true aud=false",
+                 bframes=0 zerolatency=true{h26x}",
                 k / fps
             )
         }
@@ -69,6 +81,10 @@ pub fn encoder_properties(kind: EncoderKind, kbit: u32, fps: u32, gop: u32) -> S
 }
 
 pub fn video_decoder(codec: Codec) -> String {
+    // AV1: on the GPU when it can (the element exists only then), else dav1d on the CPU.
+    if codec == Codec::Av1 && !cfg!(target_os = "macos") && gst::ElementFactory::find("d3d11av1dec").is_none() {
+        return "dav1ddec".into();
+    }
     if cfg!(target_os = "macos") {
         // Note: vtdec holds 16 frames on H.265 (stage 0), so macOS viewers want H.264.
         "vtdec_hw".into()

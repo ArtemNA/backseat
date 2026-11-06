@@ -246,12 +246,17 @@ impl Host {
         let desc = format!(
             "queue name=lqueue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! {rate}\
              d3d11convert ! capsfilter name=vsize caps=\"video/x-raw(memory:D3D11Memory),format=NV12,width={w},height={h}\" ! \
-             {enc} name=venc {props} ! {c}parse config-interval=-1 ! video/x-{c},alignment=au ! \
+             {enc} name=venc {props} ! {parse} ! \
              tee name=ltee allow-not-linked=true",
             w = q.width,
             h = q.height,
             enc = self.encoder,
-            props = platform::encoder_properties(self.kind, q.kbit, q.fps, q.fps * self.cfg.keyframe_secs),
+            props = platform::encoder_properties(self.kind, self.cfg.codec, q.kbit, q.fps, q.fps * self.cfg.keyframe_secs),
+            parse = if self.cfg.codec == crate::config::Codec::Av1 {
+                "av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu".to_string()
+            } else {
+                format!("{c}parse config-interval=-1 ! video/x-{c},alignment=au")
+            },
         );
         let bin = gst::parse::bin_from_description(&desc, true).map_err(|e| format!("layer {q}: {e}"))?;
         bin.set_property("name", format!("layer-{}x{}-{}-{}", q.width, q.height, q.fps, q.kbit));
@@ -685,8 +690,13 @@ impl Host {
 
         self.pipeline.add(&webrtc).unwrap();
         let video_pay = make_pay(&format!("rtp{}pay", self.cfg.codec.short()), VIDEO_PT);
-        video_pay.set_property("config-interval", -1i32);
-        video_pay.set_property_from_str("aggregate-mode", "zero-latency");
+        // H.26x payloaders: parameter sets with every key frame, no waiting to aggregate.
+        if video_pay.has_property("config-interval") {
+            video_pay.set_property("config-interval", -1i32);
+        }
+        if video_pay.has_property("aggregate-mode") {
+            video_pay.set_property_from_str("aggregate-mode", "zero-latency");
+        }
         // A viewer starts on the quality it subscribed with, and may change it later.
         let tee = self.layer_tee(start)?;
         let video_queue = branch_queue();
@@ -955,8 +965,13 @@ fn make_pay(factory: &str, pt: u32) -> gst::Element {
     let pay = gst::ElementFactory::make(factory).build().unwrap();
     pay.set_property("pt", pt);
     pay.set_property("mtu", 1200u32);
-    // RTP time equals the host running time, which lets the viewer measure latency.
-    pay.set_property("timestamp-offset", 0u32);
+    // RTP time equals the host running time, which lets the viewer measure latency. The
+    // Rust payloaders (AV1) take it as i64, the C ones as u32.
+    if pay.property_type("timestamp-offset") == Some(i64::static_type()) {
+        pay.set_property("timestamp-offset", 0i64);
+    } else {
+        pay.set_property("timestamp-offset", 0u32);
+    }
     pay
 }
 

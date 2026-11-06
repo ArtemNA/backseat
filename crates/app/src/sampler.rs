@@ -35,6 +35,8 @@ pub struct WatchStats {
     /// Shown inside the main window (else popped out into its own).
     pub embedded: bool,
     pub muted: bool,
+    /// "AV1 · GPU", "AV1 · CPU (dav1d)", "H265 · GPU"; empty before video arrives.
+    pub codec: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -118,8 +120,9 @@ impl Sampler {
 /// The video window's diagnostic overlay, in English like other technical readouts.
 fn overlay_text(w: &WatchStats) -> String {
     let quality = w.quality.as_deref().unwrap_or("streamer's quality");
+    let codec = if w.codec.is_empty() { String::new() } else { format!(" · {}", w.codec) };
     format!(
-        "{quality}\n{:.0} fps shown / {:.0} received\n{:.1} Mbit/s   loss {:.1}%\nlatency {:.0} ms   ping {:.0} ms\nframe gap p99 {:.1} ms   F3 hides",
+        "{quality}{codec}\n{:.0} fps shown / {:.0} received\n{:.1} Mbit/s   loss {:.1}%\nlatency {:.0} ms   ping {:.0} ms\nframe gap p99 {:.1} ms   F3 hides",
         w.shown_fps, w.received_fps, w.mbit, w.loss_pct, w.latency_ms, w.ping_ms, w.gap_p99_ms
     )
 }
@@ -189,6 +192,14 @@ fn sample(inner: &Mutex<Inner>) {
             overlay: st.overlay,
             embedded: st.embedded,
             muted: w.viewer.muted(),
+            codec: w
+                .viewer
+                .video_codec
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(c, dec)| if dec == "dav1ddec" { format!("{c} · CPU (dav1d)") } else { format!("{c} · GPU") })
+                .unwrap_or_default(),
             streamer: w.streamer,
             received_fps: (frames - f0) as f64 / dt,
             shown_fps: (shown.saturating_sub(p0)) as f64 / dt,

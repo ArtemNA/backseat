@@ -97,6 +97,12 @@ fn set_ui_language(lang: String) {
     *sampler::UI_LANG.lock().unwrap() = lang;
 }
 
+/// Codecs this machine can stream (hardware encoders only), e.g. ["h265", "h264", "av1"].
+#[tauri::command]
+fn codecs() -> Vec<String> {
+    media::platform::encodable_codecs().into_iter().map(|c| c.short().to_string()).collect()
+}
+
 #[tauri::command]
 fn built_in_server() -> Option<String> {
     built_in().map(String::from)
@@ -603,7 +609,7 @@ fn main() {
             Ok(())
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
