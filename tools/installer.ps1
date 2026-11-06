@@ -1,11 +1,12 @@
 # Builds dist\streamer-setup-<version>.exe from the bundled folder (tools\bundle.ps1).
-#   tools\installer.ps1 [-NoBundle]
-param([switch]$NoBundle)
+#   tools\installer.ps1 [-NoBundle] [-Server wss://host/ws]
+# -Server fixes the signaling server in the app (no server field).
+param([switch]$NoBundle, [string]$Server = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 if (-not $NoBundle) {
-  & "$PSScriptRoot\bundle.ps1"
+  & "$PSScriptRoot\bundle.ps1" -Server $Server
   if ($LASTEXITCODE) { throw 'bundle failed' }
 }
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value

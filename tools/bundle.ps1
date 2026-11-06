@@ -3,11 +3,13 @@
 # Every DLL import of every shipped binary must resolve inside the folder or to a DLL that
 # ships with Windows itself; otherwise the script fails and names what is missing.
 #
-#   tools\bundle.ps1 [-Out dist\streamer] [-NoBuild]
+#   tools\bundle.ps1 [-Out dist\streamer] [-NoBuild] [-Server wss://host/ws]
+# -Server fixes the signaling server: the app then has no server field.
 param(
   [string]$Out = 'dist\streamer',
   [string]$Gst = '.toolchain\gstreamer',
   [switch]$NoBuild,
+  [string]$Server = '',
   # Tests only: leave this file out, to prove the import check notices.
   [string]$Drop = ''
 )
@@ -39,7 +41,10 @@ if (-not $NoBuild) {
   . "$root\.scratch\env.ps1" 2>$null
   Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
   $env:PKG_CONFIG_PATH = "$Gst\lib\pkgconfig"
+  # Compiled into the app (option_env!); empty means the user types the server.
+  $env:STREAMER_SERVER_URL = $Server
   cargo build --release -p app
+  Remove-Item Env:STREAMER_SERVER_URL -ErrorAction SilentlyContinue
   if ($LASTEXITCODE) { throw 'build failed' }
 }
 

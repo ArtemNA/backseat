@@ -95,6 +95,12 @@ function loadForm() {
     const saved = JSON.parse(localStorage.getItem('join') || '{}');
     for (const k of ['server', 'room', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
   } catch {}
+  // A build made for one server has no server field: the address is fixed.
+  invoke('built_in_server').then((url) => {
+    if (!url) return;
+    $('f-server').value = url;
+    $('f-server').closest('label').classList.add('hidden');
+  });
 }
 $('join-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();

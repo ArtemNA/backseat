@@ -71,8 +71,22 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
     }
 }
 
+/// The signaling server fixed at build time (STREAMER_SERVER_URL when compiling), if any.
+/// Such a build has no server field and ignores any other address.
+const BUILT_IN_SERVER: Option<&str> = option_env!("STREAMER_SERVER_URL");
+
+fn built_in() -> Option<&'static str> {
+    BUILT_IN_SERVER.filter(|s| !s.is_empty())
+}
+
+#[tauri::command]
+fn built_in_server() -> Option<String> {
+    built_in().map(String::from)
+}
+
 #[tauri::command]
 fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String) -> Result<(), String> {
+    let server = built_in().map(String::from).unwrap_or(server);
     do_connect(app.inner(), &server, &room, &name).inspect_err(|e| eprintln!("connect failed: {e}"))
 }
 
@@ -308,7 +322,8 @@ fn automate(app: &Arc<App>) {
         if p.len() != 3 {
             return;
         }
-        if let Err(e) = do_connect(&app, p[0], p[1], p[2]) {
+        // A build with a fixed server goes there, like the join screen does.
+        if let Err(e) = do_connect(&app, built_in().unwrap_or(p[0]), p[1], p[2]) {
             app.notify(format!("error:{e}"));
             return;
         }
@@ -377,7 +392,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
