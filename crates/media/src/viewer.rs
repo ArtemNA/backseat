@@ -412,17 +412,20 @@ fn make(factory: &str) -> Result<gst::Element, String> {
 
 /// Elements after the decoder, ending in a sink. Windows: our own swapchain.
 #[cfg(windows)]
-fn video_tail(frames: Option<std::sync::mpsc::Sender<gst_app::AppSink>>) -> Result<Vec<gst::Element>, String> {
+fn video_tail(frames: Option<std::sync::mpsc::Sender<(gst_app::AppSink, gst::Element)>>) -> Result<Vec<gst::Element>, String> {
     let caps = gst::Caps::builder("video/x-raw")
         .features(["memory:D3D11Memory"])
         .field("format", "BGRA")
         .build();
     let sink = gst_app::AppSink::builder().caps(&caps).max_buffers(1).drop(true).sync(false).build();
+    // The renderer sets the frame size to its window's here; the converter then scales on
+    // the GPU and adds borders to keep the aspect ratio.
+    let fit = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().map_err(|e| e.to_string())?;
     if let Some(tx) = frames {
-        tx.send(sink.clone()).map_err(|_| "renderer gone".to_string())?;
+        tx.send((sink.clone(), fit.clone())).map_err(|_| "renderer gone".to_string())?;
     }
-    // NV12 to BGRA on the GPU, at the stream's own size.
-    Ok(vec![make("d3d11convert")?, sink.upcast()])
+    // NV12 to BGRA on the GPU.
+    Ok(vec![make("d3d11convert")?, fit, sink.upcast()])
 }
 
 #[cfg(not(windows))]

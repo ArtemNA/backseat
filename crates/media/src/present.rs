@@ -35,7 +35,8 @@ extern "C" {
 pub struct Renderer {
     /// Set on the viewer pipeline so the decoder allocates on our device.
     pub context: gst::Context,
-    pub frames: mpsc::Sender<gst_app::AppSink>,
+    /// The appsink frames come from, and the capsfilter that sets their size.
+    pub frames: mpsc::Sender<(gst_app::AppSink, gst::Element)>,
     pub closed: Arc<AtomicBool>,
     pub stats: Arc<RenderStats>,
     pub window: Window,
@@ -223,7 +224,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
 pub fn start() -> Renderer {
     let closed = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::channel();
-    let (frames_tx, frames_rx) = mpsc::channel::<gst_app::AppSink>();
+    let (frames_tx, frames_rx) = mpsc::channel::<(gst_app::AppSink, gst::Element)>();
     let stats = Arc::new(RenderStats::default());
     let (s, c) = (stats.clone(), closed.clone());
     std::thread::Builder::new()
@@ -292,7 +293,7 @@ fn frame_size(sample: &gst::SampleRef) -> Option<(u32, u32)> {
 
 unsafe fn run(
     ready: mpsc::Sender<Send_<(gst::Context, isize)>>,
-    frames: mpsc::Receiver<gst_app::AppSink>,
+    frames: mpsc::Receiver<(gst_app::AppSink, gst::Element)>,
     stats: Arc<RenderStats>,
     closed: Arc<AtomicBool>,
 ) {
@@ -399,6 +400,15 @@ unsafe fn run(
     let mut waitable = windows::Win32::Foundation::HANDLE::default();
     let mut size = (0u32, 0u32);
     let mut sink: Option<gst_app::AppSink> = None;
+    let mut fit: Option<gst::Element> = None;
+    // Frames come at the window's client size, with black borders where the aspect ratios
+    // differ. Stretching the stream's own frame to the window distorted 16:9 on a 21:9
+    // monitor. A new size waits until it holds for a moment, so dragging the border does
+    // not renegotiate on every pixel. STREAMER_DEBUG_NO_FIT keeps the stretch: the spoiled
+    // variant.
+    let no_fit = std::env::var_os("STREAMER_DEBUG_NO_FIT").is_some();
+    let mut applied = (0u32, 0u32);
+    let mut pending = ((0u32, 0u32), std::time::Instant::now());
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -408,8 +418,30 @@ unsafe fn run(
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if let Ok(s) = frames.try_recv() {
+        if let Ok((s, f)) = frames.try_recv() {
             sink = Some(s);
+            fit = Some(f);
+            applied = (0, 0);
+        }
+        if let (Some(f), false) = (&fit, no_fit) {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let want = ((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32);
+            if want.0 > 0 && want.1 > 0 && want != applied {
+                if want != pending.0 {
+                    pending = (want, std::time::Instant::now());
+                } else if applied == (0, 0) || pending.1.elapsed() > std::time::Duration::from_millis(120) {
+                    let caps = gst::Caps::builder("video/x-raw")
+                        .features(["memory:D3D11Memory"])
+                        .field("format", "BGRA")
+                        .field("width", want.0 as i32)
+                        .field("height", want.1 as i32)
+                        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                        .build();
+                    gst::prelude::ObjectExt::set_property(f, "caps", &caps);
+                    applied = want;
+                }
+            }
         }
         let Some(appsink) = &sink else {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -435,7 +467,8 @@ unsafe fn run(
                     BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                     // Several buffers, so DWM holding one never blocks Present (as in Moonlight).
                     BufferCount: 3,
-                    // The window may be any size; DWM scales the stream to it.
+                    // Frames already match the window; stretch only covers the moment
+                    // between a resize and the next frame of the new size.
                     Scaling: DXGI_SCALING_STRETCH,
                     SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                     AlphaMode: DXGI_ALPHA_MODE_IGNORE,
