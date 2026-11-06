@@ -92,7 +92,11 @@ impl Server {
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
-        Router::new().route("/ws", get(upgrade)).with_state(self.clone())
+        Router::new()
+            .route("/ws", get(upgrade))
+            // Health check for the host, and the target of the keep-alive request.
+            .route("/live", get(|| async { "ok" }))
+            .with_state(self.clone())
     }
 
     pub fn peer_count(&self) -> usize {

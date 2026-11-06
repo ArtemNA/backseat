@@ -32,3 +32,6 @@ node_modules/
 
 # Tauri build output
 /crates/app/gen/
+
+# Separate repository: the deployable signaling server
+/deploy/

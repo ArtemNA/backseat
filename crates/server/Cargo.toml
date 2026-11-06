@@ -9,6 +9,7 @@ protocol = { path = "../protocol" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+ureq = "3"
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
