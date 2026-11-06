@@ -157,6 +157,17 @@ struct Thumb {
 #[tauri::command]
 async fn thumbnails(kind: String, ids: Vec<u64>) -> Vec<Thumb> {
     let t0 = std::time::Instant::now();
+    // Diagnosis only: STREAMER_APP_THUMBS=off|monitors|windows limits which pictures are taken.
+    let only = std::env::var("STREAMER_APP_THUMBS").unwrap_or_default();
+    let skip = match only.as_str() {
+        "off" => true,
+        "monitors" => kind == "window",
+        "windows" => kind != "window",
+        _ => false,
+    };
+    if skip {
+        return ids.into_iter().map(|id| Thumb { id, image: None, icon: None }).collect();
+    }
     let out: Vec<Thumb> = ids
         .into_iter()
         .map(|id| {
@@ -182,9 +193,11 @@ fn test_open_golive() -> bool {
 }
 
 /// Tests only: STREAMER_APP_UI_STRESS keeps the UI busy (dialog with pictures, language).
+/// "screen" or "window": which tab the busy UI opens; None when not busy.
 #[tauri::command]
-fn test_ui_stress() -> bool {
-    std::env::var_os("STREAMER_APP_UI_STRESS").is_some()
+fn test_ui_stress() -> Option<String> {
+    let v = std::env::var("STREAMER_APP_UI_STRESS").ok()?;
+    Some(if v == "windows" { "window".into() } else { "screen".into() })
 }
 
 /// Tests only: STREAMER_APP_UPLOAD_LIMIT sets the upload limit (Mbit/s) for screenshots.

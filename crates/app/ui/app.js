@@ -379,8 +379,9 @@ setLanguage(lang);
 invoke('forced_language').then((l) => { if (l) { setLanguage(l); fillLanguages(); applyStrings(); } });
 // Tests only: keep the UI busy: open and close the go-live dialog (which takes pictures
 // of every source), switch the language, every 1.5 s.
-invoke('test_ui_stress').then((on) => {
-  if (!on) return;
+invoke('test_ui_stress').then((tab) => {
+  if (!tab) return;
+  state.gl.tab = tab;
   let n = 0;
   setInterval(() => {
     n++;
