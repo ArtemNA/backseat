@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -98,7 +98,29 @@ impl Window {
     }
 
     pub fn state(&self) -> WindowState {
-        WINDOWS.lock().unwrap().get(&self.hwnd).map(|w| WindowState { fullscreen: w.fullscreen.is_some(), topmost: w.topmost }).unwrap_or_default()
+        WINDOWS
+            .lock()
+            .unwrap()
+            .get(&self.hwnd)
+            .map(|w| WindowState { fullscreen: w.fullscreen.is_some(), topmost: w.topmost, overlay: w.overlay })
+            .unwrap_or_default()
+    }
+
+    /// Shows or hides the diagnostic overlay (F3 in the window does the same).
+    pub fn set_overlay(&self, on: bool) {
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
+            st.overlay = on;
+        }
+    }
+
+    /// The overlay's text; drawn while the overlay is on.
+    pub fn set_overlay_text(&self, text: &str) {
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
+            if st.overlay_text != text {
+                st.overlay_text = text.to_string();
+                st.overlay_version += 1;
+            }
+        }
     }
 }
 
@@ -106,6 +128,7 @@ impl Window {
 pub struct WindowState {
     pub fullscreen: bool,
     pub topmost: bool,
+    pub overlay: bool,
 }
 
 /// Per-window state, by HWND: an app may show several streams at once.
@@ -114,6 +137,16 @@ struct WinState {
     /// Placement and style before fullscreen, while fullscreen.
     fullscreen: Option<(WINDOWPLACEMENT, i32)>,
     topmost: bool,
+    overlay: bool,
+    overlay_text: String,
+    overlay_version: u64,
+}
+
+/// The overlay text and its version while the overlay is on.
+fn overlay_of(hwnd: HWND) -> Option<(u64, String)> {
+    let map = WINDOWS.lock().unwrap();
+    let st = map.get(&(hwnd.0 as isize))?;
+    (st.overlay && !st.overlay_text.is_empty()).then(|| (st.overlay_version, st.overlay_text.clone()))
 }
 
 static WINDOWS: std::sync::LazyLock<Mutex<HashMap<isize, WinState>>> = std::sync::LazyLock::new(Default::default);
@@ -121,6 +154,7 @@ static WINDOWS: std::sync::LazyLock<Mutex<HashMap<isize, WinState>>> = std::sync
 /// Virtual-key codes, without the keyboard feature of the windows crate.
 const KEY_ESCAPE: usize = 0x1B;
 const KEY_F11: usize = 0x7A;
+const KEY_F3: usize = 0x72;
 
 unsafe fn fullscreen(hwnd: HWND, mode: usize) {
     let mut map = WINDOWS.lock().unwrap();
@@ -206,6 +240,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
             }
             WM_KEYDOWN if w.0 == KEY_F11 => {
                 fullscreen(hwnd, 2);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == KEY_F3 => {
+                if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                    st.overlay = !st.overlay;
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN if w.0 == KEY_ESCAPE => {
@@ -374,7 +414,12 @@ unsafe fn run(
         None,
     )
     .unwrap();
-    WINDOWS.lock().unwrap().insert(hwnd.0 as isize, WinState { closed, fullscreen: None, topmost: false });
+    // STREAMER_OVERLAY=1: windows open with the overlay on (diagnosis and tests).
+    let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some();
+    WINDOWS.lock().unwrap().insert(
+        hwnd.0 as isize,
+        WinState { closed, fullscreen: None, topmost: false, overlay: overlay_on, overlay_text: String::new(), overlay_version: 0 },
+    );
 
     // Context calls from this thread and from GStreamer are then serialized by D3D11 itself,
     // so Present can run without holding GStreamer's device lock.
@@ -409,6 +454,7 @@ unsafe fn run(
     let no_fit = std::env::var_os("STREAMER_DEBUG_NO_FIT").is_some();
     let mut applied = (0u32, 0u32);
     let mut pending = ((0u32, 0u32), std::time::Instant::now());
+    let mut overlay: Option<crate::overlay::Overlay> = None;
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -532,6 +578,18 @@ unsafe fn run(
         let _ = sh.km_present.AcquireSync(1, 100);
         pcontext.CopyResource(&back, &sh.present);
         let _ = sh.km_present.ReleaseSync(0);
+        if let Some((version, text)) = overlay_of(hwnd) {
+            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            if overlay.as_ref().is_some_and(|o| o.scale() != scale) {
+                overlay = None;
+            }
+            if overlay.is_none() {
+                overlay = crate::overlay::Overlay::new(&pdevice, scale).map_err(|e| eprintln!("overlay: {e}")).ok();
+            }
+            if let Some(o) = overlay.as_mut() {
+                o.draw(&pcontext, &back, size, version, &text);
+            }
+        }
         drop(back);
 
         let presenting = std::time::Instant::now();

@@ -78,7 +78,8 @@ const STRINGS = {
     'win.show': 'Show window',
     'win.fullscreen': 'Fullscreen',
     'win.on_top': 'Always on top',
-    'win.keys': 'In the video window: F11 or double click — fullscreen, Esc — leave it.',
+    'win.stats': 'Stats on video',
+    'win.keys': 'In the video window: F11 or double click — fullscreen, Esc — leave it, F3 — stats.',
     'unit.ms': 'ms',
   },
   uk: {
@@ -159,7 +160,8 @@ const STRINGS = {
     'win.show': 'Показати вікно',
     'win.fullscreen': 'На весь екран',
     'win.on_top': 'Поверх усіх вікон',
-    'win.keys': 'У вікні відео: F11 або подвійний клік — на весь екран, Esc — вийти.',
+    'win.stats': 'Статистика на відео',
+    'win.keys': 'У вікні відео: F11 або подвійний клік — на весь екран, Esc — вийти, F3 — статистика.',
     'unit.ms': 'мс',
   },
   ru: {
@@ -240,7 +242,8 @@ const STRINGS = {
     'win.show': 'Показать окно',
     'win.fullscreen': 'На весь экран',
     'win.on_top': 'Поверх всех окон',
-    'win.keys': 'В окне видео: F11 или двойной клик — на весь экран, Esc — выйти.',
+    'win.stats': 'Статистика на видео',
+    'win.keys': 'В окне видео: F11 или двойной клик — на весь экран, Esc — выйти, F3 — статистика.',
     'unit.ms': 'мс',
   },
 };

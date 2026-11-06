@@ -25,6 +25,13 @@ pub struct WatchStats {
     /// Time between decoded frames in the last second, ms.
     pub gap_p99_ms: f64,
     pub gap_max_ms: f64,
+    /// Video received, Mbit/s.
+    pub mbit: f64,
+    /// Video packets lost in the last second, percent.
+    pub loss_pct: f64,
+    /// Round trip of the clock ping (through signaling), ms; 0 before the first.
+    pub ping_ms: f64,
+    pub overlay: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -69,6 +76,8 @@ struct Inner {
     live_since: Option<Instant>,
     /// Per watch: frames decoded and presented at the last sample.
     last: HashMap<u64, (u64, u64, Instant)>,
+    /// Per watch: video bytes, packets received and lost at the last sample.
+    net: HashMap<u64, (i64, i64, i64)>,
     /// Per viewer of our stream: bytes sent at the last sample.
     sent: HashMap<u64, (u64, Instant)>,
     marker: Marker,
@@ -103,6 +112,15 @@ impl Sampler {
     }
 }
 
+/// The video window's diagnostic overlay, in English like other technical readouts.
+fn overlay_text(w: &WatchStats) -> String {
+    let quality = w.quality.as_deref().unwrap_or("streamer's quality");
+    format!(
+        "{quality}\n{:.0} fps shown / {:.0} received\n{:.1} Mbit/s   loss {:.1}%\nlatency {:.0} ms   ping {:.0} ms\nframe gap p99 {:.1} ms   F3 hides",
+        w.shown_fps, w.received_fps, w.mbit, w.loss_pct, w.latency_ms, w.ping_ms, w.gap_p99_ms
+    )
+}
+
 fn sample(inner: &Mutex<Inner>) {
     let session = inner.lock().unwrap().session.as_ref().and_then(|w| w.upgrade());
     let Some(s) = session else { return };
@@ -115,12 +133,28 @@ fn sample(inner: &Mutex<Inner>) {
         let shown = w.viewer.render_report().map(|r| r.presented).unwrap_or(0);
         let lat = w.viewer.stats.video_latency.take();
         let gaps = w.viewer.stats.frame_interval.take();
+        let net = w.viewer.inbound().map(|n| (n.bytes, n.received, n.lost));
         let mut i = inner.lock().unwrap();
         let (f0, p0, t0) = i.last.get(&w.streamer).copied().unwrap_or((frames, shown, now));
         let dt = now.duration_since(t0).as_secs_f64().max(0.001);
         i.last.insert(w.streamer, (frames, shown, now));
+        let (mbit, loss_pct) = match (net, i.net.get(&w.streamer).copied()) {
+            (Some((b, r, l)), Some((b0, r0, l0))) => {
+                let (dr, dl) = ((r - r0).max(0) as f64, (l - l0).max(0) as f64);
+                ((b - b0).max(0) as f64 * 8.0 / dt / 1e6, if dr + dl > 0.0 { dl * 100.0 / (dr + dl) } else { 0.0 })
+            }
+            _ => (0.0, 0.0),
+        };
+        if let Some(n) = net {
+            i.net.insert(w.streamer, n);
+        }
         seen.push(w.streamer);
+        let st = w.viewer.window.map(|x| x.state()).unwrap_or_default();
         watches.push(WatchStats {
+            mbit,
+            loss_pct,
+            ping_ms: w.clock.last_rtt_ns().map(|n| n as f64 / 1e6).unwrap_or(0.0),
+            overlay: st.overlay,
             streamer: w.streamer,
             received_fps: (frames - f0) as f64 / dt,
             shown_fps: (shown.saturating_sub(p0)) as f64 / dt,
@@ -133,7 +167,17 @@ fn sample(inner: &Mutex<Inner>) {
             gap_max_ms: if gaps.is_empty() { 0.0 } else { gaps.ms(1.0) },
         });
     }
-    inner.lock().unwrap().last.retain(|k, _| seen.contains(k));
+    {
+        let mut i = inner.lock().unwrap();
+        i.last.retain(|k, _| seen.contains(k));
+        i.net.retain(|k, _| seen.contains(k));
+    }
+    for w in s.watching() {
+        let Some(st) = watches.iter().find(|x| x.streamer == w.streamer) else { continue };
+        if let (Some(win), true) = (w.viewer.window, st.overlay) {
+            win.set_overlay_text(&overlay_text(st));
+        }
+    }
     if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
         for w in &watches {
             eprintln!(

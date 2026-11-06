@@ -2215,6 +2215,7 @@ dependencies = [
  "serde",
  "tungstenite 0.30.0",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ pub mod clock;
 pub mod config;
 pub mod host;
 pub mod ice;
+pub mod logfile;
 pub mod marker;
 pub mod netsim;
 pub mod platform;
@@ -17,11 +18,43 @@ pub mod thumbs;
 pub mod viewer;
 
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
 pub mod present;
 
 pub fn init() {
     platform::init_timer();
+    use_bundled_plugins();
     gst::init().expect("GStreamer init failed");
+}
+
+/// An installed copy carries its own plugins in `gstreamer-1.0` next to the executable
+/// (the libraries themselves sit next to it, so Windows finds them first). Point
+/// GStreamer at that folder only, so a GStreamer installed elsewhere on the machine is
+/// never mixed in, and keep the plugin registry in the user's local app data. Without
+/// that folder (a developer build) nothing changes.
+fn use_bundled_plugins() {
+    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("gstreamer-1.0"))) else { return };
+    if !dir.is_dir() {
+        return;
+    }
+    let registry = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("streamer")
+        .join(format!("gst-registry-{}.bin", env!("CARGO_PKG_VERSION")));
+    if let Some(parent) = registry.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Runs before GStreamer or any other thread of ours starts.
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &dir);
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH", &dir);
+    std::env::remove_var("GST_PLUGIN_PATH_1_0");
+    std::env::remove_var("GST_PLUGIN_PATH");
+    std::env::set_var("GST_REGISTRY_1_0", &registry);
+    std::env::set_var("GST_REGISTRY", &registry);
+    // Scan in-process: no separate scanner executable to ship.
+    std::env::set_var("GST_REGISTRY_FORK", "no");
 }
 
 /// Drains a pipeline's bus on its own thread, printing errors and warnings. Undrained

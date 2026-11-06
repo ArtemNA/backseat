@@ -70,6 +70,8 @@ pub struct Inbound {
     pub repaired: i64,
     pub nack: i64,
     pub pli: i64,
+    /// Video payload bytes received.
+    pub bytes: i64,
 }
 
 /// Presentation counters since start, and the longest Present and lock hold since last call.
@@ -242,6 +244,7 @@ impl Viewer {
                 repaired: num(&s, "packets-repaired"),
                 nack: num(&s, "nack-count"),
                 pli: num(&s, "pli-count"),
+                bytes: num(&s, "bytes-received"),
             })
         })
     }

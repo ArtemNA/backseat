@@ -61,6 +61,11 @@ impl HostClock {
         Some(rtt)
     }
 
+    /// The latest round trip of the ping (through the signaling path, not the media one).
+    pub fn last_rtt_ns(&self) -> Option<u64> {
+        self.samples.lock().unwrap().back().map(|s| s.0)
+    }
+
     pub fn best_rtt_ns(&self) -> Option<u64> {
         match self.best_rtt_ns.load(Ordering::Relaxed) {
             u64::MAX => None,

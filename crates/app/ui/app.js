@@ -190,6 +190,7 @@ function renderContent(s) {
     c.querySelector('[data-k=lat]').textContent = ms(w.latency_ms);
     c.querySelector('[data-k=fs]')?.setAttribute('aria-pressed', String(w.fullscreen));
     c.querySelector('[data-k=top]')?.setAttribute('aria-pressed', String(w.topmost));
+    c.querySelector('[data-k=ov]')?.setAttribute('aria-pressed', String(w.overlay));
     c.querySelector('[data-k=sub]').textContent = `${t('card.watching')} · ${requestLabel(w.quality)}`;
     // Show what is being watched in the pickers until the viewer picks something else.
     const ch = state.choice[w.streamer];
@@ -240,7 +241,8 @@ function card(p) {
       el('div', { class: 'controls' },
         el('button', { class: 'btn', type: 'button', text: t('win.show'), onclick: () => act('show') }),
         el('button', { class: 'btn', type: 'button', 'data-k': 'fs', 'aria-pressed': 'false', text: t('win.fullscreen'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'windowed' : 'fullscreen') }),
-        el('button', { class: 'btn', type: 'button', 'data-k': 'top', 'aria-pressed': 'false', text: t('win.on_top'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'not_topmost' : 'topmost') })),
+        el('button', { class: 'btn', type: 'button', 'data-k': 'top', 'aria-pressed': 'false', text: t('win.on_top'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'not_topmost' : 'topmost') }),
+        el('button', { class: 'btn', type: 'button', 'data-k': 'ov', 'aria-pressed': 'false', text: t('win.stats'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'no_overlay' : 'overlay') })),
       el('span', { class: 'small', text: t('win.keys') }));
     controls.append(
       el('button', { class: 'btn', type: 'button', text: t('card.apply'), onclick: async () => { const q = requestOf(p.id); if (q) await invoke('set_quality', { streamer: p.id, quality: q }); } }),

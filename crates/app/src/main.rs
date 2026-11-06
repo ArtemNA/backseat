@@ -140,6 +140,8 @@ fn video_window_do(app: tauri::State<'_, Arc<App>>, streamer: u64, action: Strin
         "toggle_fullscreen" => w.toggle_fullscreen(),
         "topmost" => w.set_topmost(true),
         "not_topmost" => w.set_topmost(false),
+        "overlay" => w.set_overlay(true),
+        "no_overlay" => w.set_overlay(false),
         _ => return Err(format!("unknown window action {action}")),
     }
     Ok(())
@@ -357,7 +359,11 @@ fn test_window_actions(w: Option<media::present::Window>) {
 }
 
 fn main() {
+    if let Some(p) = media::logfile::start() {
+        eprintln!("log file: {}", p.display());
+    }
     media::init();
+    media::logfile::gst_warnings();
     let app = Arc::new(App::default());
     app.sampler.start();
     automate(&app);
