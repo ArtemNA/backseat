@@ -13,6 +13,7 @@ pub mod server_client;
 pub mod session;
 pub mod signal;
 pub mod stats;
+pub mod thumbs;
 pub mod viewer;
 
 #[cfg(windows)]

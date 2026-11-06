@@ -14,7 +14,25 @@ const el = (tag, attrs = {}, ...kids) => {
 
 const PRESETS = [2000, 4000, 8000, 12000, 20000, 35000, 50000];
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
-const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, sources: null } };
+const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, sources: null, thumbs: {} } };
+
+// Pictures for the visible tab of the source picker, every 2 s while it is open.
+async function refreshThumbs() {
+  const g = state.gl;
+  if (!$('golive').open || !g.sources) return;
+  const tab = g.tab;
+  const ids = tab === 'screen' ? g.sources.monitors.map((m) => m.handle) : g.sources.windows.map((w) => w.hwnd);
+  const shots = await invoke('thumbnails', { kind: tab === 'screen' ? 'monitor' : 'window', ids });
+  for (const s of shots) g.thumbs[`${tab}:${s.id}`] = s;
+  // Swap pictures in place, so the grid does not jump.
+  for (const s of shots) {
+    const card = document.querySelector(`#gl-sources [data-src="${s.id}"] .shot`);
+    if (!card || !s.image) continue;
+    const img = card.querySelector('img');
+    if (img) img.src = s.image; else card.replaceChildren(el('img', { src: s.image, alt: '' }));
+  }
+}
+setInterval(refreshThumbs, 2000);
 
 // ---------- language ----------
 function applyStrings() {
@@ -268,10 +286,13 @@ function renderGoLive() {
   $('gl-tab-window').setAttribute('aria-pressed', String(g.tab === 'window'));
   const list = g.tab === 'screen'
     ? (g.sources?.monitors || []).map((m) => ({ id: m.handle, title: `${m.name.replace('\\\\.\\', '')}${m.primary ? ' · ' + t('golive.primary') : ''}`, sub: `${m.width}×${m.height}` }))
-    : (g.sources?.windows || []).map((w) => ({ id: w.hwnd, title: w.title, sub: w.minimized ? t('golive.minimized') : w.exe, pid: w.pid }));
+    : (g.sources?.windows || []).map((w) => ({ id: w.hwnd, title: w.title, sub: w.exe, minimized: w.minimized, pid: w.pid }));
   if (!list.some((x) => g.pick && x.id === g.pick.id)) g.pick = g.tab === 'screen' ? list[0] || null : null;
-  $('gl-sources').replaceChildren(...list.map((x) => el('button', { type: 'button', class: 'source', 'aria-pressed': String(g.pick?.id === x.id), onclick: () => { g.pick = x; renderGoLive(); } },
-    el('span', { text: x.title }), el('span', { class: 'small', text: x.sub }))));
+  const shot = (id) => g.thumbs[`${g.tab}:${id}`] || {};
+  $('gl-sources').replaceChildren(...list.map((x) => el('button', { type: 'button', class: 'source', 'aria-pressed': String(g.pick?.id === x.id), 'data-src': x.id, onclick: () => { g.pick = x; renderGoLive(); } },
+    el('span', { class: 'shot' }, shot(x.id).image ? el('img', { src: shot(x.id).image, alt: '' }) : el('span', { class: 'small', text: x.minimized ? t('golive.minimized') : '' })),
+    el('span', { class: 'src-title' }, shot(x.id).icon ? el('img', { class: 'src-icon', src: shot(x.id).icon, alt: '' }) : null, el('span', { text: x.title })),
+    el('span', { class: 'small', text: x.sub }))));
   $('gl-audio-app').classList.toggle('hidden', g.tab !== 'window');
   if (g.tab !== 'window' && document.querySelector('input[name=audio]:checked')?.value === 'app') document.querySelector('input[name=audio][value=system]').checked = true;
   seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; renderGoLive(); });
@@ -286,11 +307,13 @@ function renderGoLive() {
 $('go-live').addEventListener('click', async () => {
   $('gl-error').classList.add('hidden');
   state.gl.sources = await invoke('sources');
+  state.gl.thumbs = {};
   renderGoLive();
   $('golive').showModal();
+  refreshThumbs().then(renderGoLive);
 });
-$('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); });
-$('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); });
+$('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); refreshThumbs(); });
+$('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); refreshThumbs(); });
 $('gl-cancel').addEventListener('click', () => $('golive').close());
 $('gl-start').addEventListener('click', async () => {
   const g = state.gl;

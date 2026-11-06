@@ -123,6 +123,37 @@ fn sources() -> Sources {
     Sources { monitors, windows }
 }
 
+#[derive(Serialize)]
+struct Thumb {
+    id: u64,
+    /// A `data:` URL, None when there is nothing to show (a minimized window).
+    image: Option<String>,
+    icon: Option<String>,
+}
+
+/// Pictures for the source picker. Async, so the work runs off the UI thread.
+#[tauri::command]
+async fn thumbnails(kind: String, ids: Vec<u64>) -> Vec<Thumb> {
+    let t0 = std::time::Instant::now();
+    let out: Vec<Thumb> = ids
+        .into_iter()
+        .map(|id| {
+            if id == 0 && dev_sources() {
+                return Thumb { id, image: Some(media::thumbs::test_pattern(256, 144)), icon: None };
+            }
+            match kind.as_str() {
+                "window" => Thumb { id, image: media::thumbs::window(id, 256, 144), icon: media::thumbs::icon(id, 20) },
+                _ => Thumb { id, image: media::thumbs::monitor(id, 256, 144), icon: None },
+            }
+        })
+        .collect();
+    if std::env::var_os("STREAMER_APP_DEBUG_THUMBS").is_some() {
+        let bytes: usize = out.iter().map(|t| t.image.as_ref().map_or(0, |s| s.len()) + t.icon.as_ref().map_or(0, |s| s.len())).sum();
+        eprintln!("thumbs: {} {kind} in {} ms, {} KB", out.len(), t0.elapsed().as_millis(), bytes / 1024);
+    }
+    out
+}
+
 #[tauri::command]
 fn test_open_golive() -> bool {
     std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some()
@@ -256,7 +287,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
