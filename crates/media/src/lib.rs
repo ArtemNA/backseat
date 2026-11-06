@@ -45,6 +45,19 @@ pub(crate) fn drain_bus(pipeline: &gst::Pipeline, label: &'static str) {
                     gst::MessageView::Error(e) => {
                         eprintln!("{label}: error from {:?}: {} ({:?})", e.src().map(|s| s.name()), e.error(), e.debug())
                     }
+                    // STREAMER_DEBUG_STATES traces the pipeline's own state changes and the
+                    // async (preroll) messages that drive them.
+                    gst::MessageView::StateChanged(s)
+                        if std::env::var_os("STREAMER_DEBUG_STATES").is_some()
+                            && s.src().is_some_and(|o| o.type_().is_a(gst::Pipeline::static_type())) =>
+                    {
+                        eprintln!("{label}: pipeline {:?} -> {:?} (pending {:?})", s.old(), s.current(), s.pending())
+                    }
+                    gst::MessageView::AsyncStart(_) | gst::MessageView::AsyncDone(_)
+                        if std::env::var_os("STREAMER_DEBUG_STATES").is_some() =>
+                    {
+                        eprintln!("{label}: {:?} from {:?}", msg.type_(), msg.src().map(|s| s.path_string()))
+                    }
                     gst::MessageView::Warning(w) => {
                         eprintln!("{label}: warning from {:?}: {}", w.src().map(|s| s.name()), w.error())
                     }

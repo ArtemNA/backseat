@@ -13,7 +13,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: viewer (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] [--watch STREAMER] | \
---listen 0.0.0.0:7700) [--stun stun://HOST:PORT|none] [--turn turn://USER:PASS@HOST:PORT] [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--decoder NAME] \
+--listen 0.0.0.0:7700) [--stun stun://HOST:PORT|none] [--turn turn://USER:PASS@HOST:PORT] [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--quality '720p30 4000'] [--decoder NAME] \
 [--seconds 0] [--report-secs 5]";
 
 /// Test only: withholds our ICE candidates, so together with ignoring the host's no path
@@ -33,6 +33,8 @@ fn main() {
     let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
     let mut subscribe = None;
     let mut never_answer = false;
+    // Quality to ask the host for, as "720p30 4000"; the host never gives more than its own.
+    let mut quality = None::<String>;
     let mut no_ice = false;
     let mut cfg =
         ViewerConfig {
@@ -100,6 +102,10 @@ fn main() {
                     "--debug-cap-kbit" => val.parse().map(|v| cfg.impair.cap_kbit = v).is_ok(),
                     // Test only: add this one-way delay to the host's traffic, in ms.
                     "--debug-delay" => val.parse().map(|v| cfg.impair.delay_ms = v).is_ok(),
+                    "--quality" => {
+                        quality = Some(val.clone());
+                        true
+                    }
                     "--decoder" => {
                         cfg.decoder = Some(val.clone());
                         true
@@ -203,6 +209,23 @@ fn main() {
     }
     if let Some((client, streamer)) = subscribe.take() {
         client.send(ClientMsg::Subscribe { streamer });
+    }
+    if let Some(q) = &quality {
+        link.send(media::host::QUALITY_MSG, q);
+    }
+    // Test only: STREAMER_DEBUG_QUALITY_CYCLE="SECS;Q1;Q2;..." asks for each quality in turn.
+    if let Ok(cycle) = std::env::var("STREAMER_DEBUG_QUALITY_CYCLE") {
+        let mut parts = cycle.split(';');
+        let secs: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(5);
+        let list: Vec<String> = parts.map(str::to_string).collect();
+        let link = link.clone();
+        std::thread::spawn(move || {
+            for q in list.iter().cycle() {
+                std::thread::sleep(Duration::from_secs(secs));
+                println!("viewer: asking for {q}");
+                link.send(media::host::QUALITY_MSG, q);
+            }
+        });
     }
 
     {

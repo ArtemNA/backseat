@@ -55,7 +55,8 @@ impl ServerClient {
             .name("signaling".into())
             .spawn(move || loop {
                 while let Ok(m) = out_rx.try_recv() {
-                    if ws.send(Message::Text(m.to_json().into())).is_err() {
+                    if let Err(e) = ws.send(Message::Text(m.to_json().into())) {
+                        eprintln!("signaling: send failed: {e}");
                         return;
                     }
                 }
@@ -68,15 +69,24 @@ impl ServerClient {
                         }
                         Err(e) => eprintln!("signaling: bad server message: {e}"),
                     },
-                    Ok(Message::Close(_)) => return,
+                    Ok(Message::Close(f)) => {
+                        eprintln!("signaling: server closed the connection: {f:?}");
+                        return;
+                    }
                     Ok(_) => {}
+                    // On Windows a read that times out can also report ERROR_IO_PENDING (997);
+                    // treating it as a lost connection dropped a host after ~5 min of churn.
                     Err(tungstenite::Error::Io(e))
-                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+                            || e.raw_os_error() == Some(997) =>
                     {
                         // Flushes a queued pong, if the read produced one.
                         let _ = ws.flush();
                     }
-                    Err(_) => return,
+                    Err(e) => {
+                        eprintln!("signaling: connection lost: {e}");
+                        return;
+                    }
                 }
             })
             .unwrap();

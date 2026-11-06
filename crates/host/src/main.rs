@@ -241,6 +241,25 @@ fn main() {
             s.max_frame_bytes.swap(0, Ordering::Relaxed) / 1000,
             s.key_requests_dropped.load(Ordering::Relaxed),
         );
+        host.housekeeping();
+        // Layers below the host's own quality, started because some viewer asked for less.
+        for l in host.layers().into_iter().filter(|l| l.quality != host.ceiling) {
+            let s = &l.stats;
+            let (frames, bytes, keys) = (
+                s.frames.swap(0, Ordering::Relaxed),
+                s.bytes.swap(0, Ordering::Relaxed),
+                s.key_frames.swap(0, Ordering::Relaxed),
+            );
+            println!(
+                "host   layer {}{} | viewers {} | {:.1} fps | {:.2} Mbit/s | {} key frames",
+                l.quality,
+                if l.parked { " (parked)" } else { "" },
+                l.viewers,
+                frames as f64 / dt,
+                bytes as f64 * 8.0 / dt / 1e6,
+                keys,
+            );
+        }
         for q in host.viewer_quality() {
             let problems = marker.assess(&q);
             let mark = if problems.is_empty() {
