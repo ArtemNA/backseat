@@ -36,6 +36,45 @@ a { color: #8fb4ff; }
 /* Shell */
 .shell { display: flex; height: 100vh; }
 .rail { width: 72px; background: var(--rail); display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 0; }
+/* Saved rooms, Discord-style: online only in the open one. */
+.rail .r { position: relative; width: 48px; height: 48px; border-radius: 24px; border: 0; background: #313338; color: #dbdee1; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; transition: border-radius .15s; }
+.rail .r:hover { border-radius: 16px; background: var(--accent); color: #fff; }
+.rail .r.on { border-radius: 16px; background: var(--accent); color: #fff; }
+.rail .r.on::before { content: ""; position: absolute; left: -12px; width: 4px; height: 40px; border-radius: 0 4px 4px 0; background: #fff; }
+.rail .sep { width: 32px; height: 2px; background: #35363c; border-radius: 1px; flex: none; }
+.rail .r.add { color: var(--ok); font-size: 24px; font-weight: 400; }
+.rail .r.add:hover { background: var(--ok); color: #fff; }
+.menu { position: fixed; z-index: 20; background: #111214; border-radius: 6px; padding: 6px; min-width: 190px; box-shadow: 0 6px 20px #000a; display: flex; flex-direction: column; }
+.menu button { text-align: left; border: 0; background: transparent; padding: 8px 10px; border-radius: 4px; color: #dbdee1; font-weight: 500; font-size: 13px; }
+.menu button:hover { background: var(--accent); color: #fff; }
+.menu button.danger { color: #f0767b; }
+.menu button.danger:hover { background: var(--danger); color: #fff; }
+.small-dlg { width: 380px; }
+#rename input { background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; }
+
+/* Watched streams: a grid of tiles; the video itself is a native window placed over
+   each .video box, so nothing from the page may be drawn on top of it. */
+.stage { flex: 1 1 60%; min-height: 0; padding: 16px 16px 8px; display: grid; gap: 12px; }
+.stage.n1 { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); }
+.stage.n2 { grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr); }
+.stage.n4 { grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+.vtile { display: flex; flex-direction: column; background: var(--card); border-radius: 10px; overflow: hidden; min-height: 0; min-width: 0; }
+.vtile .video { flex: 1; min-height: 120px; background: #000; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; text-align: center; padding: 8px; }
+.vbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; flex-wrap: wrap; }
+.vbar .name { font-weight: 600; color: var(--bright); }
+.vbar .vstat { font-size: 12px; color: var(--muted); margin-right: auto; white-space: nowrap; }
+.vbar .vstat.warn { color: var(--warn); }
+.vbar select { background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 5px 6px; max-width: 150px; }
+.vbar .btn { min-height: 28px; height: 28px; padding: 0 9px; font-size: 12px; }
+.vbar .btn.icon { width: 30px; padding: 0; justify-content: center; font-size: 15px; }
+.vbar select { height: 28px; padding: 0 4px; font-size: 12px; max-width: 128px; }
+.below { flex: 1 1 40%; min-height: 0; }
+.stage:not(.hidden) + .below { flex: 0 1 auto; max-height: 45%; }
+.chips { display: flex; gap: 10px; flex-wrap: wrap; }
+.chip { display: flex; align-items: center; gap: 10px; background: var(--card); border-radius: 8px; padding: 8px 10px 8px 8px; }
+.chip b { color: var(--bright); }
+.chip .btn { height: 30px; }
+
 .room-icon { width: 48px; height: 48px; border-radius: 16px; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; }
 .side { width: 248px; background: var(--side); display: flex; flex-direction: column; }
 .side header, .main > header { height: 48px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 1px solid #1f2023; font-weight: 600; color: var(--bright); }

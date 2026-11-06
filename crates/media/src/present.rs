@@ -53,6 +53,11 @@ const WM_SHOW: u32 = WM_APP + 1;
 const WM_FULLSCREEN: u32 = WM_APP + 2;
 /// wparam: 0 off, 1 on.
 const WM_TOPMOST: u32 = WM_APP + 3;
+/// Apply the slot, popped-out and hidden state from WinState.
+const WM_PLACE: u32 = WM_APP + 4;
+/// Close for good (the watch ended). A user closing a popped-out window sends WM_CLOSE,
+/// which puts it back into the app instead.
+const WM_END: u32 = WM_APP + 5;
 
 impl Window {
     fn post(&self, msg: u32, w: usize) {
@@ -82,7 +87,31 @@ impl Window {
 
     /// Closes the window; its thread then ends.
     pub fn close(&self) {
-        self.post(WM_CLOSE, 0);
+        self.post(WM_END, 0);
+    }
+
+    fn update(&self, f: impl FnOnce(&mut WinState)) {
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
+            f(st);
+        }
+        self.post(WM_PLACE, 0);
+    }
+
+    /// Where the video goes inside the app's main window, in its client pixels; None
+    /// hides it (no slot on screen).
+    pub fn place(&self, rect: Option<(i32, i32, i32, i32)>) {
+        self.update(|st| st.slot = rect.map(|(x, y, w, h)| RECT { left: x, top: y, right: x + w, bottom: y + h }));
+    }
+
+    /// Takes the video out into a window of its own, or puts it back into the app.
+    pub fn set_popped(&self, popped: bool) {
+        self.update(|st| st.popped = popped);
+    }
+
+    /// Hides embedded video while the app shows something over it (a dialog): the
+    /// webview cannot draw above a child window.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.update(|st| st.hidden = hidden);
     }
 
     /// Whether the window still exists.
@@ -102,7 +131,12 @@ impl Window {
             .lock()
             .unwrap()
             .get(&self.hwnd)
-            .map(|w| WindowState { fullscreen: w.fullscreen.is_some(), topmost: w.topmost, overlay: w.overlay })
+            .map(|w| WindowState {
+                fullscreen: w.fullscreen.is_some(),
+                topmost: w.topmost,
+                overlay: w.overlay,
+                embedded: w.parent != 0 && !w.popped,
+            })
             .unwrap_or_default()
     }
 
@@ -146,6 +180,8 @@ pub struct WindowState {
     pub fullscreen: bool,
     pub topmost: bool,
     pub overlay: bool,
+    /// Shown inside the app's main window (not popped out).
+    pub embedded: bool,
 }
 
 /// Per-window state, by HWND: an app may show several streams at once.
@@ -159,6 +195,16 @@ struct WinState {
     overlay_version: u64,
     /// Shown before the first frame; see `Window::set_status`.
     status: String,
+    /// The app's main window when the video lives inside it, else 0 (own window).
+    parent: isize,
+    /// Its place in the parent's client area; None: not on screen.
+    slot: Option<RECT>,
+    /// Out in a window of its own, by the user's choice.
+    popped: bool,
+    /// Hidden for a dialog.
+    hidden: bool,
+    /// Fullscreen was entered from inside the main window: go back there on exit.
+    fs_from_embedded: bool,
 }
 
 /// The overlay text and its version while the overlay is on.
@@ -166,6 +212,78 @@ fn overlay_of(hwnd: HWND) -> Option<(u64, String)> {
     let map = WINDOWS.lock().unwrap();
     let st = map.get(&(hwnd.0 as isize))?;
     (st.overlay && !st.overlay_text.is_empty()).then(|| (st.overlay_version, st.overlay_text.clone()))
+}
+
+/// The app's main window: new video windows are created inside it. 0: each video gets a
+/// window of its own (the command-line viewer).
+static DEFAULT_PARENT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+pub fn set_default_parent(hwnd: isize) {
+    DEFAULT_PARENT.store(hwnd, Ordering::SeqCst);
+}
+
+pub fn default_parent() -> isize {
+    DEFAULT_PARENT.load(Ordering::SeqCst)
+}
+
+/// Puts the window where WinState says: a child of the app's main window at its slot,
+/// or a window of its own. Never holds the state lock while calling into Win32, since
+/// those calls can send messages back to this window.
+unsafe fn apply_place(hwnd: HWND) {
+    let (parent, slot, popped, hidden, fs) = {
+        let map = WINDOWS.lock().unwrap();
+        let Some(st) = map.get(&(hwnd.0 as isize)) else { return };
+        (st.parent, st.slot, st.popped, st.hidden, st.fullscreen.is_some())
+    };
+    if parent == 0 || fs {
+        return;
+    }
+    let parent_hwnd = HWND(parent as *mut c_void);
+    let is_child = GetParent(hwnd).map(|p| p == parent_hwnd).unwrap_or(false);
+    if std::env::var_os("STREAMER_DEBUG_PLACE").is_some() {
+        eprintln!("place: popped {popped} hidden {hidden} child {is_child} slot {:?}", slot.map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)));
+    }
+    if !popped {
+        if !is_child {
+            SetWindowLongW(hwnd, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS).0 as i32);
+            let _ = SetParent(hwnd, Some(parent_hwnd));
+        }
+        match slot {
+            Some(r) if !hidden && r.right > r.left && r.bottom > r.top => {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            _ => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    } else if is_child {
+        // Out into its own window, near the main window, 1280x720 of picture.
+        let _ = SetParent(hwnd, None);
+        SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
+        let mut pr = RECT::default();
+        let _ = GetWindowRect(parent_hwnd, &mut pr);
+        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(parent_hwnd).max(96) as i32;
+        let mut r = RECT { left: 0, top: 0, right: 1280 * scale / 96, bottom: 720 * scale / 96 };
+        let _ = AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            pr.left + 48,
+            pr.top + 48,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+        );
+        let _ = SetForegroundWindow(hwnd);
+    }
 }
 
 static WINDOWS: std::sync::LazyLock<Mutex<HashMap<isize, WinState>>> = std::sync::LazyLock::new(Default::default);
@@ -217,6 +335,13 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         return;
     }
     if on {
+        // From inside the main window: become a window of its own first.
+        let embedded = st.parent != 0 && !st.popped;
+        st.fs_from_embedded = embedded;
+        if embedded {
+            let _ = SetParent(hwnd, None);
+            SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
+        }
         let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         let _ = GetWindowPlacement(hwnd, &mut place);
         let style = GetWindowLongW(hwnd, GWL_STYLE);
@@ -224,8 +349,16 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
         let r = mi.rcMonitor;
         SetWindowLongW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as i32)) | WS_POPUP.0 as i32);
-        let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
         st.fullscreen = Some((place, style));
+    } else if st.fs_from_embedded {
+        // Back into its place in the main window.
+        st.fullscreen = None;
+        st.fs_from_embedded = false;
+        drop(map);
+        apply_place(hwnd);
     } else if let Some((place, style)) = st.fullscreen.take() {
         SetWindowLongW(hwnd, GWL_STYLE, style);
         let _ = SetWindowPlacement(hwnd, &place);
@@ -250,6 +383,26 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
     unsafe {
         match msg {
             WM_CLOSE => {
+                // The user closed a popped-out video: it goes back into the app.
+                let back = {
+                    let mut map = WINDOWS.lock().unwrap();
+                    match map.get_mut(&(hwnd.0 as isize)) {
+                        Some(st) if st.parent != 0 => {
+                            st.popped = false;
+                            st.fullscreen = None;
+                            st.fs_from_embedded = false;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if back {
+                    apply_place(hwnd);
+                    return LRESULT(0);
+                }
+                wndproc(hwnd, WM_END, w, l)
+            }
+            WM_END => {
                 let map = WINDOWS.lock().unwrap();
                 // STREAMER_DEBUG_SHARED_CLOSE: one window closing marks every window closed,
                 // as the single process-wide flag did; the spoiled variant for the gate.
@@ -276,6 +429,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
             }
             WM_FULLSCREEN => {
                 fullscreen(hwnd, w.0);
+                LRESULT(0)
+            }
+            WM_PLACE => {
+                apply_place(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // Inside the main window, a click gives the video the keys (F11, Esc, F3).
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
                 LRESULT(0)
             }
             WM_TOPMOST => {
@@ -454,21 +616,42 @@ unsafe fn run(
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH).0),
         ..Default::default()
     });
-    let hwnd = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("streamer_viewer"),
-        w!("Stream"),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        1280,
-        720,
-        None,
-        None,
-        Some(instance.into()),
-        None,
-    )
-    .unwrap();
+    // Inside the app's main window when it has one (hidden until the UI gives it a
+    // place); else a window of its own.
+    let parent = default_parent();
+    let hwnd = if parent != 0 {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("streamer_viewer"),
+            w!("Stream"),
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0,
+            0,
+            16,
+            9,
+            Some(HWND(parent as *mut c_void)),
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .unwrap()
+    } else {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("streamer_viewer"),
+            w!("Stream"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1280,
+            720,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .unwrap()
+    };
     // STREAMER_OVERLAY=1: windows open with the overlay on (diagnosis and tests).
     let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some();
     WINDOWS.lock().unwrap().insert(
@@ -481,6 +664,11 @@ unsafe fn run(
             overlay_text: String::new(),
             overlay_version: 0,
             status: String::new(),
+            parent,
+            slot: None,
+            popped: false,
+            hidden: false,
+            fs_from_embedded: false,
         },
     );
 
@@ -592,7 +780,7 @@ unsafe fn run(
                 }
                 swapchain = Some(sc);
                 let mut r = RECT { left: 0, top: 0, right: frame.0 as i32, bottom: frame.1 as i32 };
-                if AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false).is_ok() {
+                if parent == 0 && AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false).is_ok() {
                     let _ = SetWindowPos(hwnd, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
                 }
             }

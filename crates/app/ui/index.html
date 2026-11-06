@@ -16,14 +16,14 @@
       <label class="field"><span data-t="connect.language"></span><select id="f-lang"></select></label>
       <div id="join-error" class="banner error hidden"></div>
       <button class="btn primary" type="submit" data-t="connect.join"></button>
+      <button id="join-back" class="btn hidden" type="button" data-t="join.back"></button>
     </form>
   </div>
 
   <!-- Room -->
   <div id="shell" class="shell hidden">
-    <nav class="rail" aria-label="Rooms">
-      <div id="room-icon" class="room-icon"></div>
-    </nav>
+    <nav id="rail" class="rail" aria-label="Rooms"></nav>
+    <div id="room-menu" class="menu hidden" role="menu"></div>
     <aside class="side">
       <header><span id="room-name" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
         <button id="leave" class="icon-btn" type="button">
@@ -42,9 +42,22 @@
     </aside>
     <main class="main">
       <header id="main-header"></header>
-      <div id="content" class="scroll"></div>
+      <div id="stage" class="stage hidden"></div>
+      <div id="content" class="scroll below"></div>
     </main>
   </div>
+
+  <!-- Change my name in a saved room -->
+  <dialog id="rename" class="small-dlg">
+    <form method="dialog" style="padding:20px 24px;display:flex;flex-direction:column;gap:12px">
+      <b id="rename-title"></b>
+      <input id="rename-name" maxlength="32" required>
+      <div class="controls" style="justify-content:flex-end">
+        <button class="btn" value="cancel" type="submit" formnovalidate data-t="common.cancel"></button>
+        <button id="rename-save" class="btn primary" value="save" type="submit" data-t="common.save"></button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Go live -->
   <dialog id="golive">

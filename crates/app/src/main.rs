@@ -107,7 +107,8 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str) -> Result<()
     std::thread::spawn(move || {
         while let Ok(e) = events.recv() {
             match e {
-                Event::WatchEnded { reason, .. } => a.notify(format!("watch_ended:{reason}")),
+                // Leaving the room on purpose ends its watches; that is no news.
+                Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 Event::Lost => {
                     a.notify("lost".into());
@@ -169,10 +170,37 @@ fn video_window_do(app: tauri::State<'_, Arc<App>>, streamer: u64, action: Strin
         "topmost" => w.set_topmost(true),
         "not_topmost" => w.set_topmost(false),
         "overlay" => w.set_overlay(true),
+        "pop_out" => w.set_popped(true),
+        "pop_in" => w.set_popped(false),
         "no_overlay" => w.set_overlay(false),
         _ => return Err(format!("unknown window action {action}")),
     }
     Ok(())
+}
+
+/// Where a stream's video goes in the main window, in CSS pixels of the webview (the
+/// webview fills the client area); None: not on screen.
+#[tauri::command]
+fn video_place(app: tauri::State<'_, Arc<App>>, window: tauri::WebviewWindow, streamer: u64, rect: Option<(f64, f64, f64, f64)>) {
+    if std::env::var_os("STREAMER_DEBUG_PLACE").is_some() {
+        eprintln!("video_place {streamer} {rect:?}");
+    }
+    let Some(w) = video_window(&app, streamer) else { return };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let px = |v: f64| (v * scale).round() as i32;
+    w.place(rect.map(|(x, y, wd, ht)| (px(x), px(y), px(wd), px(ht))));
+}
+
+/// Hides all video inside the main window while a dialog is open: the webview cannot
+/// draw over it.
+#[tauri::command]
+fn videos_hidden(app: tauri::State<'_, Arc<App>>, hidden: bool) {
+    let Some(s) = app.session.lock().unwrap().clone() else { return };
+    for w in s.watching() {
+        if let Some(win) = w.viewer.window {
+            win.set_hidden(hidden);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -220,6 +248,14 @@ async fn thumbnails(kind: String, ids: Vec<u64>) -> Vec<Thumb> {
 #[tauri::command]
 fn test_open_golive() -> bool {
     std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some()
+}
+
+/// Tests only: STREAMER_APP_TEST_ROOMS="room B" makes the page go to room B after a
+/// while, then back to the first room through its button in the rail, then open the
+/// menu of room B.
+#[tauri::command]
+fn test_rooms() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_ROOMS").ok()
 }
 
 /// Tests only: STREAMER_APP_UI_STRESS keeps the UI busy (dialog with pictures, language).
@@ -333,6 +369,13 @@ fn automate(app: &Arc<App>) {
         if p.len() != 3 {
             return;
         }
+        // Video windows go inside the main window, which may not exist yet this early.
+        for _ in 0..100 {
+            if media::present::default_parent() != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         // A build with a fixed server goes there, like the join screen does.
         if let Err(e) = do_connect(&app, built_in().unwrap_or(p[0]), p[1], p[2]) {
             app.notify(format!("error:{e}"));
@@ -382,7 +425,22 @@ fn automate(app: &Arc<App>) {
 /// Tests only: STREAMER_APP_AUTOWINDOW=1 makes the video window fullscreen and topmost
 /// after 3 s, and windowed again after 10 s.
 fn test_window_actions(w: Option<media::present::Window>) {
-    let (Some(w), Some(_)) = (w, std::env::var_os("STREAMER_APP_AUTOWINDOW")) else { return };
+    let (Some(w), Some(mode)) = (w, std::env::var("STREAMER_APP_AUTOWINDOW").ok()) else { return };
+    // "embed": pop out at +6 s, back in at +12 s, fullscreen at +18 s, back at +24 s.
+    if mode == "embed" {
+        std::thread::spawn(move || {
+            let step = |secs| std::thread::sleep(std::time::Duration::from_secs(secs));
+            step(6);
+            w.set_popped(true);
+            step(6);
+            w.set_popped(false);
+            step(6);
+            w.set_fullscreen(true);
+            step(6);
+            w.set_fullscreen(false);
+        });
+        return;
+    }
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
         w.set_fullscreen(true);
@@ -402,8 +460,18 @@ fn main() {
     app.sampler.start();
     automate(&app);
     tauri::Builder::default()
+        .setup(|a| {
+            // Video windows go inside the main window (the UI gives each a place).
+            use tauri::Manager;
+            if let Some(w) = a.get_webview_window("main") {
+                if let Ok(h) = w.hwnd() {
+                    media::present::set_default_parent(h.0 as isize);
+                }
+            }
+            Ok(())
+        })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

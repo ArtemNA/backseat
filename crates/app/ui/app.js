@@ -22,7 +22,7 @@ function setUploadLimit(v) {
 }
 const fmt = (v) => v.toLocaleString(lang, { maximumFractionDigits: 1 });
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
-const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, codec: 'h265', sources: null, thumbs: {} } };
+const state = { snap: null, current: null, joinOpen: false, videosHidden: false, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, codec: 'h265', sources: null, thumbs: {} } };
 
 // Pictures for the visible tab of the source picker, every 2 s while it is open.
 async function refreshThumbs() {
@@ -48,6 +48,7 @@ function applyStrings() {
   $('leave').setAttribute('aria-label', t('room.leave'));
   state.cardsKey = '';
   state.liveKey = '';
+  $('rail').dataset.key = '';
   if (state.snap) render(state.snap);
 }
 function fillLanguages() {
@@ -89,6 +90,97 @@ async function call(cmd, args, errBox) {
   }
 }
 
+// ---------- saved rooms ----------
+// Rooms the user has been in, shown in the left rail like Discord servers. Only the open
+// one is joined; the others are shortcuts.
+function savedRooms() {
+  try { return JSON.parse(localStorage.getItem('rooms') || '[]'); } catch { return []; }
+}
+function saveRooms(list) {
+  try { localStorage.setItem('rooms', JSON.stringify(list)); } catch {}
+}
+const sameRoom = (a, b) => a && b && a.room === b.room && a.server === b.server;
+function rememberRoom(r) {
+  const list = savedRooms();
+  const i = list.findIndex((x) => sameRoom(x, r));
+  if (i >= 0) list[i] = r; else list.push(r);
+  saveRooms(list);
+}
+function initials(room) {
+  const words = room.split(/[\s\-_.]+/).filter(Boolean);
+  const two = words.length > 1 ? words[0][0] + words[1][0] : room.slice(0, 2);
+  return two.toUpperCase();
+}
+async function joinRoom(r) {
+  await call('connect', r, $('join-error'));
+  state.current = r;
+  rememberRoom(r);
+  try { localStorage.setItem('join', JSON.stringify(r)); } catch {}
+  state.joinOpen = false;
+  state.cardsKey = '';
+  tick();
+}
+async function switchRoom(r) {
+  $('join-error').classList.add('hidden');
+  try {
+    await joinRoom(r);
+  } catch {
+    // Show the join screen with this room filled in and the error.
+    for (const k of ['room', 'name']) $('f-' + k).value = r[k];
+    state.joinOpen = true;
+    tick();
+  }
+}
+function renderRail(s) {
+  const list = savedRooms();
+  const cur = state.current;
+  if (cur && !list.some((x) => sameRoom(x, cur))) list.push(cur);
+  const key = JSON.stringify(list) + '|' + JSON.stringify(cur) + '|' + lang;
+  if ($('rail').dataset.key === key) return;
+  $('rail').dataset.key = key;
+  $('rail').replaceChildren(
+    ...list.map((r) => el('button', {
+      class: 'r' + (sameRoom(r, cur) ? ' on' : ''), type: 'button', title: r.room, text: initials(r.room),
+      onclick: () => { if (!sameRoom(r, state.current)) switchRoom(r); },
+      oncontextmenu: (e) => { e.preventDefault(); openRoomMenu(e, r); },
+    })),
+    el('div', { class: 'sep' }),
+    el('button', { class: 'r add', type: 'button', title: t('rooms.add'), text: '+', onclick: () => { state.joinOpen = true; tick(); } }));
+}
+function closeRoomMenu() { $('room-menu').classList.add('hidden'); }
+function openRoomMenu(e, r) {
+  const m = $('room-menu');
+  const item = (text, fn, cls = '') => el('button', { type: 'button', class: cls, text, onclick: () => { closeRoomMenu(); fn(); } });
+  m.replaceChildren(
+    sameRoom(r, state.current) ? null : item(t('rooms.open'), () => switchRoom(r)),
+    item(t('rooms.rename'), () => openRename(r)),
+    item(t('rooms.remove'), () => { saveRooms(savedRooms().filter((x) => !sameRoom(x, r))); $('rail').dataset.key = ''; tick(); }, 'danger'));
+  m.style.left = `${e.clientX}px`;
+  m.style.top = `${e.clientY}px`;
+  m.classList.remove('hidden');
+}
+document.addEventListener('click', (e) => { if (!$('room-menu').contains(e.target)) closeRoomMenu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeRoomMenu(); });
+let renaming = null;
+function openRename(r) {
+  renaming = r;
+  $('rename-title').textContent = t('rename.title', { room: r.room });
+  $('rename-name').value = r.name;
+  $('rename').showModal();
+}
+$('rename').addEventListener('close', async () => {
+  const r = renaming;
+  renaming = null;
+  if (!r || $('rename').returnValue !== 'save') return;
+  const name = $('rename-name').value.trim();
+  if (!name || name === r.name) return;
+  const next = { ...r, name };
+  saveRooms(savedRooms().map((x) => (sameRoom(x, r) ? next : x)));
+  $('rail').dataset.key = '';
+  // In the open room the new name takes effect by joining again.
+  if (sameRoom(r, state.current)) await switchRoom(next); else tick();
+});
+
 // ---------- join ----------
 function loadForm() {
   try {
@@ -106,25 +198,32 @@ $('join-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   $('join-error').classList.add('hidden');
   const args = { server: $('f-server').value.trim(), room: $('f-room').value.trim(), name: $('f-name').value.trim() };
-  try { localStorage.setItem('join', JSON.stringify(args)); } catch {}
-  await call('connect', args, $('join-error'));
-  tick();
+  try { await joinRoom(args); } catch {}
 });
-$('leave').addEventListener('click', async () => { await invoke('leave'); tick(); });
+$('join-back').addEventListener('click', () => { state.joinOpen = false; tick(); });
+$('leave').addEventListener('click', async () => { await invoke('leave'); state.current = null; $('rail').dataset.key = ''; tick(); });
 
 // ---------- render ----------
 function render(s) {
-  $('join').classList.toggle('hidden', s.connected);
-  $('shell').classList.toggle('hidden', !s.connected);
-  if (!s.connected) return;
+  // Boolean on purpose: toggle(name, undefined) flips the class instead of clearing it.
+  const joinShown = !s.connected || !!state.joinOpen;
+  $('join').classList.toggle('hidden', !joinShown);
+  $('join-back').classList.toggle('hidden', !s.connected);
+  $('shell').classList.toggle('hidden', joinShown);
+  if (!s.connected) { syncVideos(); return; }
   const me = s.peers.find((p) => p.me) || { name: '?' };
+  // Joined some other way (tests): remember what we are in.
+  if (!state.current || state.current.room !== s.room) {
+    state.current = { server: $('f-server').value.trim(), room: s.room, name: me.name };
+    rememberRoom(state.current);
+  }
   $('room-name').textContent = s.room;
-  $('room-icon').textContent = s.room.slice(0, 2).toUpperCase();
   $('me-avatar').replaceWith(Object.assign(avatar(me.name), { id: 'me-avatar' }));
   $('me-state').textContent = s.live ? t('room.live_for', { t: clock(s.live.since_secs) }) : t('room.not_live');
   $('me-state').style.color = s.live ? '#ff9aa0' : '';
   $('go-live').classList.toggle('hidden', !!s.live);
 
+  renderRail(s);
   renderPeople(s);
   renderHeader(s);
   renderContent(s);
@@ -170,34 +269,42 @@ function renderHeader(s) {
 }
 
 function renderContent(s) {
-  const others = s.peers.filter((p) => p.streaming && !p.me);
-  const cardsKey = others.map((p) => `${p.id}:${p.watching}`).join(',') + '|' + (s.live ? 'L' : '');
+  const watched = s.peers.filter((p) => p.streaming && !p.me && p.watching);
+  const others = s.peers.filter((p) => p.streaming && !p.me && !p.watching);
+  const key = watched.map((p) => p.id).join(',') + '|' + others.map((p) => p.id).join(',') + '|' + (s.live ? 'L' : '');
+  const stage = $('stage');
   const box = $('content');
-  if (cardsKey !== state.cardsKey) {
-    state.cardsKey = cardsKey;
+  if (key !== state.cardsKey) {
+    state.cardsKey = key;
     state.liveKey = '';
-    const parts = [];
+    stage.className = 'stage ' + (watched.length === 0 ? 'hidden' : watched.length === 1 ? 'n1' : watched.length === 2 ? 'n2' : 'n4');
+    stage.replaceChildren(...watched.map(tile));
+    const parts = [el('div', { id: 'hint' })];
+    if (watched.length) parts.push(el('div', { class: 'small', text: t('tile.keys') }));
+    if (others.length) parts.push(el('section', {},
+      el('div', { class: 'section', style: 'padding-left:0', text: t('room.also_live') }),
+      el('div', { class: 'chips' }, ...others.map(chip))));
     if (s.live) parts.push(el('div', { id: 'live-panel', style: 'display:flex;flex-direction:column;gap:16px' }));
-    parts.push(el('div', { id: 'hint' }));
-    if (others.length) parts.push(el('div', { class: 'grid' }, ...others.map(card)));
-    else if (!s.live) parts.push(el('div', { class: 'empty', text: t('room.none') }));
+    if (!watched.length && !others.length && !s.live) parts.push(el('div', { class: 'empty', text: t('room.none') }));
     box.replaceChildren(...parts);
   }
   // Numbers, in place.
   let hint = null;
   for (const w of s.watches) {
-    const c = document.querySelector(`[data-card="${w.streamer}"]`);
+    const c = document.querySelector(`[data-tile="${w.streamer}"]`);
     if (!c) continue;
-    c.querySelector('[data-k=rx]').textContent = `${Math.round(w.received_fps)} fps`;
-    const shown = c.querySelector('[data-k=shown]');
-    shown.textContent = `${Math.round(w.shown_fps)} fps`;
     const throttled = w.received_fps > 20 && w.shown_fps < w.received_fps * 0.8;
-    shown.classList.toggle('warn', throttled);
-    c.querySelector('[data-k=lat]').textContent = ms(w.latency_ms);
-    c.querySelector('[data-k=fs]')?.setAttribute('aria-pressed', String(w.fullscreen));
-    c.querySelector('[data-k=top]')?.setAttribute('aria-pressed', String(w.topmost));
-    c.querySelector('[data-k=ov]')?.setAttribute('aria-pressed', String(w.overlay));
-    c.querySelector('[data-k=sub]').textContent = `${t('card.watching')} · ${requestLabel(w.quality)}`;
+    const st = c.querySelector('[data-k=stat]');
+    st.textContent = `${Math.round(w.shown_fps)} fps · ${ms(w.latency_ms)}${w.quality ? ' · ' + requestLabel(w.quality) : ''}`;
+    st.classList.toggle('warn', throttled);
+    c.querySelector('[data-k=ov]').setAttribute('aria-pressed', String(w.overlay));
+    const pop = c.querySelector('[data-k=pop]');
+    pop.title = w.embedded ? t('tile.popout') : t('tile.popin');
+    pop.setAttribute('aria-label', pop.title);
+    pop.setAttribute('aria-pressed', String(!w.embedded));
+    pop.dataset.action = w.embedded ? 'pop_out' : 'pop_in';
+    const p = s.peers.find((x) => x.id === w.streamer);
+    c.querySelector('.video').textContent = w.embedded ? '' : t('tile.popped', { name: p ? p.name : '?' });
     // Show what is being watched in the pickers until the viewer picks something else.
     const ch = state.choice[w.streamer];
     if (ch && !ch.touched && w.quality) {
@@ -209,10 +316,7 @@ function renderContent(s) {
         if (sels[1]) sels[1].value = ch.kbit;
       }
     }
-    if (throttled && !hint) {
-      const p = s.peers.find((x) => x.id === w.streamer);
-      hint = t('hint.background', { name: p ? p.name : '?', shown: Math.round(w.shown_fps), rx: Math.round(w.received_fps) });
-    }
+    if (throttled && !hint) hint = t('hint.background', { name: p ? p.name : '?', shown: Math.round(w.shown_fps), rx: Math.round(w.received_fps) });
   }
   const hb = $('hint');
   if (hb) {
@@ -220,17 +324,18 @@ function renderContent(s) {
     else hb.replaceChildren();
   }
   if (s.live) renderLive(s.live);
+  syncVideos();
 }
 
-function qualityControls(id, watching) {
+function qualitySelects(id) {
   const ch = state.choice[id] || (state.choice[id] = { mode: '', kbit: '' });
-  const mode = el('select', { onchange: (e) => { ch.mode = e.target.value; ch.touched = true; } },
+  const mode = el('select', { 'aria-label': t('card.quality'), onchange: (e) => { ch.mode = e.target.value; ch.touched = true; } },
     el('option', { value: '', text: t('card.source_quality'), selected: ch.mode === '' }),
     ...VIEW_MODES.map((m) => el('option', { value: m, text: m, selected: ch.mode === m })));
-  const kbit = el('select', { onchange: (e) => { ch.kbit = e.target.value; ch.touched = true; } },
+  const kbit = el('select', { 'aria-label': t('card.bitrate'), onchange: (e) => { ch.kbit = e.target.value; ch.touched = true; } },
     el('option', { value: '', text: '—', selected: ch.kbit === '' }),
     ...PRESETS.map((k) => el('option', { value: String(k), text: `${mbit(k)} ${t('unit.mbit')}`, selected: ch.kbit === String(k) })));
-  return [el('label', {}, t('card.quality'), mode), el('label', {}, t('card.bitrate'), kbit)];
+  return [mode, kbit];
 }
 function requestOf(id) {
   const ch = state.choice[id] || {};
@@ -238,33 +343,54 @@ function requestOf(id) {
   return `${ch.mode || '1440p60'}${ch.kbit ? ' ' + ch.kbit : ''}`;
 }
 
-function card(p) {
-  const controls = el('div', { class: 'controls' }, ...qualityControls(p.id, p.watching));
-  let windowRow = null;
-  if (p.watching) {
-    const act = (action) => invoke('video_window_do', { streamer: p.id, action });
-    windowRow = el('div', { style: 'display:flex;flex-direction:column;gap:6px' },
-      el('div', { class: 'controls' },
-        el('button', { class: 'btn', type: 'button', text: t('win.show'), onclick: () => act('show') }),
-        el('button', { class: 'btn', type: 'button', 'data-k': 'fs', 'aria-pressed': 'false', text: t('win.fullscreen'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'windowed' : 'fullscreen') }),
-        el('button', { class: 'btn', type: 'button', 'data-k': 'top', 'aria-pressed': 'false', text: t('win.on_top'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'not_topmost' : 'topmost') }),
-        el('button', { class: 'btn', type: 'button', 'data-k': 'ov', 'aria-pressed': 'false', text: t('win.stats'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'no_overlay' : 'overlay') })),
-      el('span', { class: 'small', text: t('win.keys') }));
-    controls.append(
+// A watched stream: the native video window is placed over .video by syncVideos.
+function tile(p) {
+  const act = (action) => invoke('video_window_do', { streamer: p.id, action });
+  return el('div', { class: 'vtile', 'data-tile': p.id },
+    el('div', { class: 'video', 'data-video': p.id }),
+    el('div', { class: 'vbar' },
+      el('span', { class: 'name', text: p.name }),
+      el('span', { class: 'vstat', 'data-k': 'stat', text: '—' }),
+      ...qualitySelects(p.id),
       el('button', { class: 'btn', type: 'button', text: t('card.apply'), onclick: async () => { const q = requestOf(p.id); if (q) await invoke('set_quality', { streamer: p.id, quality: q }); } }),
-      el('button', { class: 'btn danger push', type: 'button', text: t('card.stop'), onclick: async () => { await invoke('unwatch', { streamer: p.id }); tick(); } }));
-  } else {
-    controls.append(el('button', { class: 'btn primary push', type: 'button', text: t('card.watch'), onclick: async () => { const ch = state.choice[p.id]; if (ch) ch.touched = false; await invoke('watch', { streamer: p.id, quality: requestOf(p.id) }); tick(); } }));
-  }
-  const stat = (label, k) => el('div', { class: 'stat' }, el('span', { text: label }), el('b', { 'data-k': k, text: '—' }));
-  return el('article', { class: 'card' + (p.watching ? ' on' : ''), 'data-card': p.id },
-    el('div', { class: 'thumb' }, el('span', { class: 'pill-live', text: 'LIVE' }), p.watching ? t('card.in_window') : p.name),
-    el('div', { class: 'card-body' },
-      el('div', { class: 'card-title' }, el('b', { text: p.name }), el('span', { class: 'small', 'data-k': 'sub', text: p.watching ? t('card.watching') : t('card.streaming') })),
-      p.watching ? el('div', { class: 'stats' }, stat(t('card.received'), 'rx'), stat(t('card.shown'), 'shown'), stat(t('card.latency'), 'lat')) : null,
-      windowRow,
-      controls));
+      el('button', { class: 'btn', type: 'button', 'data-k': 'ov', 'aria-pressed': 'false', title: 'F3', text: t('tile.stats'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'no_overlay' : 'overlay') }),
+      el('button', { class: 'btn icon', type: 'button', 'data-k': 'pop', 'data-action': 'pop_out', text: '⧉', onclick: (e) => { act(e.currentTarget.dataset.action); setTimeout(tick, 150); } }),
+      el('button', { class: 'btn icon', type: 'button', title: t('tile.fullscreen'), 'aria-label': t('tile.fullscreen'), text: '⛶', onclick: () => act('toggle_fullscreen') }),
+      el('button', { class: 'btn danger', type: 'button', text: t('card.stop'), onclick: async () => { await invoke('unwatch', { streamer: p.id }); tick(); } })));
 }
+// Someone live we are not watching.
+function chip(p) {
+  return el('div', { class: 'chip' }, avatar(p.name), el('b', { text: p.name }),
+    el('button', { class: 'btn primary', type: 'button', text: t('card.watch'), onclick: async () => { await invoke('watch', { streamer: p.id, quality: null }); tick(); } }));
+}
+
+// Keeps each native video window over its .video box, and hides them all while
+// something from the page must be on top (a dialog, the join screen).
+const placed = {};
+function syncVideos() {
+  const s = state.snap;
+  const covered = [...document.querySelectorAll('dialog')].some((d) => d.open) || !$('join').classList.contains('hidden');
+  if (covered !== state.videosHidden) {
+    state.videosHidden = covered;
+    invoke('videos_hidden', { hidden: covered });
+  }
+  for (const w of (s && s.watches) || []) {
+    const box = document.querySelector(`[data-video="${w.streamer}"]`);
+    let rect = null;
+    if (box && w.embedded) {
+      const r = box.getBoundingClientRect();
+      if (r.width > 4 && r.height > 4) rect = [r.left, r.top, r.width, r.height];
+    }
+    const k = JSON.stringify(rect);
+    if (placed[w.streamer] !== k) {
+      placed[w.streamer] = k;
+      invoke('video_place', { streamer: w.streamer, rect });
+    }
+  }
+}
+new ResizeObserver(() => syncVideos()).observe($('stage'));
+window.addEventListener('resize', () => syncVideos());
+new MutationObserver(() => syncVideos()).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['open', 'class'] });
 
 function renderLive(l) {
   const panel = $('live-panel');
@@ -399,6 +525,21 @@ invoke('test_ui_stress').then((tab) => {
     if ($('golive').open) $('golive').close(); else $('go-live').click();
     if (n % 2 === 0) { setLanguage(LANGS[(n / 2) % LANGS.length].id); $('main-header').dataset.key = ''; applyStrings(); }
   }, 1500);
+});
+invoke('test_rooms').then((other) => {
+  if (!other) return;
+  setTimeout(async () => {
+    const first = state.current;
+    await switchRoom({ ...first, room: other });
+    setTimeout(() => {
+      const btn = [...document.querySelectorAll('#rail .r')].find((b) => b.title === first.room);
+      if (btn) btn.click();
+      setTimeout(() => {
+        const b2 = [...document.querySelectorAll('#rail .r')].find((b) => b.title === other);
+        if (b2) { const r = b2.getBoundingClientRect(); b2.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.right - 6, clientY: r.top + 10 })); }
+      }, 4000);
+    }, 5000);
+  }, 5000);
 });
 invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });

@@ -32,6 +32,8 @@ pub struct WatchStats {
     /// Round trip of the clock ping (through signaling), ms; 0 before the first.
     pub ping_ms: f64,
     pub overlay: bool,
+    /// Shown inside the main window (else popped out into its own).
+    pub embedded: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -184,6 +186,7 @@ fn sample(inner: &Mutex<Inner>) {
             loss_pct,
             ping_ms: w.clock.last_rtt_ns().map(|n| n as f64 / 1e6).unwrap_or(0.0),
             overlay: st.overlay,
+            embedded: st.embedded,
             streamer: w.streamer,
             received_fps: (frames - f0) as f64 / dt,
             shown_fps: (shown.saturating_sub(p0)) as f64 / dt,
