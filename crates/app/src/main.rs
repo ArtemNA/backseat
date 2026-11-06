@@ -210,6 +210,15 @@ fn video_place(app: tauri::State<'_, Arc<App>>, window: tauri::WebviewWindow, st
 
 /// Hides all video inside the main window while a dialog is open: the webview cannot
 /// draw over it.
+/// Sound of one watched stream off or on.
+#[tauri::command]
+fn set_muted(app: tauri::State<'_, Arc<App>>, streamer: u64, muted: bool) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    let w = s.watching().into_iter().find(|w| w.streamer == streamer).ok_or("not watching this stream")?;
+    w.viewer.set_muted(muted);
+    Ok(())
+}
+
 #[tauri::command]
 fn videos_hidden(app: tauri::State<'_, Arc<App>>, hidden: bool) {
     let Some(s) = app.session.lock().unwrap().clone() else { return };
@@ -469,7 +478,21 @@ fn automate(app: &Arc<App>) {
                     todo.retain(|(name, quality)| {
                         let Some(p) = s.peers().into_iter().find(|p| p.streaming && &p.name == name && p.id != s.id) else { return true };
                         match s.watch(p.id, ViewerConfig::default(), quality.clone()) {
-                            Ok(w) => test_window_actions(w.viewer.window),
+                            Ok(w) => {
+                                test_window_actions(w.viewer.window);
+                                // Tests only: STREAMER_APP_TEST_MUTE mutes at +8 s and unmutes at +14 s.
+                                if std::env::var_os("STREAMER_APP_TEST_MUTE").is_some() {
+                                    let w = w.clone();
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(8));
+                                        w.viewer.set_muted(true);
+                                        eprintln!("test: muted");
+                                        std::thread::sleep(std::time::Duration::from_secs(6));
+                                        w.viewer.set_muted(false);
+                                        eprintln!("test: unmuted");
+                                    });
+                                }
+                            }
                             Err(e) => app.notify(format!("error:{e}")),
                         }
                         false
@@ -580,7 +603,7 @@ fn main() {
             Ok(())
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

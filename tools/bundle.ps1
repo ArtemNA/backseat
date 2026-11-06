@@ -23,7 +23,7 @@ $plugins = @(
   'coreelements', 'app', 'audioconvert', 'audioresample', 'autodetect',
   'd3d11', 'nvcodec', 'amfcodec', 'qsv', 'videoparsersbad', 'videorate',
   'rtp', 'rtpmanager', 'webrtc', 'nice', 'dtls', 'srtp', 'opus', 'wasapi2',
-  'videotestsrc', 'audiotestsrc'
+  'videotestsrc', 'audiotestsrc', 'volume'
 )
 # License folders under share\licenses for the libraries that end up in the folder.
 $licenses = @(

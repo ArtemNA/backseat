@@ -58,6 +58,8 @@ pub struct Viewer {
     /// The streamer's offer arrived. Failed without it: the streamer never answered the
     /// request to watch, so the network was never tried.
     pub offered: Arc<std::sync::atomic::AtomicBool>,
+    /// Sound off for this stream (the stream itself keeps coming).
+    muted: Arc<std::sync::atomic::AtomicBool>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
     /// How far behind the video is, and catch-up requests sent.
     pub lag: Arc<crate::catchup::LagWatch>,
@@ -158,6 +160,8 @@ impl Viewer {
         let started = Instant::now();
         let pipeline_weak = pipeline.downgrade();
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let muted2 = muted.clone();
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         #[cfg(windows)]
@@ -180,7 +184,7 @@ impl Viewer {
                     let tail = video_tail();
                     add_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, tail)
                 }
-                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync),
+                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, muted2.load(Ordering::SeqCst)),
                 _ => add_fakesink(&pipeline, pad),
             };
             if let Err(e) = result {
@@ -201,6 +205,7 @@ impl Viewer {
             relay,
             ice_failed: failed,
             offered,
+            muted,
             jitterbuffers,
             lag,
             never_answer: cfg.debug_never_answer,
@@ -277,6 +282,19 @@ impl Viewer {
             .set_state(gst::State::Playing)
             .map(|_| ())
             .map_err(|e| format!("cannot start viewer pipeline: {e}"))
+    }
+
+    /// Turns this stream's sound off or on, now and for an audio branch made later.
+    pub fn set_muted(&self, on: bool) {
+        self.muted.store(on, Ordering::SeqCst);
+        match self.pipeline.by_name(AUDIO_VOLUME) {
+            Some(v) => v.set_property("mute", on),
+            None => eprintln!("viewer: no audio branch to mute yet"),
+        }
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
     }
 
     pub fn window_closed(&self) -> bool {
@@ -486,6 +504,9 @@ fn add_video(
     Ok(())
 }
 
+/// The element that mutes a viewer's sound.
+const AUDIO_VOLUME: &str = "avolume";
+
 fn add_audio(
     pipeline: &gst::Pipeline,
     pad: &gst::Pad,
@@ -493,11 +514,18 @@ fn add_audio(
     stats: &ViewerStats,
     started: Instant,
     audio_sync: bool,
+    muted: bool,
 ) -> Result<(), String> {
     let depay = make("rtpopusdepay")?;
     let decoder = make("opusdec")?;
     decoder.set_property("plc", true);
     let sink = make(platform::audio_sink())?;
+    // Mute by zeroing samples before the device, not by the sink's own mute: wasapi2sink's
+    // mute acts on the Windows session, which a check through process loopback could not
+    // see change. The stream keeps coming, so unmuting is instant and stays in sync.
+    let volume = make("volume")?;
+    volume.set_property("name", AUDIO_VOLUME);
+    volume.set_property("mute", muted);
     // With sync the sink follows the stream timing and corrects clock drift between the
     // machines; without it audio piles up in front of the device (stage 1 on macOS: ~300 ms).
     sink.set_property("sync", audio_sync);
@@ -532,7 +560,7 @@ fn add_audio(
             gst::PadProbeReturn::Ok
         });
     }
-    let chain = vec![depay.clone(), decoder.clone(), make("audioconvert")?, make("audioresample")?, sink];
+    let chain = vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume, make("audioresample")?, sink];
     link_branch(pipeline, pad, &chain)?;
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
     Ok(())

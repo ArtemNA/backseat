@@ -416,6 +416,7 @@ function renderContent(s) {
     st.textContent = `${Math.round(w.shown_fps)} fps · ${ms(w.latency_ms)}${w.quality ? ' · ' + requestLabel(w.quality) : ''}`;
     st.classList.toggle('warn', throttled);
     c.querySelector('[data-k=ov]').setAttribute('aria-pressed', String(w.overlay));
+    setMuteButton(c.querySelector('[data-k=mute]'), w.muted);
     const pop = c.querySelector('[data-k=pop]');
     pop.title = w.embedded ? t('tile.popout') : t('tile.popin');
     pop.setAttribute('aria-label', pop.title);
@@ -471,10 +472,18 @@ function tile(p) {
       el('span', { class: 'vstat', 'data-k': 'stat', text: '—' }),
       ...qualitySelects(p.id),
       el('button', { class: 'btn', type: 'button', text: t('card.apply'), onclick: async () => { const q = requestOf(p.id); if (q) await invoke('set_quality', { streamer: p.id, quality: q }); } }),
+      el('button', { class: 'btn icon', type: 'button', 'data-k': 'mute', 'aria-pressed': 'false', title: t('tile.mute'), 'aria-label': t('tile.mute'), text: '🔊', onclick: async (e) => { const on = e.currentTarget.getAttribute('aria-pressed') !== 'true'; await invoke('set_muted', { streamer: p.id, muted: on }); setMuteButton(e.currentTarget, on); } }),
       el('button', { class: 'btn', type: 'button', 'data-k': 'ov', 'aria-pressed': 'false', title: 'F3', text: t('tile.stats'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'no_overlay' : 'overlay') }),
       el('button', { class: 'btn icon', type: 'button', 'data-k': 'pop', 'data-action': 'pop_out', text: '⧉', onclick: (e) => { act(e.currentTarget.dataset.action); setTimeout(tick, 150); } }),
       el('button', { class: 'btn icon', type: 'button', title: t('tile.fullscreen'), 'aria-label': t('tile.fullscreen'), text: '⛶', onclick: () => act('toggle_fullscreen') }),
       el('button', { class: 'btn danger', type: 'button', text: t('card.stop'), onclick: async () => { await invoke('unwatch', { streamer: p.id }); tick(); } })));
+}
+function setMuteButton(b, muted) {
+  if (!b) return;
+  b.setAttribute('aria-pressed', String(muted));
+  b.textContent = muted ? '🔇' : '🔊';
+  b.title = muted ? t('tile.unmute') : t('tile.mute');
+  b.setAttribute('aria-label', b.title);
 }
 // Someone live we are not watching.
 function chip(p) {
