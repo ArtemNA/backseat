@@ -4,49 +4,24 @@
 use gst::prelude::*;
 use media::clock::HostClock;
 use media::config::ViewerConfig;
-use media::server_client::ServerClient;
+use media::session::{Event, Session};
 use media::signal::{self, Link, Outbox};
 use media::viewer::Viewer;
-use protocol::{ClientMsg, PeerInfo, ServerMsg};
+use protocol::PeerInfo;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: viewer (--server ws://HOST:PORT/ws [--room NAME] [--name NAME] [--watch STREAMER] | \
 --listen 0.0.0.0:7700) [--stun stun://HOST:PORT|none] [--turn turn://USER:PASS@HOST:PORT] [--latency 40] [--wait-keyframe] [--no-audio] [--audio-nosync] [--quality '720p30 4000'] [--decoder NAME] \
 [--seconds 0] [--report-secs 5]";
 
-/// Test only: withholds our ICE candidates, so together with ignoring the host's no path
-/// can exist and the failure report can be checked.
-struct WithoutIce(Arc<dyn Outbox>);
-
-impl Outbox for WithoutIce {
-    fn send(&self, kind: &str, payload: &str) {
-        if kind != "ice" {
-            self.0.send(kind, payload);
-        }
-    }
-}
-
 fn main() {
     let mut listen = "0.0.0.0:7700".to_string();
     let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
-    let mut subscribe = None;
-    let mut never_answer = false;
     // Quality to ask the host for, as "720p30 4000"; the host never gives more than its own.
     let mut quality = None::<String>;
-    let mut no_ice = false;
-    let mut cfg =
-        ViewerConfig {
-            latency_ms: 40,
-            audio: true,
-            wait_keyframe: false,
-            decoder: None,
-            audio_sync: true,
-            headless: false,
-            impair: Default::default(),
-            ice: media::config::IceConfig::default(),
-        };
+    let mut cfg = ViewerConfig::default();
     let (mut seconds, mut report_secs) = (0u64, 5u64);
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -56,9 +31,9 @@ fn main() {
             "--no-audio" => cfg.audio = false,
             "--audio-nosync" => cfg.audio_sync = false,
             // Test only: subscribes but never answers the offer, like a stuck peer.
-            "--debug-never-answer" => never_answer = true,
+            "--debug-never-answer" => cfg.debug_never_answer = true,
             // Test only: ignore the host's ICE candidates, so no path can be found.
-            "--debug-no-ice" => no_ice = true,
+            "--debug-no-ice" => cfg.debug_no_ice = true,
             // Test only: no window and no decoding, so the process does not touch the GPU.
             "--headless" => cfg.headless = true,
             key => {
@@ -125,9 +100,11 @@ fn main() {
     }
 
     media::init();
-    // Messages from the host, as (kind, payload), whichever way we reach it.
-    let (in_tx, in_rx) = mpsc::channel::<(String, String)>();
-    let link: Arc<dyn Outbox> = match &server {
+    let gone = Arc::new(AtomicBool::new(false));
+    // Asks the host for another quality, whichever way we reach it.
+    let ask: Arc<dyn Fn(&str) + Send + Sync>;
+    let mut session = None;
+    let (viewer, clock, link): (Arc<Viewer>, HostClock, Option<Arc<dyn Outbox>>) = match &server {
         None => {
             let listener = std::net::TcpListener::bind(&listen).unwrap_or_else(|e| {
                 eprintln!("viewer: cannot listen on {listen}: {e}");
@@ -137,129 +114,111 @@ fn main() {
             let (stream, from) = listener.accept().expect("accept");
             println!("viewer: host connected from {}", from.ip());
             let (link, mut reader) = Link::new(stream);
+            let link: Arc<dyn Outbox> = Arc::new(link);
+            let clock = HostClock::default();
+            let viewer = Arc::new(Viewer::new(cfg, clock.clone(), link.clone()).unwrap_or_else(|e| {
+                eprintln!("viewer: {e}");
+                std::process::exit(1);
+            }));
+            if let Err(e) = viewer.start() {
+                eprintln!("viewer: {e}");
+                std::process::exit(1);
+            }
+            let (v, l, c, g) = (viewer.clone(), link.clone(), clock.clone(), gone.clone());
             std::thread::spawn(move || {
-                while let Some(m) = signal::recv(&mut reader) {
-                    if in_tx.send(m).is_err() {
+                while let Some((kind, payload)) = signal::recv(&mut reader) {
+                    if kind == "bye" {
                         break;
                     }
+                    v.on_message(&l, &c, &kind, &payload);
                 }
-                let _ = in_tx.send(("bye".into(), String::new()));
+                g.store(true, Ordering::SeqCst);
             });
-            Arc::new(link)
+            {
+                let (l, c) = (link.clone(), clock.clone());
+                std::thread::spawn(move || loop {
+                    l.send("ping", &c.local_ns().to_string());
+                    std::thread::sleep(Duration::from_millis(200));
+                });
+            }
+            let l = link.clone();
+            ask = Arc::new(move |q| l.send(media::host::QUALITY_MSG, q));
+            // Direct mode has no subscription: ask once the link is up.
+            if let Some(q) = &quality {
+                ask(q);
+            }
+            (viewer, clock, Some(link))
         }
         Some(url) => {
-            let (client, rx) = ServerClient::join(url, &room, &name).unwrap_or_else(|e| {
+            let (s, events) = Session::join(url, &room, &name).unwrap_or_else(|e| {
                 eprintln!("viewer: {e}");
                 std::process::exit(1);
             });
-            println!("viewer: joined room {room} as {name} (id {})", client.id);
-            let pick = |p: &PeerInfo| p.streaming && watch.as_ref().is_none_or(|w| *w == p.name);
-            let mut streamer = client.peers.iter().find(|p| pick(p)).map(|p| p.id);
+            println!("viewer: joined room {room} as {name} (id {})", s.id);
+            let pick = |p: &PeerInfo| p.id != s.id && p.streaming && watch.as_ref().is_none_or(|w| *w == p.name);
+            let mut streamer = s.peers().iter().find(|p| pick(p)).map(|p| p.id);
             while streamer.is_none() {
                 println!("viewer: waiting for a streamer{}", watch.as_ref().map(|w| format!(" named {w}")).unwrap_or_default());
-                match rx.recv() {
-                    Ok(ServerMsg::PeerJoined { peer } | ServerMsg::PeerUpdated { peer }) if pick(&peer) => streamer = Some(peer.id),
-                    Ok(_) => {}
-                    Err(_) => {
+                match events.recv() {
+                    Ok(Event::Peers(peers)) => streamer = peers.iter().find(|p| pick(p)).map(|p| p.id),
+                    Ok(Event::Lost) | Err(_) => {
                         eprintln!("viewer: lost the signaling server");
                         std::process::exit(1);
                     }
+                    Ok(_) => {}
                 }
             }
             let streamer = streamer.unwrap();
             println!("viewer: watching peer {streamer}");
-            let out = client.to_peer(streamer);
-            let c = client.clone();
+            // The quality rides on the subscription, so the stream starts at it.
+            // STREAMER_DEBUG_QUALITY_LATE asks only after subscribing: the spoiled variant.
+            let late = std::env::var_os("STREAMER_DEBUG_QUALITY_LATE").is_some();
+            let w = s.watch(streamer, cfg, if late { None } else { quality.clone() }).unwrap_or_else(|e| {
+                eprintln!("viewer: {e}");
+                std::process::exit(1);
+            });
+            let s2 = s.clone();
+            ask = Arc::new(move |q| s2.set_watch_quality(streamer, q));
+            if late {
+                if let Some(q) = &quality {
+                    ask(q);
+                }
+            }
+            let g = gone.clone();
             std::thread::spawn(move || {
-                while let Ok(msg) = rx.recv() {
-                    let forward = match msg {
-                        ServerMsg::Signal { from, kind, payload } if from == streamer => (kind, payload),
-                        ServerMsg::PeerLeft { id } if id == streamer => ("bye".into(), String::new()),
-                        ServerMsg::PeerUpdated { peer } if peer.id == streamer && !peer.streaming => ("bye".into(), String::new()),
-                        ServerMsg::Error { message } => {
-                            eprintln!("viewer: server error: {message}");
-                            continue;
+                while let Ok(e) = events.recv() {
+                    match e {
+                        Event::WatchEnded { streamer: id, reason } if id == streamer => {
+                            println!("viewer: stream ended: {reason}");
+                            break;
                         }
-                        _ => continue,
-                    };
-                    if in_tx.send(forward).is_err() {
-                        break;
+                        Event::Error(m) => eprintln!("viewer: server error: {m}"),
+                        Event::Lost => {
+                            eprintln!("viewer: lost the signaling server");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                let _ = in_tx.send(("bye".into(), String::new()));
+                g.store(true, Ordering::SeqCst);
             });
-            // The subscription goes out once the pipeline exists, so the offer finds it.
-            subscribe = Some((c, streamer));
-            out
+            let (viewer, clock) = (w.viewer.clone(), w.clock.clone());
+            session = Some((s, streamer));
+            (viewer, clock, None)
         }
     };
-    let clock = HostClock::default();
-    let link: Arc<dyn Outbox> = if no_ice { Arc::new(WithoutIce(link)) } else { link };
-
-    let viewer = match Viewer::new(cfg, clock.clone(), link.clone()) {
-        Ok(v) => Arc::new(v),
-        Err(e) => {
-            eprintln!("viewer: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = viewer.start() {
-        eprintln!("viewer: {e}");
-        std::process::exit(1);
-    }
-    if let Some((client, streamer)) = subscribe.take() {
-        // The quality rides on the subscription, so the stream starts at it.
-        // STREAMER_DEBUG_QUALITY_LATE asks only after subscribing: the spoiled variant.
-        let late = std::env::var_os("STREAMER_DEBUG_QUALITY_LATE").is_some();
-        client.send(ClientMsg::Subscribe { streamer, quality: if late { None } else { quality.clone() } });
-        if late {
-            if let Some(q) = &quality {
-                link.send(media::host::QUALITY_MSG, q);
-            }
-        }
-    } else if let Some(q) = &quality {
-        // Direct mode has no subscription: ask once the link is up.
-        link.send(media::host::QUALITY_MSG, q);
-    }
     // Test only: STREAMER_DEBUG_QUALITY_CYCLE="SECS;Q1;Q2;..." asks for each quality in turn.
     if let Ok(cycle) = std::env::var("STREAMER_DEBUG_QUALITY_CYCLE") {
         let mut parts = cycle.split(';');
         let secs: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(5);
         let list: Vec<String> = parts.map(str::to_string).collect();
-        let link = link.clone();
+        let ask = ask.clone();
         std::thread::spawn(move || {
             for q in list.iter().cycle() {
                 std::thread::sleep(Duration::from_secs(secs));
                 println!("viewer: asking for {q}");
-                link.send(media::host::QUALITY_MSG, q);
+                ask(q);
             }
-        });
-    }
-
-    {
-        let (link, clock) = (link.clone(), clock.clone());
-        std::thread::spawn(move || loop {
-            link.send("ping", &clock.local_ns().to_string());
-            std::thread::sleep(Duration::from_millis(200));
-        });
-    }
-    let gone = Arc::new(AtomicBool::new(false));
-    {
-        let (viewer, link, clock, gone) = (viewer.clone(), link.clone(), clock.clone(), gone.clone());
-        std::thread::spawn(move || {
-            while let Ok((kind, payload)) = in_rx.recv() {
-                if kind == "bye" {
-                    break;
-                }
-                if never_answer && kind == "offer" {
-                    continue;
-                }
-                if no_ice && kind == "ice" {
-                    continue;
-                }
-                viewer.on_message(&link, &clock, &kind, &payload);
-            }
-            gone.store(true, Ordering::SeqCst);
         });
     }
 
@@ -354,7 +313,13 @@ fn main() {
             break;
         }
     }
-    link.send("bye", "");
-    let _ = viewer.pipeline.set_state(gst::State::Null);
+    match (&session, &link) {
+        (Some((s, streamer)), _) => s.unwatch(*streamer),
+        (None, Some(l)) => {
+            l.send("bye", "");
+            let _ = viewer.pipeline.set_state(gst::State::Null);
+        }
+        _ => {}
+    }
     println!("viewer: stopped");
 }

@@ -55,6 +55,8 @@ pub struct Viewer {
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
     /// How far behind the video is, and catch-up requests sent.
     pub lag: Arc<crate::catchup::LagWatch>,
+    never_answer: bool,
+    no_ice: bool,
 }
 
 /// Receive-side RTP counters for video, since the session started.
@@ -97,10 +99,13 @@ impl Viewer {
             None
         });
         let relay = cfg.impair.active().then(|| crate::netsim::LossRelay::start(cfg.impair));
-        let (l, r) = (link.clone(), relay.clone());
+        let (l, r, no_ice) = (link.clone(), relay.clone(), cfg.debug_no_ice);
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
             let mut cand = v[2].get::<String>().unwrap();
+            if no_ice {
+                return None;
+            }
             if let Some(r) = &r {
                 match r.rewrite_local(&cand) {
                     Some(c) => cand = c,
@@ -181,6 +186,8 @@ impl Viewer {
             ice_failed: failed,
             jitterbuffers,
             lag,
+            never_answer: cfg.debug_never_answer,
+            no_ice: cfg.debug_no_ice,
         })
     }
 
@@ -263,6 +270,9 @@ impl Viewer {
 
     /// Applies one signaling message from the host.
     pub fn on_message(&self, link: &Arc<dyn Outbox>, clock: &HostClock, kind: &str, payload: &str) {
+        if (self.never_answer && kind == "offer") || (self.no_ice && kind == "ice") {
+            return;
+        }
         match kind {
             "offer" => {
                 let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) else { return };

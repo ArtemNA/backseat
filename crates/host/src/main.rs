@@ -4,10 +4,8 @@
 
 use media::config::{Codec, HostConfig, IceConfig, Source, VideoMode};
 use media::host::Host;
-use media::server_client::ServerClient;
-use media::signal::{self, Link, Outbox};
-use protocol::{ClientMsg, PeerId, ServerMsg};
-use std::collections::HashMap;
+use media::session::{Event, Session};
+use media::signal::{self, Link};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,11 +110,70 @@ fn main() {
     if let Some(msg) = media::platform::set_gpu_priority_from_env() {
         println!("host: {msg}");
     }
-    let host = match Host::new(args.cfg.clone()) {
-        Ok(h) => Arc::new(h),
-        Err(e) => {
-            eprintln!("host: {e}");
-            std::process::exit(1);
+    let gone = Arc::new(AtomicBool::new(false));
+    let mut direct: Option<Arc<Link>> = None;
+    let mut session = None;
+    let host = match &args.target {
+        Target::Direct(peer) => {
+            let host = Arc::new(Host::new(args.cfg.clone()).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            }));
+            let stream = connect(peer).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            });
+            let (link, mut reader) = Link::new(stream);
+            let link = Arc::new(link);
+            if let Err(e) = host.add_viewer(0, link.clone(), None) {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            }
+            println!("host: viewer connected, negotiating");
+            let (h, l, gone) = (host.clone(), link.clone(), gone.clone());
+            std::thread::spawn(move || {
+                while let Some((kind, payload)) = signal::recv(&mut reader) {
+                    if kind == "bye" {
+                        break;
+                    }
+                    h.on_message(0, l.as_ref(), &kind, &payload);
+                }
+                gone.store(true, Ordering::SeqCst);
+            });
+            direct = Some(link);
+            host
+        }
+        Target::Server { url, room, name } => {
+            let (s, events) = Session::join(url, room, name).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            });
+            let host = s.start_streaming(args.cfg.clone()).unwrap_or_else(|e| {
+                eprintln!("host: {e}");
+                std::process::exit(1);
+            });
+            println!("host: joined room {room} as {name} (id {}), streaming", s.id);
+            let (h, gone) = (host.clone(), gone.clone());
+            std::thread::spawn(move || {
+                while let Ok(e) = events.recv() {
+                    match e {
+                        Event::ViewerJoined { viewer, quality } => {
+                            let at = quality.map(|q| format!(" at {q}")).unwrap_or_default();
+                            println!("host: viewer {viewer} subscribed{at} ({} viewers)", h.viewer_count());
+                        }
+                        Event::ViewerLeft { viewer, took_ms } => {
+                            println!("host: viewer {viewer} removed in {took_ms} ms ({} viewers)", h.viewer_count());
+                        }
+                        Event::Error(m) => eprintln!("host: server error: {m}"),
+                        Event::Lost => break,
+                        _ => {}
+                    }
+                }
+                eprintln!("host: lost the signaling server");
+                gone.store(true, Ordering::SeqCst);
+            });
+            session = Some(s);
+            host
         }
     };
     let m = args.cfg.mode;
@@ -130,88 +187,6 @@ fn main() {
         host.encoder,
         args.cfg.audio
     );
-    let gone = Arc::new(AtomicBool::new(false));
-    let mut direct: Option<Arc<Link>> = None;
-    match &args.target {
-        Target::Direct(peer) => {
-            let stream = connect(peer).unwrap_or_else(|e| {
-                eprintln!("host: {e}");
-                std::process::exit(1);
-            });
-            let (link, mut reader) = Link::new(stream);
-            let link = Arc::new(link);
-            if let Err(e) = host.add_viewer(0, link.clone(), None) {
-                eprintln!("host: {e}");
-                std::process::exit(1);
-            }
-            println!("host: viewer connected, negotiating");
-            let (host, l, gone) = (host.clone(), link.clone(), gone.clone());
-            std::thread::spawn(move || {
-                while let Some((kind, payload)) = signal::recv(&mut reader) {
-                    if kind == "bye" {
-                        break;
-                    }
-                    host.on_message(0, l.as_ref(), &kind, &payload);
-                }
-                gone.store(true, Ordering::SeqCst);
-            });
-            direct = Some(link);
-        }
-        Target::Server { url, room, name } => {
-            let (client, rx) = ServerClient::join(url, room, name).unwrap_or_else(|e| {
-                eprintln!("host: {e}");
-                std::process::exit(1);
-            });
-            client.send(ClientMsg::SetStreaming { streaming: true });
-            println!("host: joined room {room} as {name} (id {}), streaming", client.id);
-            let (host, gone) = (host.clone(), gone.clone());
-            std::thread::spawn(move || {
-                let mut outboxes: HashMap<PeerId, Arc<dyn Outbox>> = HashMap::new();
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        ServerMsg::SubscribeRequest { viewer, quality } => {
-                            let out = client.to_peer(viewer);
-                            // A bad request falls back to the host's own quality.
-                            let want = quality.as_deref().and_then(|q| match media::config::Quality::parse_request(q, host.ceiling) {
-                                Ok(w) => Some(w),
-                                Err(e) => {
-                                    eprintln!("host: viewer {viewer} quality {q}: {e}");
-                                    None
-                                }
-                            });
-                            match host.add_viewer(viewer, out.clone(), want) {
-                                Ok(()) => {
-                                    outboxes.insert(viewer, out);
-                                    println!("host: viewer {viewer} subscribed ({} viewers)", host.viewer_count());
-                                }
-                                Err(e) => eprintln!("host: cannot add viewer {viewer}: {e}"),
-                            }
-                        }
-                        ServerMsg::Signal { from, kind, payload } => {
-                            if let Some(out) = outboxes.get(&from) {
-                                host.on_message(from, out.as_ref(), &kind, &payload);
-                            }
-                        }
-                        ServerMsg::UnsubscribeRequest { viewer } | ServerMsg::PeerLeft { id: viewer } => {
-                            if outboxes.remove(&viewer).is_some() {
-                                let t = Instant::now();
-                                host.remove_viewer(viewer);
-                                println!(
-                                    "host: viewer {viewer} removed in {} ms ({} viewers)",
-                                    t.elapsed().as_millis(),
-                                    host.viewer_count()
-                                );
-                            }
-                        }
-                        ServerMsg::Error { message } => eprintln!("host: server error: {message}"),
-                        _ => {}
-                    }
-                }
-                eprintln!("host: lost the signaling server");
-                gone.store(true, Ordering::SeqCst);
-            });
-        }
-    }
 
     let started = Instant::now();
     let s = &host.stats;
@@ -294,6 +269,9 @@ fn main() {
         link.send("bye", "");
     }
     std::thread::sleep(Duration::from_millis(300));
-    host.stop();
+    match session {
+        Some(s) => s.leave(),
+        None => host.stop(),
+    }
     println!("host: stopped");
 }

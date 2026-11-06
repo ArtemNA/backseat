@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+gst.workspace = true
+media.workspace = true
+protocol = { path = "../protocol" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

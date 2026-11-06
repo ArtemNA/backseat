@@ -10,6 +10,7 @@ pub mod marker;
 pub mod netsim;
 pub mod platform;
 pub mod server_client;
+pub mod session;
 pub mod signal;
 pub mod stats;
 pub mod viewer;

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>streamer</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 16px; background: #1e1f22; color: #e6e6e6; }
+    input, button { font: inherit; padding: 4px 8px; }
+    label { display: block; margin: 6px 0; }
+    #stats { margin-top: 12px; font-family: ui-monospace, monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <label>Сервер <input id="server" value="ws://127.0.0.1:7800/ws" size="30"></label>
+  <label>Кімната <input id="room" value="ui"></label>
+  <label>Стример <input id="streamer" value="pc"></label>
+  <button id="watch">Дивитись</button>
+  <div id="stats">—</div>
+  <script src="main.js"></script>
+</body>
+</html>

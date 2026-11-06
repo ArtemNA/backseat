@@ -184,4 +184,25 @@ pub struct ViewerConfig {
     /// Tests only: loss, a slow link or delay applied to traffic from the host.
     pub impair: crate::netsim::Impairment,
     pub ice: IceConfig,
+    /// Tests only: never answer the offer, like a stuck peer.
+    pub debug_never_answer: bool,
+    /// Tests only: neither send nor accept ICE candidates, so no path can exist.
+    pub debug_no_ice: bool,
+}
+
+impl Default for ViewerConfig {
+    fn default() -> Self {
+        Self {
+            latency_ms: 40,
+            audio: true,
+            wait_keyframe: false,
+            decoder: None,
+            audio_sync: true,
+            headless: false,
+            impair: Default::default(),
+            ice: IceConfig::default(),
+            debug_never_answer: false,
+            debug_no_ice: false,
+        }
+    }
 }
