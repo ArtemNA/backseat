@@ -119,7 +119,7 @@ impl Host {
         let gop = m.fps * cfg.keyframe_secs;
         let c = cfg.codec.short();
         let desc = format!(
-            "{src} ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,width={w},height={h} ! \
+            "{src} ! d3d11convert ! capsfilter name=vsize caps=\"video/x-raw(memory:D3D11Memory),format=NV12,width={w},height={h}\" ! \
              queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
              {encoder} name=venc {props} ! {c}parse config-interval=-1 ! video/x-{c},alignment=au ! \
              tee name=vtee allow-not-linked=true",
@@ -202,6 +202,7 @@ impl Host {
         });
 
         crate::drain_bus(&pipeline, "host");
+        debug_switch_size(&pipeline, m.width, m.height);
         Ok(Self { pipeline, stats, encoder, cfg, viewers: Mutex::default() })
     }
 
@@ -487,6 +488,39 @@ impl Host {
             _ => {}
         }
     }
+}
+
+/// Probe for viewer-chosen modes: STREAMER_DEBUG_SWITCH_SECS=N alternates the encoded size
+/// between the mode and 1280x720 every N seconds, so decoders meet a new resolution mid-stream
+/// exactly as when a viewer moves to another encoder.
+fn debug_switch_size(pipeline: &gst::Pipeline, w: u32, h: u32) {
+    let Some(secs) = std::env::var("STREAMER_DEBUG_SWITCH_SECS").ok().and_then(|v| v.parse::<u64>().ok()) else {
+        return;
+    };
+    let filter = pipeline.by_name("vsize").unwrap();
+    std::thread::spawn(move || {
+        let mut small = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            small = !small;
+            let (cw, ch) = if small { (1280, 720) } else { (w, h) };
+            let caps = gst::Caps::builder("video/x-raw")
+                .features(["memory:D3D11Memory"])
+                .field("format", "NV12")
+                .field("width", cw as i32)
+                .field("height", ch as i32)
+                .build();
+            eprintln!("switch {:>9.1} ms: encode {cw}x{ch}", since_start_ms());
+            filter.set_property("caps", &caps);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let enc = filter.parent().and_downcast::<gst::Bin>().and_then(|b| b.by_name("venc"));
+            let out = enc.and_then(|e| e.static_pad("src")).and_then(|p| p.current_caps());
+            let size = out.as_ref().and_then(|c| c.structure(0)).map(|s| {
+                format!("{}x{}", s.get::<i32>("width").unwrap_or(0), s.get::<i32>("height").unwrap_or(0))
+            });
+            eprintln!("switch {:>9.1} ms: encoder output now {}", since_start_ms(), size.unwrap_or_default());
+        }
+    });
 }
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
