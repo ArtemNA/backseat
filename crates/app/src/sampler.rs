@@ -51,8 +51,10 @@ pub struct LiveStats {
     pub encoder: String,
     pub viewers: Vec<ViewerRow>,
     pub layers: Vec<LayerRow>,
-    /// Sum over viewers of their layer's measured bitrate.
+    /// Measured: what is actually sent to all viewers, video and audio, per second.
     pub upload_mbit: f64,
+    /// The bitrate of the host's own layer: what one more viewer at full quality adds.
+    pub ceiling_mbit: f64,
     pub since_secs: u64,
 }
 
@@ -64,6 +66,8 @@ struct Inner {
     live_since: Option<Instant>,
     /// Per watch: frames decoded and presented at the last sample.
     last: HashMap<u64, (u64, u64, Instant)>,
+    /// Per viewer of our stream: bytes sent at the last sample.
+    sent: HashMap<u64, (u64, Instant)>,
     marker: Marker,
 }
 
@@ -171,10 +175,36 @@ fn sample(inner: &Mutex<Inner>) {
                     .collect(),
             })
             .collect();
-        let upload_mbit = viewers.iter().map(|v| rate.get(&v.quality).copied().unwrap_or(0.0)).sum();
+        // STREAMER_DEBUG_UPLOAD_PER_LAYER counts each layer once however many watch it: the
+        // spoiled variant for the upload gate.
+        let upload_mbit = if std::env::var_os("STREAMER_DEBUG_UPLOAD_PER_LAYER").is_some() {
+            rate.values().sum()
+        } else {
+            let qs = h.viewer_quality();
+            let mut total = 0.0;
+            for q in &qs {
+                let (b0, t0) = i.sent.get(&q.id).copied().unwrap_or((q.bytes_sent, now));
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt > 0.0 && q.bytes_sent >= b0 {
+                    total += (q.bytes_sent - b0) as f64 * 8.0 / dt / 1e6;
+                }
+                i.sent.insert(q.id, (q.bytes_sent, now));
+            }
+            i.sent.retain(|k, _| qs.iter().any(|q| q.id == *k));
+            total
+        };
         let since = *i.live_since.get_or_insert(now);
         h.housekeeping();
+        if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
+            eprintln!(
+                "stats: live viewers {} upload {:.2} Mbit/s layers {}",
+                viewers.len(),
+                upload_mbit,
+                layers.iter().map(|l| format!("{}={:.2}x{}", l.quality, l.mbit, l.viewers)).collect::<Vec<_>>().join(", ")
+            );
+        }
         LiveStats {
+            ceiling_mbit: h.ceiling.kbit as f64 / 1000.0,
             ceiling: h.ceiling.to_string(),
             encoder: h.encoder.clone(),
             viewers,

@@ -13,6 +13,14 @@ const el = (tag, attrs = {}, ...kids) => {
 };
 
 const PRESETS = [2000, 4000, 8000, 12000, 20000, 35000, 50000];
+// The streamer's own upload limit in Mbit/s, or 0 when unknown.
+function uploadLimit() {
+  try { return Math.max(0, +localStorage.getItem('uploadLimit') || 0); } catch { return 0; }
+}
+function setUploadLimit(v) {
+  try { if (v > 0) localStorage.setItem('uploadLimit', String(v)); else localStorage.removeItem('uploadLimit'); } catch {}
+}
+const fmt = (v) => v.toLocaleString(lang, { maximumFractionDigits: 1 });
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
 const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, sources: null, thumbs: {} } };
 
@@ -255,8 +263,9 @@ function renderLive(l) {
   if (!panel) return;
   const active = l.layers.filter((x) => !x.parked);
   const fps = Math.round(active.reduce((a, x) => Math.max(a, x.fps), 0));
-  const ceilingMbit = (+(/(\d+) kbit/.exec(l.ceiling) || [0, 0])[1]) / 1000;
-  const cap = Math.max(ceilingMbit * Math.max(l.viewers.length, 1), 1);
+  const limit = uploadLimit();
+  const cap = limit || Math.max(l.ceiling_mbit * Math.max(l.viewers.length, 1), 1);
+  const wontFit = limit && l.upload_mbit + l.ceiling_mbit > limit;
   const rows = l.viewers.map((v) => {
     const q = v.problems.find((p) => p.startsWith('queue:'));
     const loss = v.problems.find((p) => p.startsWith('loss:'));
@@ -276,8 +285,9 @@ function renderLive(l) {
       el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.encoding') }), el('span', { class: 'num', text: `${fps} fps` }),
         el('span', { class: 'small', text: t('live.layers', { n: active.length, list: active.map((x) => shortQuality(x.quality)).join(', ') || '—' }) })),
       el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.upload') }),
-        el('span', { class: 'num', text: `${l.upload_mbit.toLocaleString(lang, { maximumFractionDigits: 1 })} ${t('unit.mbit')}` }),
-        el('div', { class: 'meter' }, el('div', { style: `width:${Math.min(100, (l.upload_mbit / cap) * 100)}%` })))),
+        el('span', { class: 'num', text: limit ? t('up.of', { used: fmt(l.upload_mbit), limit: fmt(limit) }) : `${fmt(l.upload_mbit)} ${t('unit.mbit')}` }),
+        el('div', { class: 'meter' }, el('div', { style: `width:${Math.min(100, (l.upload_mbit / cap) * 100)}%;${wontFit ? 'background:var(--warn)' : ''}` })))),
+    wontFit ? el('div', { class: 'banner', text: t('up.next_wont_fit', { used: fmt(l.upload_mbit), add: fmt(l.ceiling_mbit), limit: fmt(limit) }) }) : null,
     l.viewers.length
       ? el('section', { class: 'table', 'aria-label': t('live.viewers') },
           el('div', { class: 'tr head' }, el('span', { text: t('live.th_viewer') }), el('span', { text: t('live.th_quality') }), el('span', { text: t('live.th_rtt') }), el('span', { text: t('live.th_state') })),
@@ -310,10 +320,18 @@ function renderGoLive() {
   seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
   seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
   const n = Math.max(s.peers.length - 1, 1);
+  const need = (g.kbit * n) / 1000;
+  const limit = uploadLimit();
   $('gl-upload-label').textContent = t('golive.upload', { n });
-  $('gl-upload').textContent = t('golive.upload_value', { mbit: mbit(g.kbit * n) });
-  $('gl-upload-bar').style.width = Math.min(100, (g.kbit * n) / 1000) + '%';
+  $('gl-upload').textContent = limit ? t('up.of', { used: fmt(need), limit: fmt(limit) }) : t('golive.upload_value', { mbit: mbit(g.kbit * n) });
+  const bar = $('gl-upload-bar');
+  bar.style.width = Math.min(100, (need / (limit || Math.max(need, 1))) * 100) + '%';
+  bar.style.background = limit && need > limit ? 'var(--warn)' : '';
   $('gl-upload-note').textContent = t('golive.upload_note', { kbit: mbit(g.kbit) });
+  if (document.activeElement !== $('gl-limit')) $('gl-limit').value = limit || '';
+  const over = $('gl-over');
+  over.classList.toggle('hidden', !(limit && need > limit));
+  over.textContent = limit && need > limit ? t('up.over', { need: fmt(need), limit: fmt(limit) }) : '';
 }
 $('go-live').addEventListener('click', async () => {
   $('gl-error').classList.add('hidden');
@@ -326,6 +344,7 @@ $('go-live').addEventListener('click', async () => {
 $('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); refreshThumbs(); });
 $('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); refreshThumbs(); });
 $('gl-cancel').addEventListener('click', () => $('golive').close());
+$('gl-limit').addEventListener('input', (e) => { setUploadLimit(+e.target.value); renderGoLive(); });
 $('gl-start').addEventListener('click', async () => {
   const g = state.gl;
   if (!g.pick) { $('gl-error').textContent = t('golive.pick_window'); $('gl-error').classList.remove('hidden'); return; }
@@ -358,6 +377,7 @@ async function tick() {
 setLanguage(lang);
 // Tests only: STREAMER_APP_LANG forces the language for screenshots.
 invoke('forced_language').then((l) => { if (l) { setLanguage(l); fillLanguages(); applyStrings(); } });
+invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
 fillLanguages();
 loadForm();

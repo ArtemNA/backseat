@@ -92,6 +92,9 @@ pub struct ViewerQuality {
     /// Catch-ups this viewer asked for, and frames skipped for it, since it joined.
     pub catchups: u64,
     pub skipped_frames: u64,
+    /// RTP payload bytes sent to this viewer since it joined, video and audio. Headers
+    /// (RTP, SRTP, UDP/IP) add about 4% on the wire.
+    pub bytes_sent: u64,
 }
 
 /// Everything one viewer adds to the pipeline.
@@ -473,6 +476,9 @@ impl Host {
                         for s in reply.iter().filter_map(|(_, v)| v.get::<gst::Structure>().ok()) {
                             if std::env::var_os("STREAMER_DEBUG_STATS").is_some() {
                                 eprintln!("stats {s}");
+                            }
+                            if s.name() == "outbound-rtp" {
+                                q.bytes_sent += s.get::<u64>("bytes-sent").unwrap_or(0);
                             }
                             let kind = s.get::<&str>("kind").unwrap_or("video");
                             if kind != "video" {

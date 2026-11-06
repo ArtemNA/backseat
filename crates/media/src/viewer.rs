@@ -507,8 +507,8 @@ fn add_audio(
             let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) else { return gst::PadProbeReturn::Ok };
             // opusdec gives interleaved S16LE.
             let mut a = acc.lock().unwrap();
-            for s in map.as_slice().chunks_exact(2) {
-                let v = i16::from_le_bytes([s[0], s[1]]) as f64 / 32768.0;
+            for s in map.as_slice().as_chunks::<2>().0 {
+                let v = i16::from_le_bytes(*s) as f64 / 32768.0;
                 a.0 += v * v;
                 a.1 += 1;
             }

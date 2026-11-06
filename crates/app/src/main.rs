@@ -181,6 +181,12 @@ fn test_open_golive() -> bool {
     std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some()
 }
 
+/// Tests only: STREAMER_APP_UPLOAD_LIMIT sets the upload limit (Mbit/s) for screenshots.
+#[tauri::command]
+fn test_upload_limit() -> Option<f64> {
+    std::env::var("STREAMER_APP_UPLOAD_LIMIT").ok()?.parse().ok()
+}
+
 #[tauri::command]
 fn forced_language() -> Option<String> {
     std::env::var("STREAMER_APP_LANG").ok()
@@ -323,7 +329,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

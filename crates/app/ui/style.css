@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --rail: #1e1f22;
   --side: #2b2d31;
   --main: #313338;
@@ -95,6 +96,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .7); }
 .dlg header { padding: 20px 24px 8px; }
 .dlg h2 { margin: 0; font-size: 20px; color: var(--bright); }
 .dlg .body { padding: 12px 24px 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+.dlg .body > * { flex-shrink: 0; }
 .dlg footer { background: var(--side); padding: 14px 24px; display: flex; justify-content: flex-end; gap: 10px; }
 .seg { display: inline-flex; align-self: flex-start; gap: 4px; background: var(--sunk); padding: 4px; border-radius: 8px; }
 .seg button { border: 0; border-radius: 6px; background: transparent; color: var(--muted); padding: 0 12px; min-height: 32px; }
