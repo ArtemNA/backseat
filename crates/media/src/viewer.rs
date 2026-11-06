@@ -246,10 +246,16 @@ impl Viewer {
 /// repaired. A session bandwidth at the top of our range (a cap, not traffic) fixed it.
 const SESSION_DEFAULTS: &str = "bandwidth=50000000,rtcp-fraction=0.05";
 
-/// Session defaults above, plus experiment overrides: STREAMER_JB_PROPS for rtpjitterbuffer
+/// By default the jitterbuffer also requests a packet that is merely later than the packet
+/// spacing predicts. On a link slower than the stream every packet is late, so a viewer sent
+/// ~16000 needless requests in 40 s and the resends filled its link further. Requesting only
+/// real gaps gave 0 there and still recovered all of 5% random loss.
+const JB_DEFAULTS: &str = "rtx-next-seqnum=false";
+
+/// Defaults above, plus experiment overrides: STREAMER_JB_PROPS for rtpjitterbuffer
 /// and STREAMER_SESSION_PROPS for RTPSession, both as "name=value,...".
 fn tune_jitterbuffer(webrtc: &gst::Element) {
-    let jb_props = std::env::var("STREAMER_JB_PROPS").unwrap_or_default();
+    let jb_props = format!("{JB_DEFAULTS},{}", std::env::var("STREAMER_JB_PROPS").unwrap_or_default());
     let session_props = format!("{SESSION_DEFAULTS},{}", std::env::var("STREAMER_SESSION_PROPS").unwrap_or_default());
     let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) else {
         eprintln!("viewer: no rtpbin inside webrtcbin, tuning ignored");
