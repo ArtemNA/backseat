@@ -6,6 +6,7 @@ pub mod clock;
 pub mod config;
 pub mod host;
 pub mod ice;
+pub mod instance;
 pub mod logfile;
 pub mod marker;
 pub mod netsim;
@@ -41,7 +42,7 @@ fn use_bundled_plugins() {
     let registry = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("streamer")
+        .join("Backseat")
         .join(format!("gst-registry-{}.bin", env!("CARGO_PKG_VERSION")));
     if let Some(parent) = registry.parent() {
         let _ = std::fs::create_dir_all(parent);

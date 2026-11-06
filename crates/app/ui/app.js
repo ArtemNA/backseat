@@ -130,8 +130,33 @@ function showToast(text) {
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => tb.classList.add('hidden'), 6000);
 }
+// The https page for a room's invite, on the room's own server (ws -> http, wss -> https).
+function inviteLink(r) {
+  try {
+    const u = new URL(r.server.replace(/^ws/, 'http'));
+    return `${u.protocol}//${u.host}/j/${fmtCode(r.room)}`;
+  } catch { return ''; }
+}
+// An invite link from a click (backseat://join/CODE): go there.
+async function handleLink(link) {
+  const code = parseCode(link);
+  if (!code) return;
+  const known = savedRooms().find((x) => x.room === code);
+  if (known) { if (!sameRoom(known, state.current)) await switchRoom(known); return; }
+  const fixed = await invoke('built_in_server');
+  const server = fixed || (state.current && state.current.server) || $('f-server').value.trim();
+  let name = (state.current && state.current.name) || '';
+  try { name = name || JSON.parse(localStorage.getItem('join') || '{}').name || ''; } catch {}
+  if (name) { await switchRoom({ server, room: code, name }); return; }
+  // First time: ask for a name, the code is filled in.
+  state.joinMode = 'code';
+  $('f-code').value = fmtCode(code);
+  state.joinOpen = true;
+  renderJoinForm();
+  tick();
+}
 async function copyInvite(r) {
-  const text = isCode(r.room) ? t('invite.text', { title: roomLabel(r), code: fmtCode(r.room) }) : r.room;
+  const text = isCode(r.room) ? t('invite.text', { title: roomLabel(r), code: fmtCode(r.room), link: inviteLink(r) }) : r.room;
   try { await navigator.clipboard.writeText(text); } catch {
     const ta = el('textarea', { style: 'position:fixed;left:-9999px' });
     ta.value = text; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
@@ -572,6 +597,7 @@ async function tick() {
     state.snap = s;
     showNotice(s.notice);
     render(s);
+    if (s.link) handleLink(s.link);
   } catch (e) {
     console.error(e);
   }
@@ -642,6 +668,7 @@ loadForm();
 // With a saved room, start in the last one opened; the join form is only for new rooms.
 // Not when a test joins on its own (STREAMER_APP_AUTOJOIN).
 invoke('snapshot').then(async (s) => {
+  if (s.link) { handleLink(s.link); return; }
   if (s.connected) return;
   if (await invoke('test_autojoin')) return;
   let last = null;

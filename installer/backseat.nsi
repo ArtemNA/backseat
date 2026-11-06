@@ -1,6 +1,6 @@
-; Per-user installer for streamer (no administrator rights needed, like most chat apps).
+; Per-user installer for Backseat (no administrator rights needed, like most chat apps).
 ; Built by tools\installer.ps1 from the folder tools\bundle.ps1 makes:
-;   makensis /DVERSION=0.1.0 /DSRC=dist\streamer /DWEBVIEW2=...\MicrosoftEdgeWebview2Setup.exe /DOUT=dist\streamer-setup.exe installer\streamer.nsi
+;   makensis /DVERSION=0.1.0 /DSRC=dist\backseat /DWEBVIEW2=...\MicrosoftEdgeWebview2Setup.exe /DOUT=dist\backseat-setup.exe installer\backseat.nsi
 Unicode true
 SetCompressor /SOLID lzma
 RequestExecutionLevel user
@@ -8,7 +8,7 @@ RequestExecutionLevel user
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 
-!define NAME "streamer"
+!define NAME "Backseat"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${NAME}"
 ; WebView2 Runtime client id (Microsoft documentation, "Detect if a WebView2 Runtime is installed").
 !define WV2_ID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
@@ -27,7 +27,7 @@ VIAddVersionKey "LegalCopyright" ""
 !define MUI_ICON "..\crates\app\icons\icon.ico"
 !define MUI_UNICON "..\crates\app\icons\icon.ico"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\streamer.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\backseat.exe"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -38,9 +38,9 @@ VIAddVersionKey "LegalCopyright" ""
 !insertmacro MUI_LANGUAGE "Ukrainian"
 !insertmacro MUI_LANGUAGE "Russian"
 
-LangString NoWebView2 ${LANG_ENGLISH} "streamer needs Microsoft Edge WebView2 Runtime, and it could not be installed (is the computer offline?).$\r$\n$\r$\nConnect to the internet and run this installer again, or install WebView2 from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-LangString NoWebView2 ${LANG_UKRAINIAN} "Для streamer потрібен Microsoft Edge WebView2 Runtime, але встановити його не вдалося (немає інтернету?).$\r$\n$\r$\nПідключіться до інтернету й запустіть інсталятор ще раз або встановіть WebView2 з https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-LangString NoWebView2 ${LANG_RUSSIAN} "Для streamer нужен Microsoft Edge WebView2 Runtime, но установить его не удалось (нет интернета?).$\r$\n$\r$\nПодключитесь к интернету и запустите установщик ещё раз или установите WebView2 с https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+LangString NoWebView2 ${LANG_ENGLISH} "Backseat needs Microsoft Edge WebView2 Runtime, and it could not be installed (is the computer offline?).$\r$\n$\r$\nConnect to the internet and run this installer again, or install WebView2 from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+LangString NoWebView2 ${LANG_UKRAINIAN} "Для Backseat потрібен Microsoft Edge WebView2 Runtime, але встановити його не вдалося (немає інтернету?).$\r$\n$\r$\nПідключіться до інтернету й запустіть інсталятор ще раз або встановіть WebView2 з https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+LangString NoWebView2 ${LANG_RUSSIAN} "Для Backseat нужен Microsoft Edge WebView2 Runtime, но установить его не удалось (нет интернета?).$\r$\n$\r$\nПодключитесь к интернету и запустите установщик ещё раз или установите WebView2 с https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 Function HasWebView2
   ; Leaves "1" on the stack when a WebView2 Runtime is installed for the machine or the user.
@@ -57,8 +57,18 @@ Function HasWebView2
   ${EndIf}
 FunctionEnd
 
-Section "streamer" Main
+Section "Backseat" Main
   SectionIn RO
+  ; The app was called "streamer" before: remove that install (its files, shortcuts and
+  ; entry), quietly and in place.
+  ReadRegStr $3 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\streamer" "InstallLocation"
+  ${If} $3 != ""
+  ${AndIf} ${FileExists} "$3\uninstall.exe"
+    DetailPrint "Removing the old streamer install..."
+    ExecWait '"$3\uninstall.exe" /S _?=$3'
+    Delete "$3\uninstall.exe"
+    RMDir "$3"
+  ${EndIf}
   SetOutPath "$INSTDIR"
   ; A previous version's plugins must not linger next to the new ones.
   RMDir /r "$INSTDIR\gstreamer-1.0"
@@ -85,13 +95,19 @@ Section "streamer" Main
   ; The plugin registry is a cache rebuilt on start; drop the old one.
   Delete "$LOCALAPPDATA\${NAME}\gst-registry-*.bin"
 
-  CreateShortcut "$SMPROGRAMS\${NAME}.lnk" "$INSTDIR\streamer.exe"
-  CreateShortcut "$DESKTOP\${NAME}.lnk" "$INSTDIR\streamer.exe"
+  CreateShortcut "$SMPROGRAMS\${NAME}.lnk" "$INSTDIR\backseat.exe"
+  CreateShortcut "$DESKTOP\${NAME}.lnk" "$INSTDIR\backseat.exe"
+
+  ; Invite links: backseat://join/CODE opens the app (the page at /j/CODE links here).
+  WriteRegStr HKCU "Software\Classes\backseat" "" "URL:Backseat"
+  WriteRegStr HKCU "Software\Classes\backseat" "URL Protocol" ""
+  WriteRegStr HKCU "Software\Classes\backseat\DefaultIcon" "" "$INSTDIR\backseat.exe,0"
+  WriteRegStr HKCU "Software\Classes\backseat\shell\open\command" "" '"$INSTDIR\backseat.exe" "%1"'
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${NAME}"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\streamer.exe"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\backseat.exe"
   WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
@@ -107,10 +123,11 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\gstreamer-1.0"
   RMDir /r "$INSTDIR\licenses"
   Delete "$INSTDIR\*.dll"
-  Delete "$INSTDIR\streamer.exe"
+  Delete "$INSTDIR\backseat.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   ; Logs and the plugin cache; the user's settings in the WebView2 profile stay.
   RMDir /r "$LOCALAPPDATA\${NAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
+  DeleteRegKey HKCU "Software\Classes\backseat"
 SectionEnd

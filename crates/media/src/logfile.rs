@@ -1,6 +1,6 @@
 //! Log file for the installed app. Started from a shortcut, the app has no stderr, so its
 //! messages and GStreamer's warnings would be lost. `start` points stderr at a pipe whose
-//! reader writes lines, with a time stamp, to `%LOCALAPPDATA%\streamer\logs`. The newest
+//! reader writes lines, with a time stamp, to `%LOCALAPPDATA%\Backseat\logs`. The newest
 //! few files are kept, each is capped, and credentials in URLs (`user:pass@`) are masked.
 
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ pub fn dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("streamer")
+        .join("Backseat")
         .join("logs")
 }
 
@@ -67,7 +67,7 @@ fn rotate(dir: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut logs: Vec<PathBuf> = rd
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("streamer-") && n.ends_with(".log")))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("backseat-") && n.ends_with(".log")))
         .collect();
     logs.sort();
     let extra = logs.len().saturating_sub(KEEP - 1);
@@ -93,7 +93,7 @@ pub fn start() -> Option<PathBuf> {
     let dir = dir();
     std::fs::create_dir_all(&dir).ok()?;
     rotate(&dir);
-    let path = dir.join(format!("streamer-{}.log", file_stamp()));
+    let path = dir.join(format!("backseat-{}.log", file_stamp()));
     let mut file = std::fs::File::create(&path).ok()?;
     let (mut r, mut w) = (HANDLE::default(), HANDLE::default());
     unsafe { CreatePipe(&mut r, &mut w, None, 64 * 1024) }.ok()?;
@@ -102,7 +102,7 @@ pub fn start() -> Option<PathBuf> {
         let _ = SetStdHandle(STD_OUTPUT_HANDLE, w);
     }
     let mut pipe = unsafe { std::fs::File::from_raw_handle(r.0) };
-    let _ = writeln!(file, "streamer {} log, times UTC, started {}", env!("CARGO_PKG_VERSION"), file_stamp());
+    let _ = writeln!(file, "Backseat {} log, times UTC, started {}", env!("CARGO_PKG_VERSION"), file_stamp());
     std::thread::Builder::new()
         .name("logfile".into())
         .spawn(move || {

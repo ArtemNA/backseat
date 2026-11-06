@@ -16,6 +16,9 @@ struct App {
     session: Mutex<Option<Arc<Session>>>,
     /// Last error worth showing, cleared when read.
     notice: Mutex<Option<String>>,
+    /// An invite link (backseat://join/CODE) to open, from the command line or from a
+    /// later start; cleared when read.
+    link: Mutex<Option<String>>,
     sampler: sampler::Sampler,
 }
 
@@ -47,14 +50,16 @@ struct Snapshot {
     watches: Vec<sampler::WatchStats>,
     live: Option<sampler::LiveStats>,
     notice: Option<String>,
+    link: Option<String>,
 }
 
 #[tauri::command]
 fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
     let s = app.session.lock().unwrap().clone();
     let notice = app.notice.lock().unwrap().take();
+    let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -71,6 +76,7 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
         watches: app.sampler.watches(),
         live: app.sampler.live(),
         notice,
+        link,
     }
 }
 
@@ -506,13 +512,54 @@ fn test_window_actions(w: Option<media::present::Window>) {
     });
 }
 
+/// The invite link this start was opened with (backseat://join/CODE), if any.
+fn link_arg() -> Option<String> {
+    std::env::args().skip(1).find(|a| a.to_ascii_lowercase().starts_with("backseat://"))
+}
+
+/// Brings the main window to the front (a link arrived from a later start).
+fn show_main_window() {
+    use tauri::Manager;
+    if let Some(w) = APP_HANDLE.get().and_then(|h| h.get_webview_window("main")) {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 fn main() {
+    // One app per user: a second start (an invite link clicked) hands over and leaves.
+    // Test runs start several apps on purpose (STREAMER_APP_* variables), so not them.
+    let testing = std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_"));
+    if !testing && media::instance::send_to_running(&link_arg().unwrap_or_else(|| "show".into())) {
+        return;
+    }
     if let Some(p) = media::logfile::start() {
         eprintln!("log file: {}", p.display());
     }
     media::init();
     media::logfile::gst_warnings();
     let app = Arc::new(App::default());
+    *app.link.lock().unwrap() = link_arg();
+    if !testing {
+        let a = app.clone();
+        media::instance::listen(move |msg| {
+            let msg = msg.trim().to_string();
+            eprintln!("instance: a later start sent {}", if msg.starts_with("backseat://") { "a link" } else { "show" });
+            if msg.starts_with("backseat://") {
+                *a.link.lock().unwrap() = Some(msg);
+            }
+            // The window may not exist yet in the first moments; tauri queues nothing, so
+            // try a few times.
+            for _ in 0..10 {
+                if APP_HANDLE.get().is_some() {
+                    show_main_window();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+    }
     app.sampler.start();
     automate(&app);
     tauri::Builder::default()

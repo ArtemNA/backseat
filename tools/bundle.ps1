@@ -1,12 +1,12 @@
-# Builds a self-contained Windows folder: streamer.exe, the GStreamer libraries it needs,
+# Builds a self-contained Windows folder: backseat.exe, the GStreamer libraries it needs,
 # the plugins it uses (in gstreamer-1.0\), the Visual C++ runtime, and the license texts.
 # Every DLL import of every shipped binary must resolve inside the folder or to a DLL that
 # ships with Windows itself; otherwise the script fails and names what is missing.
 #
-#   tools\bundle.ps1 [-Out dist\streamer] [-NoBuild] [-Server wss://host/ws]
+#   tools\bundle.ps1 [-Out dist\backseat] [-NoBuild] [-Server wss://host/ws]
 # -Server fixes the signaling server: the app then has no server field.
 param(
-  [string]$Out = 'dist\streamer',
+  [string]$Out = 'dist\backseat',
   [string]$Gst = '.toolchain\gstreamer',
   [switch]$NoBuild,
   [string]$Server = '',
@@ -51,7 +51,7 @@ if (-not $NoBuild) {
 if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
 New-Item -ItemType Directory "$Out\gstreamer-1.0", "$Out\licenses" -Force | Out-Null
 $Out = (Resolve-Path $Out).Path
-Copy-Item "$root\target\release\app.exe" "$Out\streamer.exe"
+Copy-Item "$root\target\release\app.exe" "$Out\backseat.exe"
 foreach ($p in $plugins) { Copy-Item "$Gst\lib\gstreamer-1.0\gst$p.dll" "$Out\gstreamer-1.0\" }
 
 function Imports($file) {
@@ -85,19 +85,19 @@ while ($todo.Count) {
 
 foreach ($l in $licenses) { Copy-Item "$Gst\share\licenses\$l" "$Out\licenses\" -Recurse }
 Copy-Item "$root\THIRD-PARTY.md" "$Out\licenses\"
-# Every crate compiled into streamer.exe for Windows, with its license.
+# Every crate compiled into backseat.exe for Windows, with its license.
 $crates = cargo tree -p app --target x86_64-pc-windows-msvc -e normal --prefix none --format '{p}  {l}' 2>$null |
   ForEach-Object { $_ -replace ' \(.*?\)', '' -replace ' \(\*\)$', '' } | Sort-Object -Unique
 if (-not $crates) { throw 'cargo tree gave no crate list' }
-@('Rust crates in streamer.exe (name version  license)', '') + $crates | Set-Content "$Out\licenses\rust-crates.txt"
+@('Rust crates in backseat.exe (name version  license)', '') + $crates | Set-Content "$Out\licenses\rust-crates.txt"
 $bad = $crates | Where-Object { $_ -match 'GPL' -and $_ -notmatch 'LGPL' -and $_ -notmatch ' OR ' }
 if ($bad) { 'crates under a GPL-only license:'; $bad; exit 1 }
 
 $files = Get-ChildItem $Out -Recurse -File
 $mb = { param($x) ($x | Measure-Object Length -Sum).Sum / 1MB }
 'folder {0}: {1} files, {2:N1} MB' -f $Out, $files.Count, (& $mb $files)
-'  streamer.exe {0:N1} MB; libraries {1} ({2:N1} MB); plugins {3} ({4:N1} MB)' -f `
-  (& $mb (Get-Item "$Out\streamer.exe")), @(Get-ChildItem $Out -Filter *.dll).Count, (& $mb (Get-ChildItem $Out -Filter *.dll)), `
+'  backseat.exe {0:N1} MB; libraries {1} ({2:N1} MB); plugins {3} ({4:N1} MB)' -f `
+  (& $mb (Get-Item "$Out\backseat.exe")), @(Get-ChildItem $Out -Filter *.dll).Count, (& $mb (Get-ChildItem $Out -Filter *.dll)), `
   @(Get-ChildItem "$Out\gstreamer-1.0").Count, (& $mb (Get-ChildItem "$Out\gstreamer-1.0"))
 if ($missing) {
   'MISSING imports:'

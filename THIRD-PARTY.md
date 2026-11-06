@@ -1,6 +1,6 @@
 # Third-party software
 
-streamer for Windows ships the following third-party software next to `streamer.exe`.
+Backseat for Windows ships the following third-party software next to `backseat.exe`.
 Their license texts are in the `licenses` folder of the installation.
 
 ## GStreamer and its libraries (LGPL)
@@ -36,7 +36,7 @@ well, libnice under LGPL 2.1 or MPL 1.1.
 
 ## Rust crates
 
-`streamer.exe` is built from Rust crates published on crates.io, under MIT, Apache 2.0,
+`backseat.exe` is built from Rust crates published on crates.io, under MIT, Apache 2.0,
 BSD, zlib, ISC, Unicode, Unlicense and MPL 2.0 licenses (the MPL 2.0 crates are used
 unmodified; their source is on crates.io). The full list with each crate's license is in
 `licenses/rust-crates.txt`.

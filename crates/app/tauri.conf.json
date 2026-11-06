@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "streamer",
+  "productName": "Backseat",
   "version": "0.1.0",
   "identifier": "app.streamer.local",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "streamer",
+        "title": "Backseat",
         "width": 1280,
         "height": 800
       }

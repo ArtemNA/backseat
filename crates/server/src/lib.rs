@@ -101,6 +101,8 @@ impl Server {
             .route("/ws", get(upgrade))
             // Health check for the host, and the target of the keep-alive request.
             .route("/live", get(|| async { "ok" }))
+            // Invite links: a page that opens the app on that room, or shows the code.
+            .route("/j/{code}", get(invite_page))
             .with_state(self.clone())
     }
 
@@ -188,6 +190,56 @@ impl Server {
         self.rooms.lock().unwrap().remove(id);
     }
 }
+
+/// The page behind an invite link (`/j/K7Q2-9XMB-4TQ1`). Messengers make https links
+/// clickable but not `backseat://` ones, so the link comes here and the page hands the
+/// code to the app. Self-contained: no scripts or styles from anywhere else.
+async fn invite_page(axum::extract::Path(code): axum::extract::Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let clean: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect();
+    if clean.len() != 12 {
+        return (axum::http::StatusCode::NOT_FOUND, "no such invite").into_response();
+    }
+    let shown = format!("{}-{}-{}", &clean[0..4], &clean[4..8], &clean[8..12]);
+    let html = INVITE_PAGE.replace("{CODE}", &clean).replace("{SHOWN}", &shown);
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::HeaderName::from_static("content-security-policy"), "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+const INVITE_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backseat</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#1e1f22;color:#dbdee1;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:420px;margin:16px;background:#313338;border-radius:12px;padding:28px;text-align:center}
+h1{margin:0 0 6px;font-size:22px;color:#f2f3f5}
+a.btn{display:inline-block;margin:18px 0 10px;padding:11px 22px;border-radius:8px;background:#3b6fd8;color:#fff;font-weight:600;text-decoration:none}
+code{display:inline-block;margin-top:6px;padding:6px 10px;border-radius:6px;background:#1e1f22;color:#f2f3f5;font-size:18px;letter-spacing:.06em}
+p{margin:6px 0;color:#b5bac1}
+</style></head>
+<body><main>
+<h1 id="h">Backseat</h1>
+<p id="lead">You are invited to a room.</p>
+<a class="btn" id="open" href="backseat://join/{CODE}">Open in Backseat</a>
+<p id="manual">No app or nothing happens? In Backseat press “+”, choose “I have an invite” and enter:</p>
+<code>{SHOWN}</code>
+</main>
+<script>
+var L={uk:["Вас запрошують у кімнату.","Відкрити в Backseat","Немає застосунку або нічого не сталося? У Backseat натисніть «+», виберіть «Маю запрошення» і введіть:"],
+ru:["Вас приглашают в комнату.","Открыть в Backseat","Нет приложения или ничего не произошло? В Backseat нажмите «+», выберите «Есть приглашение» и введите:"]};
+var l=L[(navigator.language||"").slice(0,2)];
+if(l){document.getElementById("lead").textContent=l[0];document.getElementById("open").textContent=l[1];document.getElementById("manual").textContent=l[2];}
+setTimeout(function(){location.href="backseat://join/{CODE}"},300);
+</script>
+</body></html>
+"#;
 
 async fn upgrade(ws: WebSocketUpgrade, State(server): State<Arc<Server>>) -> axum::response::Response {
     ws.max_message_size(MAX_PAYLOAD_LEN * 2).on_upgrade(move |socket| session(server, socket))
