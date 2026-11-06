@@ -257,6 +257,9 @@ struct GoLive {
     /// "1440p60" etc.
     mode: String,
     kbit: u32,
+    /// "h264" or "h265"; H.265 when missing.
+    #[serde(default)]
+    codec: Option<String>,
 }
 
 #[tauri::command]
@@ -274,7 +277,7 @@ fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
     let cfg = HostConfig {
         mode: VideoMode::parse(&req.mode)?,
         kbit: req.kbit,
-        codec: Codec::H265,
+        codec: req.codec.as_deref().map(Codec::parse).transpose()?.unwrap_or(Codec::H265),
         keyframe_secs: 2,
         audio: req.audio != "none",
         audio_pid: if req.audio == "app" { req.audio_pid } else { None },
@@ -319,6 +322,8 @@ fn set_quality(app: tauri::State<'_, Arc<App>>, streamer: u64, quality: String) 
 /// Tests only, so a run needs no clicks:
 /// STREAMER_APP_AUTOJOIN="ws://...;room;name" joins at launch;
 /// STREAMER_APP_AUTOLIVE="1080p60;8000" then streams the test pattern (needs dev sources);
+/// a third field "monitor" streams the primary monitor, a fourth sets the codec
+/// ("1080p60;8000;bars;h264");
 /// STREAMER_APP_AUTOWATCH="streamer name;720p30 2000" then watches that streamer.
 fn automate(app: &Arc<App>) {
     let Ok(join) = std::env::var("STREAMER_APP_AUTOJOIN") else { return };
@@ -342,7 +347,7 @@ fn automate(app: &Arc<App>) {
             } else {
                 0
             };
-            let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000) };
+            let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000), codec: p.get(3).map(|c| c.to_string()) };
             if let Err(e) = do_go_live(&app, req) {
                 app.notify(format!("error:{e}"));
             }

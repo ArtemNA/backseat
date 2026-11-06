@@ -293,7 +293,8 @@ fn sample(inner: &Mutex<Inner>) {
         h.housekeeping();
         if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
             eprintln!(
-                "stats: live viewers {} upload {:.2} Mbit/s layers {}",
+                "stats: live encoder {} viewers {} upload {:.2} Mbit/s layers {}",
+                h.encoder,
                 viewers.len(),
                 upload_mbit,
                 layers.iter().map(|l| format!("{}={:.2}x{}", l.quality, l.mbit, l.viewers)).collect::<Vec<_>>().join(", ")

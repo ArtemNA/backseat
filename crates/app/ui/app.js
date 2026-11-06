@@ -22,7 +22,7 @@ function setUploadLimit(v) {
 }
 const fmt = (v) => v.toLocaleString(lang, { maximumFractionDigits: 1 });
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
-const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, sources: null, thumbs: {} } };
+const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, codec: 'h265', sources: null, thumbs: {} } };
 
 // Pictures for the visible tab of the source picker, every 2 s while it is open.
 async function refreshThumbs() {
@@ -327,6 +327,8 @@ function renderGoLive() {
   seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; renderGoLive(); });
   seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
   seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
+  seg($('gl-codec'), [['h265', 'H.265'], ['h264', 'H.264']], g.codec, (v) => { g.codec = v; renderGoLive(); });
+  $('gl-codec-note').textContent = t(g.codec === 'h264' ? 'golive.codec_h264' : 'golive.codec_h265');
   const n = Math.max(s.peers.length - 1, 1);
   const need = (g.kbit * n) / 1000;
   const limit = uploadLimit();
@@ -357,7 +359,7 @@ $('gl-start').addEventListener('click', async () => {
   const g = state.gl;
   if (!g.pick) { $('gl-error').textContent = t('golive.pick_window'); $('gl-error').classList.remove('hidden'); return; }
   const audio = document.querySelector('input[name=audio]:checked').value;
-  await call('go_live', { req: { kind: g.tab === 'screen' ? 'monitor' : 'window', id: g.pick.id, audio, audio_pid: g.pick.pid ?? null, mode: `${g.res}p${g.fps}`, kbit: g.kbit } }, $('gl-error'));
+  await call('go_live', { req: { kind: g.tab === 'screen' ? 'monitor' : 'window', id: g.pick.id, audio, audio_pid: g.pick.pid ?? null, mode: `${g.res}p${g.fps}`, kbit: g.kbit, codec: g.codec } }, $('gl-error'));
   $('golive').close();
   tick();
 });
