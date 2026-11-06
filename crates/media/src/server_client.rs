@@ -22,21 +22,28 @@ pub struct ServerClient {
     out: mpsc::Sender<ClientMsg>,
     pub id: PeerId,
     pub peers: Vec<PeerInfo>,
+    /// The room's display name from the server, if it has one.
+    pub title: Option<String>,
 }
 
 impl ServerClient {
     /// Connects, joins the room and returns the client plus the stream of server messages.
     pub fn join(url: &str, room: &str, name: &str) -> Result<(Arc<Self>, mpsc::Receiver<ServerMsg>), String> {
+        Self::join_titled(url, room, name, None)
+    }
+
+    /// Like `join`; `title` names the room if it is new.
+    pub fn join_titled(url: &str, room: &str, name: &str, title: Option<&str>) -> Result<(Arc<Self>, mpsc::Receiver<ServerMsg>), String> {
         let (mut ws, _) = tungstenite::connect(url).map_err(|e| format!("cannot reach server {url}: {e}"))?;
         if let Some(s) = tcp(ws.get_mut()) {
             s.set_nodelay(true).ok();
         }
-        let join = ClientMsg::Join { room: room.into(), name: name.into() };
+        let join = ClientMsg::Join { room: room.into(), name: name.into(), title: title.map(String::from) };
         ws.send(Message::Text(join.to_json().into())).map_err(|e| e.to_string())?;
-        let (id, peers) = loop {
+        let (id, peers, title) = loop {
             match ws.read().map_err(|e| e.to_string())? {
                 Message::Text(t) => match protocol::parse_server(&t)? {
-                    ServerMsg::Welcome { id, peers, .. } => break (id, peers),
+                    ServerMsg::Welcome { id, peers, title, .. } => break (id, peers, title),
                     ServerMsg::Error { message } => return Err(format!("server refused join: {message}")),
                     _ => continue,
                 },
@@ -101,7 +108,7 @@ impl ServerClient {
               }
             })
             .unwrap();
-        Ok((Arc::new(Self { out: out_tx, id, peers }), in_rx))
+        Ok((Arc::new(Self { out: out_tx, id, peers, title }), in_rx))
     }
 
     pub fn send(&self, m: ClientMsg) {

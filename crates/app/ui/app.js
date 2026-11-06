@@ -22,7 +22,7 @@ function setUploadLimit(v) {
 }
 const fmt = (v) => v.toLocaleString(lang, { maximumFractionDigits: 1 });
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
-const state = { snap: null, current: null, joinOpen: false, videosHidden: false, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, codec: 'h265', sources: null, thumbs: {} } };
+const state = { snap: null, current: null, joinOpen: false, joinMode: 'create', videosHidden: false, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, codec: 'h265', sources: null, thumbs: {} } };
 
 // Pictures for the visible tab of the source picker, every 2 s while it is open.
 async function refreshThumbs() {
@@ -46,6 +46,9 @@ setInterval(refreshThumbs, 2000);
 function applyStrings() {
   document.querySelectorAll('[data-t]').forEach((n) => { n.textContent = t(n.dataset.t); });
   $('leave').setAttribute('aria-label', t('room.leave'));
+  $('invite').setAttribute('aria-label', t('room.invite'));
+  $('invite').title = t('room.invite');
+  renderJoinForm();
   state.cardsKey = '';
   state.liveKey = '';
   $('rail').dataset.key = '';
@@ -100,6 +103,41 @@ function saveRooms(list) {
   try { localStorage.setItem('rooms', JSON.stringify(list)); } catch {}
 }
 const sameRoom = (a, b) => a && b && a.room === b.room && a.server === b.server;
+// Rooms made here are named by a random invite code (Crockford base32, 12 symbols, about
+// 60 bits): nobody finds them by guessing. Older rooms are plain names anyone can type.
+const CODE_ABC = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{12}$/;
+function newCode() {
+  const b = new Uint8Array(12);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => CODE_ABC[x & 31]).join('');
+}
+// A code or a link carrying one, as typed or pasted; null if it is neither.
+function parseCode(text) {
+  let v = text.trim();
+  const m = v.match(/(?:\/j\/|join\/)([0-9A-Za-z-]+)/);
+  if (m) v = m[1];
+  v = v.toUpperCase().replace(/[\s-]/g, '').replace(/O/g, '0').replace(/[IL]/g, '1').replace(/U/g, 'V');
+  return CODE_RE.test(v) ? v : null;
+}
+const isCode = (room) => CODE_RE.test(room);
+const fmtCode = (c) => c.match(/.{1,4}/g).join('-');
+const roomLabel = (r) => (r && (r.title || r.room)) || '';
+function showToast(text) {
+  const tb = $('toast');
+  tb.textContent = text;
+  tb.classList.remove('hidden');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => tb.classList.add('hidden'), 6000);
+}
+async function copyInvite(r) {
+  const text = isCode(r.room) ? t('invite.text', { title: roomLabel(r), code: fmtCode(r.room) }) : r.room;
+  try { await navigator.clipboard.writeText(text); } catch {
+    const ta = el('textarea', { style: 'position:fixed;left:-9999px' });
+    ta.value = text; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  showToast(isCode(r.room) ? t('room.copied', { code: fmtCode(r.room) }) : t('room.copied_plain', { code: r.room }));
+}
 function rememberRoom(r) {
   const list = savedRooms();
   const i = list.findIndex((x) => sameRoom(x, r));
@@ -112,7 +150,7 @@ function initials(room) {
   return two.toUpperCase();
 }
 async function joinRoom(r) {
-  await call('connect', r, $('join-error'));
+  await call('connect', { server: r.server, room: r.room, name: r.name, title: r.title || null }, $('join-error'));
   state.current = r;
   rememberRoom(r);
   try { localStorage.setItem('lastRoom', JSON.stringify(r)); } catch {}
@@ -127,7 +165,8 @@ async function switchRoom(r) {
     await joinRoom(r);
   } catch {
     // Show the join screen with this room filled in and the error.
-    for (const k of ['room', 'name']) $('f-' + k).value = r[k];
+    $('f-name').value = r.name;
+    if (isCode(r.room)) { state.joinMode = 'code'; $('f-code').value = fmtCode(r.room); }
     state.joinOpen = true;
     tick();
   }
@@ -141,7 +180,7 @@ function renderRail(s) {
   $('rail').dataset.key = key;
   $('rail').replaceChildren(
     ...list.map((r) => el('button', {
-      class: 'r' + (sameRoom(r, cur) ? ' on' : ''), type: 'button', title: r.room, text: initials(r.room),
+      class: 'r' + (sameRoom(r, cur) ? ' on' : ''), type: 'button', title: roomLabel(r), 'data-room': r.room, text: initials(roomLabel(r)),
       onclick: () => { if (!sameRoom(r, state.current)) switchRoom(r); },
       oncontextmenu: (e) => { e.preventDefault(); openRoomMenu(e, r); },
     })),
@@ -154,6 +193,7 @@ function openRoomMenu(e, r) {
   const item = (text, fn, cls = '') => el('button', { type: 'button', class: cls, text, onclick: () => { closeRoomMenu(); fn(); } });
   m.replaceChildren(
     sameRoom(r, state.current) ? null : item(t('rooms.open'), () => switchRoom(r)),
+    item(t('rooms.copy_invite'), () => copyInvite(r)),
     item(t('rooms.rename'), () => openRename(r)),
     item(t('rooms.remove'), () => { saveRooms(savedRooms().filter((x) => !sameRoom(x, r))); $('rail').dataset.key = ''; tick(); }, 'danger'));
   m.style.left = `${e.clientX}px`;
@@ -165,7 +205,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeRoomM
 let renaming = null;
 function openRename(r) {
   renaming = r;
-  $('rename-title').textContent = t('rename.title', { room: r.room });
+  $('rename-title').textContent = t('rename.title', { room: roomLabel(r) });
   $('rename-name').value = r.name;
   $('rename').showModal();
 }
@@ -186,7 +226,7 @@ $('rename').addEventListener('close', async () => {
 function loadForm() {
   try {
     const saved = JSON.parse(localStorage.getItem('join') || '{}');
-    for (const k of ['server', 'room', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
+    for (const k of ['server', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
   } catch {}
   // A build made for one server has no server field: the address is fixed.
   invoke('built_in_server').then((url) => {
@@ -195,12 +235,35 @@ function loadForm() {
     $('f-server').closest('label').classList.add('hidden');
   });
 }
+// The form makes a new room or joins one by its invite.
+function renderJoinForm() {
+  const mode = state.joinMode;
+  seg($('join-mode'), [['create', t('join.create_mode')], ['code', t('join.code_mode')]], mode, (v) => { state.joinMode = v; renderJoinForm(); });
+  $('row-title').classList.toggle('hidden', mode !== 'create');
+  $('row-code').classList.toggle('hidden', mode !== 'code');
+  $('join-submit').textContent = mode === 'create' ? t('join.create') : t('join.enter');
+}
+function joinError(text) {
+  $('join-error').textContent = text;
+  $('join-error').classList.remove('hidden');
+}
 $('join-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   $('join-error').classList.add('hidden');
-  const args = { server: $('f-server').value.trim(), room: $('f-room').value.trim(), name: $('f-name').value.trim() };
-  try { await joinRoom(args); } catch {}
+  const base = { server: $('f-server').value.trim(), name: $('f-name').value.trim() };
+  let r;
+  if (state.joinMode === 'create') {
+    const title = $('f-title').value.trim();
+    if (!title) return joinError(t('join.need_title'));
+    r = { ...base, room: newCode(), title };
+  } else {
+    const code = parseCode($('f-code').value);
+    if (!code) return joinError(t('join.bad_code'));
+    r = { ...base, room: code };
+  }
+  try { await joinRoom(r); $('f-title').value = ''; $('f-code').value = ''; } catch {}
 });
+$('invite').addEventListener('click', () => { if (state.current) copyInvite(state.current); });
 $('join-back').addEventListener('click', () => { state.joinOpen = false; tick(); });
 $('leave').addEventListener('click', async () => { await invoke('leave'); state.current = null; $('rail').dataset.key = ''; tick(); });
 
@@ -214,12 +277,14 @@ function render(s) {
   if (!s.connected) { syncVideos(); return; }
   const me = s.peers.find((p) => p.me) || { name: '?' };
   // Joined some other way (tests): remember what we are in.
-  if (!state.current || state.current.room !== s.room) {
-    state.current = { server: $('f-server').value.trim(), room: s.room, name: me.name };
+  if (!state.current || state.current.room !== s.room || (s.title && state.current.title !== s.title)) {
+    // The server's title wins: a room joined by code learns its name here.
+    state.current = { ...(state.current && state.current.room === s.room ? state.current : { server: $('f-server').value.trim(), name: me.name }), room: s.room, title: s.title || (state.current && state.current.title) || null };
     rememberRoom(state.current);
     try { localStorage.setItem('lastRoom', JSON.stringify(state.current)); } catch {}
   }
-  $('room-name').textContent = s.room;
+  $('room-name').textContent = s.title || s.room;
+  $('room-name').title = isCode(s.room) ? fmtCode(s.room) : s.room;
   $('me-avatar').replaceWith(Object.assign(avatar(me.name), { id: 'me-avatar' }));
   $('me-state').textContent = s.live ? t('room.live_for', { t: clock(s.live.since_secs) }) : t('room.not_live');
   $('me-state').style.color = s.live ? '#ff9aa0' : '';
@@ -528,6 +593,26 @@ invoke('test_ui_stress').then((tab) => {
     if (n % 2 === 0) { setLanguage(LANGS[(n / 2) % LANGS.length].id); $('main-header').dataset.key = ''; applyStrings(); }
   }, 1500);
 });
+invoke('test_form').then((spec) => {
+  if (!spec) return;
+  const [mode, value, name, server] = spec.split('|');
+  setTimeout(() => {
+    if (mode === 'show') { state.joinOpen = true; tick(); return; }
+    state.joinMode = mode;
+    renderJoinForm();
+    $('f-name').value = name;
+    if (server) $('f-server').value = server;
+    if (mode === 'create') $('f-title').value = value; else $('f-code').value = value;
+    $('join-form').requestSubmit();
+    const timer = setInterval(() => {
+      const s = state.snap;
+      if (s && s.connected) {
+        clearInterval(timer);
+        setTimeout(() => invoke('test_report', { msg: `room ${s.room} title ${state.snap.title} header ${$('room-name').textContent} peers ${state.snap.peers.map((p) => p.name).join(',')}` }), 1500);
+      }
+    }, 300);
+  }, 1500);
+});
 invoke('test_click_watch').then((name) => {
   if (!name) return;
   const timer = setInterval(() => {
@@ -541,10 +626,10 @@ invoke('test_rooms').then((other) => {
     const first = state.current;
     await switchRoom({ ...first, room: other });
     setTimeout(() => {
-      const btn = [...document.querySelectorAll('#rail .r')].find((b) => b.title === first.room);
+      const btn = [...document.querySelectorAll('#rail .r')].find((b) => b.dataset.room === first.room);
       if (btn) btn.click();
       setTimeout(() => {
-        const b2 = [...document.querySelectorAll('#rail .r')].find((b) => b.title === other);
+        const b2 = [...document.querySelectorAll('#rail .r')].find((b) => b.dataset.room === other);
         if (b2) { const r = b2.getBoundingClientRect(); b2.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.right - 6, clientY: r.top + 10 })); }
       }, 4000);
     }, 5000);

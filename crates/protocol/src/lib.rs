@@ -8,6 +8,8 @@ pub type PeerId = u64;
 
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_ROOM_LEN: usize = 64;
+/// A room's display name; the room itself is its code (or, in older clients, its name).
+pub const MAX_TITLE_LEN: usize = 48;
 /// SDP offers are a few KB; anything far larger is not signaling.
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024;
 
@@ -21,8 +23,14 @@ pub struct PeerInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// First message on a connection.
-    Join { room: String, name: String },
+    /// First message on a connection. `title` names a new room for everyone who joins it
+    /// later (by code); it is ignored when the room already has one.
+    Join {
+        room: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     /// Announces whether this peer offers a stream others can watch.
     SetStreaming { streaming: bool },
     /// Asks a streamer to start sending to us, optionally at a lower quality ("720p30 2000"),
@@ -44,7 +52,14 @@ pub enum ClientMsg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    Welcome { id: PeerId, room: String, peers: Vec<PeerInfo> },
+    Welcome {
+        id: PeerId,
+        room: String,
+        peers: Vec<PeerInfo>,
+        /// The room's display name, if its first member gave one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     PeerJoined { peer: PeerInfo },
     PeerUpdated { peer: PeerInfo },
     PeerLeft { id: PeerId },
@@ -88,7 +103,7 @@ mod tests {
     fn round_trip() {
         let m = ClientMsg::Signal { to: 3, kind: "offer".into(), payload: "v=0\r\n".into() };
         assert_eq!(parse_client(&m.to_json()).unwrap(), m);
-        let s = ServerMsg::Welcome { id: 1, room: "r".into(), peers: vec![] };
+        let s = ServerMsg::Welcome { id: 1, room: "r".into(), peers: vec![], title: Some("Friends".into()) };
         assert_eq!(parse_server(&s.to_json()).unwrap(), s);
     }
 
@@ -100,5 +115,10 @@ mod tests {
         assert_eq!(parse_client(&q.to_json()).unwrap(), q);
         // Older clients without the field still parse.
         assert_eq!(parse_client(r#"{"type":"subscribe","streamer":7}"#).unwrap(), m);
+        assert_eq!(
+            parse_client(r#"{"type":"join","room":"r","name":"n"}"#).unwrap(),
+            ClientMsg::Join { room: "r".into(), name: "n".into(), title: None }
+        );
+        assert!(matches!(parse_server(r#"{"type":"welcome","id":1,"room":"r","peers":[]}"#).unwrap(), ServerMsg::Welcome { title: None, .. }));
     }
 }

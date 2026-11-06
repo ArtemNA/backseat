@@ -84,6 +84,8 @@ pub struct Session {
     client: Arc<ServerClient>,
     pub id: PeerId,
     pub room: String,
+    /// The room's display name from the server.
+    pub title: Option<String>,
     state: Mutex<State>,
     events: mpsc::Sender<Event>,
 }
@@ -91,7 +93,12 @@ pub struct Session {
 impl Session {
     /// Joins `room` as `name`. Events arrive on the returned receiver.
     pub fn join(url: &str, room: &str, name: &str) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
-        let (client, rx) = ServerClient::join(url, room, name)?;
+        Self::join_titled(url, room, name, None)
+    }
+
+    /// Like `join`; `title` names the room if it is new.
+    pub fn join_titled(url: &str, room: &str, name: &str, title: Option<&str>) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
+        let (client, rx) = ServerClient::join_titled(url, room, name, title)?;
         let (tx, events) = mpsc::channel();
         let me = PeerInfo { id: client.id, name: name.into(), streaming: false };
         let mut peers = client.peers.clone();
@@ -99,6 +106,7 @@ impl Session {
         let s = Arc::new(Self {
             id: client.id,
             room: room.into(),
+            title: client.title.clone(),
             client,
             state: Mutex::new(State { peers: peers.clone(), ..Default::default() }),
             events: tx,

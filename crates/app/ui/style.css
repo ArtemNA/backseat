@@ -50,6 +50,8 @@ a { color: #8fb4ff; }
 .menu button.danger { color: #f0767b; }
 .menu button.danger:hover { background: var(--danger); color: #fff; }
 .small-dlg { width: 380px; }
+.toast { margin: 8px; padding: 10px 12px; border-radius: 8px; background: #23392d; border: 1px solid #2f6b47; color: #cdeedb; font-size: 13px; }
+#join-mode button { flex: 1; }
 #rename input { background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; }
 
 /* Watched streams: a grid of tiles; the video itself is a native window placed over

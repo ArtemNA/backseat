@@ -40,6 +40,8 @@ struct PeerView {
 struct Snapshot {
     connected: bool,
     room: String,
+    /// The room's display name from the server.
+    title: Option<String>,
     me: u64,
     peers: Vec<PeerView>,
     watches: Vec<sampler::WatchStats>,
@@ -52,7 +54,7 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
     let s = app.session.lock().unwrap().clone();
     let notice = app.notice.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), me: 0, peers: vec![], watches: vec![], live: None, notice };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -63,6 +65,7 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
     Snapshot {
         connected: true,
         room: s.room.clone(),
+        title: s.title.clone(),
         me: s.id,
         peers,
         watches: app.sampler.watches(),
@@ -96,16 +99,17 @@ fn built_in_server() -> Option<String> {
 #[tauri::command]
 /// Async: runs off the main thread. On it, creating or closing a video window inside the
 /// main window waited for the main thread itself, and the app froze on Watch.
-async fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String) -> Result<(), String> {
+async fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String, title: Option<String>) -> Result<(), String> {
     let server = built_in().map(String::from).unwrap_or(server);
-    do_connect(app.inner(), &server, &room, &name).inspect_err(|e| eprintln!("connect failed: {e}"))
+    do_connect(app.inner(), &server, &room, &name, title.as_deref()).inspect_err(|e| eprintln!("connect failed: {e}"))
 }
 
-fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str) -> Result<(), String> {
+/// `title` names the room if it is new (a room made here, with its invite code as `room`).
+fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Option<&str>) -> Result<(), String> {
     if let Some(old) = app.session.lock().unwrap().take() {
         old.leave();
     }
-    let (s, events) = Session::join(server, room, name)?;
+    let (s, events) = Session::join_titled(server, room, name, title)?;
     *app.session.lock().unwrap() = Some(s.clone());
     app.sampler.attach(s.clone());
     let a = app.clone();
@@ -267,10 +271,24 @@ fn test_click_watch() -> Option<String> {
     std::env::var("STREAMER_APP_CLICK_WATCH").ok()
 }
 
+/// Tests only: STREAMER_APP_TEST_FORM="create|Room title|Name" or "code|K7Q2-...|Name" fills
+/// the join form and submits it; the page then reports the room it is in (test_report).
+#[tauri::command]
+fn test_form() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_FORM").ok()
+}
+
+#[tauri::command]
+fn test_report(msg: String) {
+    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() {
+        eprintln!("test: {msg}");
+    }
+}
+
 /// Whether a test joins a room by itself (then the page does not open the last room).
 #[tauri::command]
 fn test_autojoin() -> bool {
-    std::env::var_os("STREAMER_APP_AUTOJOIN").is_some()
+    std::env::var_os("STREAMER_APP_AUTOJOIN").is_some() || std::env::var_os("STREAMER_APP_TEST_FORM").is_some()
 }
 
 #[tauri::command]
@@ -415,7 +433,7 @@ fn automate(app: &Arc<App>) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // A build with a fixed server goes there, like the join screen does.
-        if let Err(e) = do_connect(&app, built_in().unwrap_or(p[0]), p[1], p[2]) {
+        if let Err(e) = do_connect(&app, built_in().unwrap_or(p[0]), p[1], p[2], None) {
             app.notify(format!("error:{e}"));
             return;
         }
@@ -510,7 +528,7 @@ fn main() {
             Ok(())
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

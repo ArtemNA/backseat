@@ -25,7 +25,7 @@ struct Client {
 impl Client {
     async fn join(url: &str, room: &str, name: &str) -> (Self, Vec<protocol::PeerInfo>) {
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        let join = ClientMsg::Join { room: room.into(), name: name.into() };
+        let join = ClientMsg::Join { room: room.into(), name: name.into(), title: None };
         ws.send(Message::Text(join.to_json().into())).await.unwrap();
         let mut c = Client { ws, id: 0 };
         match c.next().await {
@@ -218,4 +218,33 @@ async fn client_without_heartbeat_stays() {
     let (_probe, peers) = Client::join(&url, "room", "probe").await;
     assert_eq!(peers.len(), 1, "the older client should still be in the room");
     reader.abort();
+}
+
+/// The first member's title names the room for everyone after; it goes with the room.
+#[tokio::test]
+async fn room_title_is_kept_while_the_room_lives() {
+    let url = start(server::Config::default()).await;
+    let join = |title: Option<&str>| {
+        let (url, title) = (url.clone(), title.map(String::from));
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.unwrap();
+            let m = ClientMsg::Join { room: "K7Q29XMB4TQ1".into(), name: "n".into(), title };
+            ws.send(Message::Text(m.to_json().into())).await.unwrap();
+            let mut c = Client { ws, id: 0 };
+            match c.next().await {
+                ServerMsg::Welcome { title, .. } => (c, title),
+                other => panic!("expected welcome, got {other:?}"),
+            }
+        }
+    };
+    let (first, t1) = join(Some("Friends RPG")).await;
+    assert_eq!(t1.as_deref(), Some("Friends RPG"));
+    let (second, t2) = join(None).await;
+    assert_eq!(t2.as_deref(), Some("Friends RPG"), "a joiner by code gets the title");
+    let (third, t3) = join(Some("Other")).await;
+    assert_eq!(t3.as_deref(), Some("Friends RPG"), "a later title does not replace it");
+    drop((first, second, third));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_fresh, t4) = join(None).await;
+    assert_eq!(t4, None, "the title goes when the room empties");
 }

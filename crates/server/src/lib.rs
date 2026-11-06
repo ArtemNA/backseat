@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, PeerId, PeerInfo, ServerMsg, MAX_NAME_LEN, MAX_PAYLOAD_LEN, MAX_ROOM_LEN};
+use protocol::{ClientMsg, PeerId, PeerInfo, ServerMsg, MAX_NAME_LEN, MAX_PAYLOAD_LEN, MAX_ROOM_LEN, MAX_TITLE_LEN};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,8 @@ struct Peer {
 #[derive(Default)]
 struct Rooms {
     peers: HashMap<PeerId, Peer>,
+    /// Display names of rooms that have members; dropped with the last one.
+    titles: HashMap<String, String>,
 }
 
 impl Rooms {
@@ -75,6 +77,9 @@ impl Rooms {
             p.watching.remove(&id);
         }
         self.broadcast(&peer.room, id, &ServerMsg::PeerLeft { id });
+        if !self.peers.values().any(|p| p.room == peer.room) {
+            self.titles.remove(&peer.room);
+        }
     }
 }
 
@@ -157,7 +162,7 @@ impl Server {
         }
     }
 
-    fn join(&self, room: String, name: String, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<PeerId, String> {
+    fn join(&self, room: String, name: String, title: Option<String>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<PeerId, String> {
         if room.is_empty() || room.len() > MAX_ROOM_LEN || name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err("room or name is empty or too long".into());
         }
@@ -169,7 +174,11 @@ impl Server {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let info = PeerInfo { id, name, streaming: false };
-        let _ = tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members });
+        if let Some(t) = title.map(|t| t.trim().chars().take(MAX_TITLE_LEN).collect::<String>()).filter(|t| !t.is_empty()) {
+            rooms.titles.entry(room.clone()).or_insert(t);
+        }
+        let title = rooms.titles.get(&room).cloned();
+        let _ = tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members, title });
         rooms.broadcast(&room, id, &ServerMsg::PeerJoined { peer: info.clone() });
         rooms.peers.insert(id, Peer { info, room, tx, watching: HashSet::new() });
         Ok(id)
@@ -240,7 +249,7 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
         };
         match (id, msg) {
             (Some(_), ClientMsg::Alive) => heartbeat = true,
-            (None, ClientMsg::Join { room, name }) => match server.join(room, name, tx.clone()) {
+            (None, ClientMsg::Join { room, name, title }) => match server.join(room, name, title, tx.clone()) {
                 Ok(new_id) => id = Some(new_id),
                 Err(e) => {
                     let _ = tx.send(ServerMsg::Error { message: e });
