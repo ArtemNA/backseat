@@ -6,7 +6,8 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use windows::core::{w, Interface};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -15,6 +16,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const GST_MAP_D3D11: u32 = gst::ffi::GST_MAP_FLAG_LAST << 1;
@@ -36,6 +38,115 @@ pub struct Renderer {
     pub frames: mpsc::Sender<gst_app::AppSink>,
     pub closed: Arc<AtomicBool>,
     pub stats: Arc<RenderStats>,
+    pub window: Window,
+}
+
+/// Commands for the video window, carried out on its own thread.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    hwnd: isize,
+}
+
+const WM_SHOW: u32 = WM_APP + 1;
+/// wparam: 0 off, 1 on, 2 toggle.
+const WM_FULLSCREEN: u32 = WM_APP + 2;
+/// wparam: 0 off, 1 on.
+const WM_TOPMOST: u32 = WM_APP + 3;
+
+impl Window {
+    fn post(&self, msg: u32, w: usize) {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(self.hwnd as *mut c_void)), msg, WPARAM(w), LPARAM(0));
+        }
+    }
+
+    /// Restores the window if minimized and brings it to the front.
+    pub fn show(&self) {
+        self.post(WM_SHOW, 0);
+    }
+
+    /// Borderless over the whole monitor the window is on, or back.
+    pub fn set_fullscreen(&self, on: bool) {
+        self.post(WM_FULLSCREEN, on as usize);
+    }
+
+    pub fn toggle_fullscreen(&self) {
+        self.post(WM_FULLSCREEN, 2);
+    }
+
+    /// Keeps the window above all others.
+    pub fn set_topmost(&self, on: bool) {
+        self.post(WM_TOPMOST, on as usize);
+    }
+
+    /// Closes the window; its thread then ends.
+    pub fn close(&self) {
+        self.post(WM_CLOSE, 0);
+    }
+
+    /// Whether the window still exists.
+    pub fn alive(&self) -> bool {
+        WINDOWS.lock().unwrap().contains_key(&self.hwnd)
+    }
+
+    pub fn set_title(&self, title: &str) {
+        let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let _ = SetWindowTextW(HWND(self.hwnd as *mut c_void), windows::core::PCWSTR(wide.as_ptr()));
+        }
+    }
+
+    pub fn state(&self) -> WindowState {
+        WINDOWS.lock().unwrap().get(&self.hwnd).map(|w| WindowState { fullscreen: w.fullscreen.is_some(), topmost: w.topmost }).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct WindowState {
+    pub fullscreen: bool,
+    pub topmost: bool,
+}
+
+/// Per-window state, by HWND: an app may show several streams at once.
+struct WinState {
+    closed: Arc<AtomicBool>,
+    /// Placement and style before fullscreen, while fullscreen.
+    fullscreen: Option<(WINDOWPLACEMENT, i32)>,
+    topmost: bool,
+}
+
+static WINDOWS: std::sync::LazyLock<Mutex<HashMap<isize, WinState>>> = std::sync::LazyLock::new(Default::default);
+
+/// Virtual-key codes, without the keyboard feature of the windows crate.
+const KEY_ESCAPE: usize = 0x1B;
+const KEY_F11: usize = 0x7A;
+
+unsafe fn fullscreen(hwnd: HWND, mode: usize) {
+    let mut map = WINDOWS.lock().unwrap();
+    let Some(st) = map.get_mut(&(hwnd.0 as isize)) else { return };
+    let on = match mode {
+        0 => false,
+        1 => true,
+        _ => st.fullscreen.is_none(),
+    };
+    if on == st.fullscreen.is_some() {
+        return;
+    }
+    if on {
+        let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        let _ = GetWindowPlacement(hwnd, &mut place);
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        let r = mi.rcMonitor;
+        SetWindowLongW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as i32)) | WS_POPUP.0 as i32);
+        let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        st.fullscreen = Some((place, style));
+    } else if let Some((place, style)) = st.fullscreen.take() {
+        SetWindowLongW(hwnd, GWL_STYLE, style);
+        let _ = SetWindowPlacement(hwnd, &place);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+    }
 }
 
 #[derive(Default)]
@@ -48,8 +159,6 @@ pub struct RenderStats {
     pub max_lock_us: AtomicU64,
 }
 
-static CLOSED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-
 struct Send_<T>(T);
 unsafe impl<T> Send for Send_<T> {}
 
@@ -57,14 +166,53 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
     unsafe {
         match msg {
             WM_CLOSE => {
-                if let Some(c) = CLOSED.get() {
-                    c.store(true, Ordering::SeqCst);
+                let map = WINDOWS.lock().unwrap();
+                // STREAMER_DEBUG_SHARED_CLOSE: one window closing marks every window closed,
+                // as the single process-wide flag did; the spoiled variant for the gate.
+                if std::env::var_os("STREAMER_DEBUG_SHARED_CLOSE").is_some() {
+                    map.values().for_each(|st| st.closed.store(true, Ordering::SeqCst));
+                } else if let Some(st) = map.get(&(hwnd.0 as isize)) {
+                    st.closed.store(true, Ordering::SeqCst);
                 }
+                drop(map);
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
+                WINDOWS.lock().unwrap().remove(&(hwnd.0 as isize));
                 PostQuitMessage(0);
+                LRESULT(0)
+            }
+            WM_SHOW => {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_FULLSCREEN => {
+                fullscreen(hwnd, w.0);
+                LRESULT(0)
+            }
+            WM_TOPMOST => {
+                let on = w.0 != 0;
+                if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                    st.topmost = on;
+                }
+                let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                let _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == KEY_F11 => {
+                fullscreen(hwnd, 2);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == KEY_ESCAPE => {
+                fullscreen(hwnd, 0);
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                fullscreen(hwnd, 2);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
@@ -73,17 +221,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
 }
 
 pub fn start() -> Renderer {
-    let closed = CLOSED.get_or_init(|| Arc::new(AtomicBool::new(false))).clone();
+    let closed = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::channel();
     let (frames_tx, frames_rx) = mpsc::channel::<gst_app::AppSink>();
     let stats = Arc::new(RenderStats::default());
-    let s = stats.clone();
+    let (s, c) = (stats.clone(), closed.clone());
     std::thread::Builder::new()
         .name("present".into())
-        .spawn(move || unsafe { run(ready_tx, frames_rx, s) })
+        .spawn(move || unsafe { run(ready_tx, frames_rx, s, c) })
         .unwrap();
-    let Send_(context) = ready_rx.recv().expect("present thread failed to start");
-    Renderer { context, frames: frames_tx, closed, stats }
+    let Send_((context, hwnd)) = ready_rx.recv().expect("present thread failed to start");
+    Renderer { context, frames: frames_tx, closed, stats, window: Window { hwnd } }
 }
 
 /// The adapter that drives a display, so presenting needs no cross-adapter copy.
@@ -143,9 +291,10 @@ fn frame_size(sample: &gst::SampleRef) -> Option<(u32, u32)> {
 }
 
 unsafe fn run(
-    ready: mpsc::Sender<Send_<gst::Context>>,
+    ready: mpsc::Sender<Send_<(gst::Context, isize)>>,
     frames: mpsc::Receiver<gst_app::AppSink>,
     stats: Arc<RenderStats>,
+    closed: Arc<AtomicBool>,
 ) {
     let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
@@ -204,6 +353,8 @@ unsafe fn run(
         lpfnWndProc: Some(wndproc),
         hInstance: instance.into(),
         lpszClassName: w!("streamer_viewer"),
+        // Double click toggles fullscreen.
+        style: CS_DBLCLKS,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     });
@@ -222,6 +373,7 @@ unsafe fn run(
         None,
     )
     .unwrap();
+    WINDOWS.lock().unwrap().insert(hwnd.0 as isize, WinState { closed, fullscreen: None, topmost: false });
 
     // Context calls from this thread and from GStreamer are then serialized by D3D11 itself,
     // so Present can run without holding GStreamer's device lock.
@@ -229,7 +381,7 @@ unsafe fn run(
         let _ = mt.SetMultithreadProtected(true);
     }
 
-    ready.send(Send_(gst_context)).unwrap();
+    ready.send(Send_((gst_context, hwnd.0 as isize))).unwrap();
 
     // Debug knobs for the isolation gate: a slow Present outside the lock must not reach the
     // decoder; the same delay inside the lock is the spoiled variant that must.

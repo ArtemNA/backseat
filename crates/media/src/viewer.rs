@@ -48,6 +48,9 @@ pub struct Viewer {
     pub window_closed: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(windows)]
     render: Arc<crate::present::RenderStats>,
+    /// The video window, unless headless.
+    #[cfg(windows)]
+    pub window: Option<crate::present::Window>,
     /// Test-only loss on the path from the host.
     pub relay: Option<Arc<crate::netsim::LossRelay>>,
     /// Set when no direct connection could be made.
@@ -148,6 +151,8 @@ impl Viewer {
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
+        #[cfg(windows)]
+        let window = renderer.as_ref().map(|r| r.window);
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
@@ -182,6 +187,8 @@ impl Viewer {
             window_closed: renderer.as_ref().map(|r| r.closed.clone()).unwrap_or_default(),
             #[cfg(windows)]
             render: renderer.map(|r| r.stats).unwrap_or_default(),
+            #[cfg(windows)]
+            window,
             relay,
             ice_failed: failed,
             jitterbuffers,

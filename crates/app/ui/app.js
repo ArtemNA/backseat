@@ -180,6 +180,8 @@ function renderContent(s) {
     const throttled = w.received_fps > 20 && w.shown_fps < w.received_fps * 0.8;
     shown.classList.toggle('warn', throttled);
     c.querySelector('[data-k=lat]').textContent = ms(w.latency_ms);
+    c.querySelector('[data-k=fs]')?.setAttribute('aria-pressed', String(w.fullscreen));
+    c.querySelector('[data-k=top]')?.setAttribute('aria-pressed', String(w.topmost));
     c.querySelector('[data-k=sub]').textContent = `${t('card.watching')} · ${requestLabel(w.quality)}`;
     // Show what is being watched in the pickers until the viewer picks something else.
     const ch = state.choice[w.streamer];
@@ -223,7 +225,15 @@ function requestOf(id) {
 
 function card(p) {
   const controls = el('div', { class: 'controls' }, ...qualityControls(p.id, p.watching));
+  let windowRow = null;
   if (p.watching) {
+    const act = (action) => invoke('video_window_do', { streamer: p.id, action });
+    windowRow = el('div', { style: 'display:flex;flex-direction:column;gap:6px' },
+      el('div', { class: 'controls' },
+        el('button', { class: 'btn', type: 'button', text: t('win.show'), onclick: () => act('show') }),
+        el('button', { class: 'btn', type: 'button', 'data-k': 'fs', 'aria-pressed': 'false', text: t('win.fullscreen'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'windowed' : 'fullscreen') }),
+        el('button', { class: 'btn', type: 'button', 'data-k': 'top', 'aria-pressed': 'false', text: t('win.on_top'), onclick: (e) => act(e.currentTarget.getAttribute('aria-pressed') === 'true' ? 'not_topmost' : 'topmost') })),
+      el('span', { class: 'small', text: t('win.keys') }));
     controls.append(
       el('button', { class: 'btn', type: 'button', text: t('card.apply'), onclick: async () => { const q = requestOf(p.id); if (q) await invoke('set_quality', { streamer: p.id, quality: q }); } }),
       el('button', { class: 'btn danger push', type: 'button', text: t('card.stop'), onclick: async () => { await invoke('unwatch', { streamer: p.id }); tick(); } }));
@@ -236,6 +246,7 @@ function card(p) {
     el('div', { class: 'card-body' },
       el('div', { class: 'card-title' }, el('b', { text: p.name }), el('span', { class: 'small', 'data-k': 'sub', text: p.watching ? t('card.watching') : t('card.streaming') })),
       p.watching ? el('div', { class: 'stats' }, stat(t('card.received'), 'rx'), stat(t('card.shown'), 'shown'), stat(t('card.latency'), 'lat')) : null,
+      windowRow,
       controls));
 }
 

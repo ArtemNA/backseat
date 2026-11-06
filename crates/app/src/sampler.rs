@@ -20,6 +20,8 @@ pub struct WatchStats {
     pub window_closed: bool,
     /// What we asked for ("720p30 2000"), None for the streamer's own quality.
     pub quality: Option<String>,
+    pub fullscreen: bool,
+    pub topmost: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -117,9 +119,16 @@ fn sample(inner: &Mutex<Inner>) {
             latency_ms: if lat.is_empty() { 0.0 } else { lat.ms(0.5) },
             window_closed: w.viewer.window_closed(),
             quality: w.quality.lock().unwrap().clone(),
+            fullscreen: w.viewer.window.map(|x| x.state().fullscreen).unwrap_or(false),
+            topmost: w.viewer.window.map(|x| x.state().topmost).unwrap_or(false),
         });
     }
     inner.lock().unwrap().last.retain(|k, _| seen.contains(k));
+    if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
+        for w in &watches {
+            eprintln!("stats: watch {} received {:.1} shown {:.1} fps, fullscreen {} topmost {}", w.streamer, w.received_fps, w.shown_fps, w.fullscreen, w.topmost);
+        }
+    }
 
     let live = s.host().map(|h| {
         let names: HashMap<u64, String> = s.peers().into_iter().map(|p| (p.id, p.name)).collect();

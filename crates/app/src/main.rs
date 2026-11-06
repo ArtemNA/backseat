@@ -123,6 +123,28 @@ fn sources() -> Sources {
     Sources { monitors, windows }
 }
 
+fn video_window(app: &App, streamer: u64) -> Option<media::present::Window> {
+    let s = app.session.lock().unwrap().clone()?;
+    s.watching().into_iter().find(|w| w.streamer == streamer)?.viewer.window
+}
+
+/// What to do with a stream's video window: "show", "fullscreen" (on), "windowed",
+/// "toggle_fullscreen", "topmost" (on) or "not_topmost".
+#[tauri::command]
+fn video_window_do(app: tauri::State<'_, Arc<App>>, streamer: u64, action: String) -> Result<(), String> {
+    let w = video_window(&app, streamer).ok_or("no video window for this stream")?;
+    match action.as_str() {
+        "show" => w.show(),
+        "fullscreen" => w.set_fullscreen(true),
+        "windowed" => w.set_fullscreen(false),
+        "toggle_fullscreen" => w.toggle_fullscreen(),
+        "topmost" => w.set_topmost(true),
+        "not_topmost" => w.set_topmost(false),
+        _ => return Err(format!("unknown window action {action}")),
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct Thumb {
     id: u64,
@@ -268,8 +290,9 @@ fn automate(app: &Arc<App>) {
                 let s = app.session.lock().unwrap().clone();
                 if let Some(s) = s {
                     if let Some(p) = s.peers().into_iter().find(|p| p.streaming && p.name == name && p.id != s.id) {
-                        if let Err(e) = s.watch(p.id, ViewerConfig::default(), quality.clone()) {
-                            *app.notice.lock().unwrap() = Some(format!("error:{e}"));
+                        match s.watch(p.id, ViewerConfig::default(), quality.clone()) {
+                            Ok(w) => test_window_actions(w.viewer.window),
+                            Err(e) => *app.notice.lock().unwrap() = Some(format!("error:{e}")),
                         }
                         return;
                     }
@@ -280,6 +303,19 @@ fn automate(app: &Arc<App>) {
     });
 }
 
+/// Tests only: STREAMER_APP_AUTOWINDOW=1 makes the video window fullscreen and topmost
+/// after 3 s, and windowed again after 10 s.
+fn test_window_actions(w: Option<media::present::Window>) {
+    let (Some(w), Some(_)) = (w, std::env::var_os("STREAMER_APP_AUTOWINDOW")) else { return };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        w.set_fullscreen(true);
+        w.set_topmost(true);
+        std::thread::sleep(std::time::Duration::from_secs(7));
+        w.set_fullscreen(false);
+    });
+}
+
 fn main() {
     media::init();
     let app = Arc::new(App::default());
@@ -287,7 +323,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

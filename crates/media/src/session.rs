@@ -179,6 +179,10 @@ impl Session {
         let clock = HostClock::default();
         let viewer = Arc::new(Viewer::new(cfg, clock.clone(), link.clone())?);
         viewer.start()?;
+        #[cfg(windows)]
+        if let (Some(win), Some(p)) = (viewer.window, self.peers().into_iter().find(|p| p.id == streamer)) {
+            win.set_title(&p.name);
+        }
         let w = Arc::new(Watch {
             streamer,
             viewer,
@@ -230,6 +234,11 @@ impl Session {
         }
         use gst::prelude::*;
         let _ = w.viewer.pipeline.set_state(gst::State::Null);
+        // The video window goes with the watch.
+        #[cfg(windows)]
+        if let Some(win) = w.viewer.window {
+            win.close();
+        }
         let _ = self.events.send(Event::WatchEnded { streamer, reason: reason.into() });
     }
 

@@ -70,6 +70,10 @@ const STRINGS = {
     'notice.watch_ended': 'Stream ended: {reason}',
     'notice.error': 'Error: {msg}',
     'unit.mbit': 'Mbit/s',
+    'win.show': 'Show window',
+    'win.fullscreen': 'Fullscreen',
+    'win.on_top': 'Always on top',
+    'win.keys': 'In the video window: F11 or double click — fullscreen, Esc — leave it.',
     'unit.ms': 'ms',
   },
   uk: {
@@ -142,6 +146,10 @@ const STRINGS = {
     'notice.watch_ended': 'Стрім завершився: {reason}',
     'notice.error': 'Помилка: {msg}',
     'unit.mbit': 'Мбіт/с',
+    'win.show': 'Показати вікно',
+    'win.fullscreen': 'На весь екран',
+    'win.on_top': 'Поверх усіх вікон',
+    'win.keys': 'У вікні відео: F11 або подвійний клік — на весь екран, Esc — вийти.',
     'unit.ms': 'мс',
   },
   ru: {
@@ -214,6 +222,10 @@ const STRINGS = {
     'notice.watch_ended': 'Стрим завершился: {reason}',
     'notice.error': 'Ошибка: {msg}',
     'unit.mbit': 'Мбит/с',
+    'win.show': 'Показать окно',
+    'win.fullscreen': 'На весь экран',
+    'win.on_top': 'Поверх всех окон',
+    'win.keys': 'В окне видео: F11 или двойной клик — на весь экран, Esc — выйти.',
     'unit.ms': 'мс',
   },
 };

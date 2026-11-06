@@ -17,7 +17,7 @@ pub mod thumbs;
 pub mod viewer;
 
 #[cfg(windows)]
-mod present;
+pub mod present;
 
 pub fn init() {
     platform::init_timer();
