@@ -531,6 +531,11 @@ fn main() {
     // One app per user: a second start (an invite link clicked) hands over and leaves.
     // Test runs start several apps on purpose (STREAMER_APP_* variables), so not them.
     let testing = std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_"));
+    if testing && std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+        // Test runs keep their saved rooms and settings out of the real app's profile.
+        // Runs before any other thread starts.
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", std::env::temp_dir().join("backseat-test-webview"));
+    }
     if !testing && media::instance::send_to_running(&link_arg().unwrap_or_else(|| "show".into())) {
         return;
     }

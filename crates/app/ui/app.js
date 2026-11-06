@@ -294,12 +294,17 @@ $('leave').addEventListener('click', async () => { await invoke('leave'); state.
 
 // ---------- render ----------
 function render(s) {
+  // Out of every room but with saved ones: the window stays, with the rooms on the left.
+  // The join form alone only when there is nothing to go back to.
+  const hasRooms = savedRooms().length > 0;
   // Boolean on purpose: toggle(name, undefined) flips the class instead of clearing it.
-  const joinShown = !s.connected || !!state.joinOpen;
+  const joinShown = !!state.joinOpen || (!s.connected && !hasRooms);
   $('join').classList.toggle('hidden', !joinShown);
-  $('join-back').classList.toggle('hidden', !s.connected);
+  $('join-back').classList.toggle('hidden', !(s.connected || hasRooms));
   $('shell').classList.toggle('hidden', joinShown);
-  if (!s.connected) { syncVideos(); return; }
+  $('invite').classList.toggle('hidden', !s.connected);
+  $('leave').classList.toggle('hidden', !s.connected);
+  if (!s.connected) { renderLobby(s); syncVideos(); return; }
   const me = s.peers.find((p) => p.me) || { name: '?' };
   // Joined some other way (tests): remember what we are in.
   if (!state.current || state.current.room !== s.room || (s.title && state.current.title !== s.title)) {
@@ -319,6 +324,27 @@ function render(s) {
   renderPeople(s);
   renderHeader(s);
   renderContent(s);
+}
+
+// Not in a room: the rail to pick one, and a hint where the room would be.
+function renderLobby(s) {
+  state.current = null;
+  if (state.cardsKey === 'lobby') { renderRail(s); return; }
+  state.cardsKey = 'lobby';
+  $('room-name').textContent = t('lobby.title');
+  $('room-name').title = '';
+  $('people').replaceChildren();
+  let name = '';
+  try { name = JSON.parse(localStorage.getItem('join') || '{}').name || ''; } catch {}
+  $('me-avatar').replaceWith(Object.assign(avatar(name || '?'), { id: 'me-avatar' }));
+  $('me-state').textContent = '';
+  $('go-live').classList.add('hidden');
+  $('main-header').dataset.key = 'lobby';
+  $('main-header').replaceChildren(el('span', { text: t('room.streams') }), langPicker());
+  $('stage').className = 'stage hidden';
+  $('stage').replaceChildren();
+  $('content').replaceChildren(el('div', { class: 'empty', text: t('lobby.pick') }));
+  renderRail(s);
 }
 
 function renderPeople(s) {
@@ -624,6 +650,22 @@ invoke('test_form').then((spec) => {
   const [mode, value, name, server] = spec.split('|');
   setTimeout(() => {
     if (mode === 'show') { state.joinOpen = true; tick(); return; }
+    // "leave|<other room code>|": leave the room we are in, then go to the other one
+    // through the rail.
+    if (mode === 'leave') {
+      const report = (what) => invoke('test_report', { msg: `${what}: shell ${!$('shell').classList.contains('hidden')} join ${!$('join').classList.contains('hidden')} rail ${document.querySelectorAll('#rail .r:not(.add)').length} header ${$('room-name').textContent} connected ${state.snap && state.snap.connected} room ${state.snap && state.snap.room}` });
+      setTimeout(() => {
+        report('before');
+        $('leave').click();
+        setTimeout(() => {
+          report('after leave');
+          const btn = document.querySelector(`#rail .r[data-room="${value}"]`);
+          if (btn) btn.click();
+          setTimeout(() => report('after rail click'), 3000);
+        }, 2500);
+      }, 2000);
+      return;
+    }
     state.joinMode = mode;
     renderJoinForm();
     $('f-name').value = name;
