@@ -79,6 +79,12 @@ fn built_in() -> Option<&'static str> {
     BUILT_IN_SERVER.filter(|s| !s.is_empty())
 }
 
+/// The webview tells the language it shows, for text drawn natively (video window).
+#[tauri::command]
+fn set_ui_language(lang: String) {
+    *sampler::UI_LANG.lock().unwrap() = lang;
+}
+
 #[tauri::command]
 fn built_in_server() -> Option<String> {
     built_in().map(String::from)
@@ -392,7 +398,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

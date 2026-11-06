@@ -108,6 +108,7 @@ impl Server {
         let mut rooms = self.rooms.lock().unwrap();
         match msg {
             ClientMsg::Join { .. } => Some("already joined".into()),
+            ClientMsg::Alive => None,
             ClientMsg::SetStreaming { streaming } => {
                 let p = rooms.peers.get_mut(&id)?;
                 p.info.streaming = streaming;
@@ -205,6 +206,10 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
     });
 
     let mut id: Option<PeerId> = None;
+    // Set by the first Alive: from then on only the client's own messages prove it is
+    // there, since a proxy may answer our pings for a client that is gone.
+    let mut heartbeat = false;
+    let mut last_text = tokio::time::Instant::now();
     loop {
         // Any frame, including the pong to our ping, proves the client is alive.
         let next = tokio::time::timeout(cfg.idle_timeout, stream.next()).await;
@@ -212,6 +217,9 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
             Ok(Some(Ok(f))) => f,
             _ => break,
         };
+        if heartbeat && last_text.elapsed() > cfg.idle_timeout && std::env::var_os("STREAMER_DEBUG_NO_HEARTBEAT").is_none() {
+            break;
+        }
         let text = match frame {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -221,6 +229,7 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
             }
             _ => continue,
         };
+        last_text = tokio::time::Instant::now();
         server.bytes_in.fetch_add(text.len() as u64, Ordering::Relaxed);
         let msg = match protocol::parse_client(&text) {
             Ok(m) => m,
@@ -230,6 +239,7 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
             }
         };
         match (id, msg) {
+            (Some(_), ClientMsg::Alive) => heartbeat = true,
             (None, ClientMsg::Join { room, name }) => match server.join(room, name, tx.clone()) {
                 Ok(new_id) => id = Some(new_id),
                 Err(e) => {

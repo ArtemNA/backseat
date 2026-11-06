@@ -121,6 +121,35 @@ fn overlay_text(w: &WatchStats) -> String {
     )
 }
 
+/// The UI language ("en", "uk", "ru"), set by the webview; for text drawn natively.
+pub static UI_LANG: Mutex<String> = Mutex::new(String::new());
+
+/// The video window's line before the first frame.
+/// What went wrong before the first frame.
+#[derive(Clone, Copy)]
+enum Pending {
+    Connecting,
+    /// The streamer never sent its offer.
+    NoAnswer,
+    /// Offer and answer went through, the direct connection did not.
+    Network,
+}
+
+fn window_status(name: &str, p: Pending) -> String {
+    let lang = UI_LANG.lock().unwrap().clone();
+    match (lang.as_str(), p) {
+        ("uk", Pending::Connecting) => format!("З'єднання з {name}…"),
+        ("uk", Pending::NoAnswer) => format!("{name} не відповів на запит. Спробуйте ще раз; якщо не допоможе, хай {name} перезапустить стрім."),
+        ("uk", Pending::Network) => format!("Немає прямого з'єднання з {name}. Мережа однієї зі сторін його блокує; допомогти може сервер TURN."),
+        ("ru", Pending::Connecting) => format!("Соединение с {name}…"),
+        ("ru", Pending::NoAnswer) => format!("{name} не ответил на запрос. Попробуйте ещё раз; если не поможет, пусть {name} перезапустит стрим."),
+        ("ru", Pending::Network) => format!("Нет прямого соединения с {name}. Сеть одной из сторон его блокирует; помочь может сервер TURN."),
+        (_, Pending::Connecting) => format!("Connecting to {name}…"),
+        (_, Pending::NoAnswer) => format!("{name} did not answer. Try again; if that does not help, {name} should restart the stream."),
+        (_, Pending::Network) => format!("No direct connection to {name}. A network on one side blocks it; a TURN server can help."),
+    }
+}
+
 fn sample(inner: &Mutex<Inner>) {
     let session = inner.lock().unwrap().session.as_ref().and_then(|w| w.upgrade());
     let Some(s) = session else { return };
@@ -172,7 +201,21 @@ fn sample(inner: &Mutex<Inner>) {
         i.last.retain(|k, _| seen.contains(k));
         i.net.retain(|k, _| seen.contains(k));
     }
+    let names: HashMap<u64, String> = s.peers().into_iter().map(|p| (p.id, p.name)).collect();
     for w in s.watching() {
+        if let Some(win) = w.viewer.window {
+            if w.viewer.stats.frames.load(Ordering::Relaxed) == 0 {
+                let name = names.get(&w.streamer).cloned().unwrap_or_default();
+                let p = match (w.viewer.ice_failed.load(Ordering::Relaxed), w.viewer.offered.load(Ordering::Relaxed)) {
+                    (false, _) => Pending::Connecting,
+                    (true, false) => Pending::NoAnswer,
+                    (true, true) => Pending::Network,
+                };
+                win.set_status(&window_status(&name, p));
+            } else {
+                win.set_status("");
+            }
+        }
         let Some(st) = watches.iter().find(|x| x.streamer == w.streamer) else { continue };
         if let (Some(win), true) = (w.viewer.window, st.overlay) {
             win.set_overlay_text(&overlay_text(st));

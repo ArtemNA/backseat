@@ -270,6 +270,7 @@ function setLanguage(id) {
   lang = STRINGS[id] ? id : 'en';
   try { localStorage.setItem('lang', lang); } catch {}
   document.documentElement.lang = lang;
+  try { window.__TAURI__.core.invoke('set_ui_language', { lang }); } catch {}
 }
 
 // t('room.live', { n: 2 })

@@ -53,7 +53,17 @@ impl ServerClient {
         let (in_tx, in_rx) = mpsc::channel::<ServerMsg>();
         std::thread::Builder::new()
             .name("signaling".into())
-            .spawn(move || loop {
+            .spawn(move || {
+              let mut alive = std::time::Instant::now();
+              loop {
+                // Proves to the server that we are here; see ClientMsg::Alive.
+                if alive.elapsed() >= Duration::from_secs(1) && std::env::var_os("STREAMER_DEBUG_NO_ALIVE").is_none() {
+                    alive = std::time::Instant::now();
+                    if let Err(e) = ws.send(Message::Text(ClientMsg::Alive.to_json().into())) {
+                        eprintln!("signaling: send failed: {e}");
+                        return;
+                    }
+                }
                 while let Ok(m) = out_rx.try_recv() {
                     if let Err(e) = ws.send(Message::Text(m.to_json().into())) {
                         eprintln!("signaling: send failed: {e}");
@@ -88,6 +98,7 @@ impl ServerClient {
                         return;
                     }
                 }
+              }
             })
             .unwrap();
         Ok((Arc::new(Self { out: out_tx, id, peers }), in_rx))

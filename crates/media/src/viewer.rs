@@ -55,6 +55,9 @@ pub struct Viewer {
     pub relay: Option<Arc<crate::netsim::LossRelay>>,
     /// Set when no direct connection could be made.
     pub ice_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// The streamer's offer arrived. Failed without it: the streamer never answered the
+    /// request to watch, so the network was never tried.
+    pub offered: Arc<std::sync::atomic::AtomicBool>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
     /// How far behind the video is, and catch-up requests sent.
     pub lag: Arc<crate::catchup::LagWatch>,
@@ -90,8 +93,12 @@ impl Viewer {
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
         crate::ice::configure(&webrtc, &cfg.ice);
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let f = failed.clone();
+        let offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, o) = (failed.clone(), offered.clone());
         crate::ice::watch(&webrtc, "the streamer".into(), cfg.ice.turn.is_some(), move || {
+            if !o.load(Ordering::SeqCst) {
+                eprintln!("viewer: the streamer never answered the request to watch; the network was not tried");
+            }
             f.store(true, Ordering::SeqCst)
         });
         webrtc.set_property("latency", cfg.latency_ms);
@@ -193,6 +200,7 @@ impl Viewer {
             window,
             relay,
             ice_failed: failed,
+            offered,
             jitterbuffers,
             lag,
             never_answer: cfg.debug_never_answer,
@@ -285,6 +293,7 @@ impl Viewer {
         }
         match kind {
             "offer" => {
+                self.offered.store(true, Ordering::SeqCst);
                 let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) else { return };
                 let offer = WebRTCSessionDescription::new(WebRTCSDPType::Offer, sdp);
                 self.webrtc.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);

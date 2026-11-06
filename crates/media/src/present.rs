@@ -113,6 +113,23 @@ impl Window {
         }
     }
 
+    /// A line shown in the middle of the window until the first frame ("Connecting...");
+    /// empty clears it.
+    pub fn set_status(&self, text: &str) {
+        let changed = match WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
+            Some(st) if st.status != text => {
+                st.status = text.to_string();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(HWND(self.hwnd as *mut c_void)), None, true);
+            }
+        }
+    }
+
     /// The overlay's text; drawn while the overlay is on.
     pub fn set_overlay_text(&self, text: &str) {
         if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
@@ -140,6 +157,8 @@ struct WinState {
     overlay: bool,
     overlay_text: String,
     overlay_version: u64,
+    /// Shown before the first frame; see `Window::set_status`.
+    status: String,
 }
 
 /// The overlay text and its version while the overlay is on.
@@ -155,6 +174,36 @@ static WINDOWS: std::sync::LazyLock<Mutex<HashMap<isize, WinState>>> = std::sync
 const KEY_ESCAPE: usize = 0x1B;
 const KEY_F11: usize = 0x7A;
 const KEY_F3: usize = 0x72;
+
+/// Black, with the status line in the middle while there is one. Once frames come, the
+/// swapchain covers the window and the status is empty.
+unsafe fn paint_status(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::*;
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    FillRect(dc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+    let status = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).map(|s| s.status.clone()).unwrap_or_default();
+    if !status.is_empty() {
+        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
+        let font = CreateFontW(-(18 * scale / 96), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"));
+        let old = SelectObject(dc, font.into());
+        SetTextColor(dc, windows::Win32::Foundation::COLORREF(0x00DCDCDC));
+        SetBkMode(dc, TRANSPARENT);
+        let mut wide: Vec<u16> = status.encode_utf16().collect();
+        // Measure the wrapped text, then centre it vertically.
+        let pad = 24 * scale / 96;
+        let mut box_ = RECT { left: rc.left + pad, top: 0, right: rc.right - pad, bottom: 0 };
+        DrawTextW(dc, &mut wide, &mut box_, DT_CALCRECT | DT_WORDBREAK | DT_CENTER);
+        let h = box_.bottom - box_.top;
+        let mut place = RECT { left: rc.left + pad, top: (rc.bottom - h) / 2, right: rc.right - pad, bottom: (rc.bottom + h) / 2 };
+        DrawTextW(dc, &mut wide, &mut place, DT_WORDBREAK | DT_CENTER);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font.into());
+    }
+    let _ = EndPaint(hwnd, &ps);
+}
 
 unsafe fn fullscreen(hwnd: HWND, mode: usize) {
     let mut map = WINDOWS.lock().unwrap();
@@ -250,6 +299,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
             }
             WM_KEYDOWN if w.0 == KEY_ESCAPE => {
                 fullscreen(hwnd, 0);
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                paint_status(hwnd);
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
@@ -397,6 +450,8 @@ unsafe fn run(
         // Double click toggles fullscreen.
         style: CS_DBLCLKS,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        // Black until the first frame; the default was white, which looked like a fault.
+        hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH).0),
         ..Default::default()
     });
     let hwnd = CreateWindowExW(
@@ -418,7 +473,15 @@ unsafe fn run(
     let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some();
     WINDOWS.lock().unwrap().insert(
         hwnd.0 as isize,
-        WinState { closed, fullscreen: None, topmost: false, overlay: overlay_on, overlay_text: String::new(), overlay_version: 0 },
+        WinState {
+            closed,
+            fullscreen: None,
+            topmost: false,
+            overlay: overlay_on,
+            overlay_text: String::new(),
+            overlay_version: 0,
+            status: String::new(),
+        },
     );
 
     // Context calls from this thread and from GStreamer are then serialized by D3D11 itself,

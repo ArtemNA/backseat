@@ -177,3 +177,45 @@ async fn silent_client_is_dropped_within_10_s() {
     println!("silent client dropped after {:.2} s", left.as_secs_f64());
     drop(frozen);
 }
+
+/// Imitates a reverse proxy that keeps a dead client's connection open and answers pings:
+/// the client reads (so pongs go back) but stops sending Alive. It must leave the room.
+#[tokio::test]
+async fn silent_heartbeat_client_is_dropped() {
+    let url = start(server::Config::default()).await;
+    let (mut ghost, _) = Client::join(&url, "room", "ghost").await;
+    ghost.send(ClientMsg::Alive).await;
+    let (mut other, peers) = Client::join(&url, "room", "other").await;
+    assert_eq!(peers.len(), 1);
+    let ghost_id = ghost.id;
+    // The ghost keeps reading, so its pongs keep coming, but sends nothing else.
+    let reader = tokio::spawn(async move { while let Some(Ok(_)) = ghost.ws.next().await {} });
+    let started = Instant::now();
+    let m = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            other.send(ClientMsg::Alive).await;
+            if let Ok(m) = tokio::time::timeout(Duration::from_millis(900), other.next()).await {
+                if matches!(m, ServerMsg::PeerLeft { id } if id == ghost_id) {
+                    return m;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the silent client was not dropped within 10 s");
+    eprintln!("dropped after {:?}: {m:?}", started.elapsed());
+    reader.abort();
+}
+
+/// A client that never sent Alive (older builds) is kept while it answers pings.
+#[tokio::test]
+async fn client_without_heartbeat_stays() {
+    let url = start(server::Config::default()).await;
+    let (old, _) = Client::join(&url, "room", "old").await;
+    let mut ws = old.ws;
+    let reader = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let (_probe, peers) = Client::join(&url, "room", "probe").await;
+    assert_eq!(peers.len(), 1, "the older client should still be in the room");
+    reader.abort();
+}
