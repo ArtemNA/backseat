@@ -377,6 +377,18 @@ async function tick() {
 setLanguage(lang);
 // Tests only: STREAMER_APP_LANG forces the language for screenshots.
 invoke('forced_language').then((l) => { if (l) { setLanguage(l); fillLanguages(); applyStrings(); } });
+// Tests only: keep the UI busy: open and close the go-live dialog (which takes pictures
+// of every source), switch the language, every 1.5 s.
+invoke('test_ui_stress').then((on) => {
+  if (!on) return;
+  let n = 0;
+  setInterval(() => {
+    n++;
+    if (!state.snap || !state.snap.connected) return;
+    if ($('golive').open) $('golive').close(); else $('go-live').click();
+    if (n % 2 === 0) { setLanguage(LANGS[(n / 2) % LANGS.length].id); $('main-header').dataset.key = ''; applyStrings(); }
+  }, 1500);
+});
 invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
 fillLanguages();

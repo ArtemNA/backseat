@@ -22,6 +22,9 @@ pub struct WatchStats {
     pub quality: Option<String>,
     pub fullscreen: bool,
     pub topmost: bool,
+    /// Time between decoded frames in the last second, ms.
+    pub gap_p99_ms: f64,
+    pub gap_max_ms: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -111,6 +114,7 @@ fn sample(inner: &Mutex<Inner>) {
         let frames = w.viewer.stats.frames.load(Ordering::Relaxed);
         let shown = w.viewer.render_report().map(|r| r.presented).unwrap_or(0);
         let lat = w.viewer.stats.video_latency.take();
+        let gaps = w.viewer.stats.frame_interval.take();
         let mut i = inner.lock().unwrap();
         let (f0, p0, t0) = i.last.get(&w.streamer).copied().unwrap_or((frames, shown, now));
         let dt = now.duration_since(t0).as_secs_f64().max(0.001);
@@ -125,12 +129,17 @@ fn sample(inner: &Mutex<Inner>) {
             quality: w.quality.lock().unwrap().clone(),
             fullscreen: w.viewer.window.map(|x| x.state().fullscreen).unwrap_or(false),
             topmost: w.viewer.window.map(|x| x.state().topmost).unwrap_or(false),
+            gap_p99_ms: if gaps.is_empty() { 0.0 } else { gaps.ms(0.99) },
+            gap_max_ms: if gaps.is_empty() { 0.0 } else { gaps.ms(1.0) },
         });
     }
     inner.lock().unwrap().last.retain(|k, _| seen.contains(k));
     if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
         for w in &watches {
-            eprintln!("stats: watch {} received {:.1} shown {:.1} fps, fullscreen {} topmost {}", w.streamer, w.received_fps, w.shown_fps, w.fullscreen, w.topmost);
+            eprintln!(
+                "stats: watch {} received {:.1} shown {:.1} fps, gap p99 {:.1} max {:.1} ms, fullscreen {} topmost {}",
+                w.streamer, w.received_fps, w.shown_fps, w.gap_p99_ms, w.gap_max_ms, w.fullscreen, w.topmost
+            );
         }
     }
 

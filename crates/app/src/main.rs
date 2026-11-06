@@ -181,6 +181,12 @@ fn test_open_golive() -> bool {
     std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some()
 }
 
+/// Tests only: STREAMER_APP_UI_STRESS keeps the UI busy (dialog with pictures, language).
+#[tauri::command]
+fn test_ui_stress() -> bool {
+    std::env::var_os("STREAMER_APP_UI_STRESS").is_some()
+}
+
 /// Tests only: STREAMER_APP_UPLOAD_LIMIT sets the upload limit (Mbit/s) for screenshots.
 #[tauri::command]
 fn test_upload_limit() -> Option<f64> {
@@ -284,24 +290,39 @@ fn automate(app: &Arc<App>) {
             return;
         }
         if let Ok(live) = std::env::var("STREAMER_APP_AUTOLIVE") {
-            let (mode, kbit) = live.split_once(';').unwrap_or(("1080p60", "8000"));
-            let req = GoLive { kind: "monitor".into(), id: 0, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000) };
+            let p: Vec<&str> = live.split(';').collect();
+            let (mode, kbit) = (p.first().copied().unwrap_or("1080p60"), p.get(1).copied().unwrap_or("8000"));
+            // A third field "monitor" streams the primary real monitor instead of the test pattern.
+            let id = if p.get(2) == Some(&"monitor") {
+                media::platform::monitors().into_iter().find(|m| m.primary).map(|m| m.handle).unwrap_or(0)
+            } else {
+                0
+            };
+            let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000) };
             if let Err(e) = do_go_live(&app, req) {
                 *app.notice.lock().unwrap() = Some(format!("error:{e}"));
             }
         }
         if let Ok(w) = std::env::var("STREAMER_APP_AUTOWATCH") {
-            let (name, quality) = w.split_once(';').map(|(a, b)| (a.to_string(), Some(b.to_string()))).unwrap_or((w.clone(), None));
+            // "name;quality", several separated by '|'.
+            let mut todo: Vec<(String, Option<String>)> = w
+                .split('|')
+                .map(|one| one.split_once(';').map(|(a, b)| (a.to_string(), Some(b.to_string()))).unwrap_or((one.to_string(), None)))
+                .collect();
             for _ in 0..60 {
                 let s = app.session.lock().unwrap().clone();
                 if let Some(s) = s {
-                    if let Some(p) = s.peers().into_iter().find(|p| p.streaming && p.name == name && p.id != s.id) {
+                    todo.retain(|(name, quality)| {
+                        let Some(p) = s.peers().into_iter().find(|p| p.streaming && &p.name == name && p.id != s.id) else { return true };
                         match s.watch(p.id, ViewerConfig::default(), quality.clone()) {
                             Ok(w) => test_window_actions(w.viewer.window),
                             Err(e) => *app.notice.lock().unwrap() = Some(format!("error:{e}")),
                         }
-                        return;
-                    }
+                        false
+                    });
+                }
+                if todo.is_empty() {
+                    return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -329,7 +350,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
