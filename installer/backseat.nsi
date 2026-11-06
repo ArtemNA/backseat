@@ -42,6 +42,22 @@ LangString NoWebView2 ${LANG_ENGLISH} "Backseat needs Microsoft Edge WebView2 Ru
 LangString NoWebView2 ${LANG_UKRAINIAN} "Для Backseat потрібен Microsoft Edge WebView2 Runtime, але встановити його не вдалося (немає інтернету?).$\r$\n$\r$\nПідключіться до інтернету й запустіть інсталятор ще раз або встановіть WebView2 з https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 LangString NoWebView2 ${LANG_RUSSIAN} "Для Backseat нужен Microsoft Edge WebView2 Runtime, но установить его не удалось (нет интернета?).$\r$\n$\r$\nПодключитесь к интернету и запустите установщик ещё раз или установите WebView2 с https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
+; Closes a running Backseat from this install folder: its files cannot be replaced or
+; removed while it runs ("Error opening file for writing: ...\MSVCP140.dll").
+!macro CloseRunning
+  DetailPrint "Closing Backseat if it is running..."
+  ; Politely first (the window closes and the app exits), then for sure. One app runs
+  ; per user, so the name is enough.
+  nsExec::Exec 'taskkill /IM backseat.exe'
+  Pop $0
+  ${If} $0 == 0
+    Sleep 2500
+  ${EndIf}
+  nsExec::Exec 'taskkill /F /IM backseat.exe'
+  Pop $0
+  Sleep 500
+!macroend
+
 Function HasWebView2
   ; Leaves "1" on the stack when a WebView2 Runtime is installed for the machine or the user.
   ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WV2_ID}" "pv"
@@ -69,6 +85,7 @@ Section "Backseat" Main
     Delete "$3\uninstall.exe"
     RMDir "$3"
   ${EndIf}
+  !insertmacro CloseRunning
   SetOutPath "$INSTDIR"
   ; A previous version's plugins must not linger next to the new ones.
   RMDir /r "$INSTDIR\gstreamer-1.0"
@@ -118,6 +135,7 @@ Section "Backseat" Main
 SectionEnd
 
 Section "Uninstall"
+  !insertmacro CloseRunning
   Delete "$SMPROGRAMS\${NAME}.lnk"
   Delete "$DESKTOP\${NAME}.lnk"
   RMDir /r "$INSTDIR\gstreamer-1.0"
