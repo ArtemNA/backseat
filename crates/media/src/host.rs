@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-const VIDEO_PT: u32 = 96;
+pub const VIDEO_PT: u32 = 96;
 const AUDIO_PT: u32 = 111;
 
 #[derive(Default)]
@@ -46,6 +46,9 @@ pub struct ViewerQuality {
     /// Retransmission requests received, and packets actually resent.
     pub rtx_requests: u64,
     pub rtx_packets: u64,
+    /// Catch-ups this viewer asked for, and frames skipped for it, since it joined.
+    pub catchups: u64,
+    pub skipped_frames: u64,
 }
 
 /// Everything one viewer adds to the pipeline.
@@ -55,6 +58,8 @@ struct Branch {
     elements: Vec<gst::Element>,
     /// Tee request pads feeding this branch.
     tee_pads: Vec<(gst::Element, gst::Pad)>,
+    /// Skips this viewer's video while its network queue drains.
+    gate: Arc<crate::catchup::Gate>,
 }
 
 fn video_source(cfg: &HostConfig) -> String {
@@ -211,12 +216,17 @@ impl Host {
     /// What each viewer reports back about the video it receives (RTCP), for marking a
     /// viewer with problems. Only that viewer is affected by them (decision D1).
     pub fn viewer_quality(&self) -> Vec<ViewerQuality> {
-        let webrtcs: Vec<(u64, gst::Element)> =
-            self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone())).collect();
+        let webrtcs: Vec<(u64, gst::Element, Arc<crate::catchup::Gate>)> =
+            self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone(), b.gate.clone())).collect();
         webrtcs
             .into_iter()
-            .map(|(id, w)| {
-                let mut q = ViewerQuality { id, ..Default::default() };
+            .map(|(id, w, gate)| {
+                let mut q = ViewerQuality {
+                    id,
+                    catchups: gate.pauses.load(Ordering::Relaxed),
+                    skipped_frames: gate.skipped_frames.load(Ordering::Relaxed),
+                    ..Default::default()
+                };
                 let promise = gst::Promise::new();
                 w.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
                 if promise.wait() == gst::PromiseResult::Replied {
@@ -409,11 +419,23 @@ impl Host {
         });
 
         self.pipeline.add(&webrtc).unwrap();
-        let mut branch = Branch { webrtc, elements: vec![], tee_pads: vec![] };
+        let mut branch = Branch { webrtc, elements: vec![], tee_pads: vec![], gate: Default::default() };
         let video_pay = make_pay(&format!("rtp{}pay", self.cfg.codec.short()), VIDEO_PT);
         video_pay.set_property("config-interval", -1i32);
         video_pay.set_property_from_str("aggregate-mode", "zero-latency");
         self.feed(&mut branch, "vtee", video_pay);
+        // Between the queue and the payloader, so dropped frames leave no gaps in RTP
+        // sequence numbers.
+        let gate = branch.gate.clone();
+        let queue_src = branch.elements.last().unwrap().static_pad("src").unwrap();
+        queue_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
+            if gate.pass(!buf.flags().contains(gst::BufferFlags::DELTA_UNIT)) {
+                gst::PadProbeReturn::Ok
+            } else {
+                gst::PadProbeReturn::Drop
+            }
+        });
         if self.cfg.audio {
             self.feed(&mut branch, "atee", make_pay("rtpopuspay", AUDIO_PT));
         }
@@ -441,7 +463,7 @@ impl Host {
 
     /// Applies one signaling message from viewer `id`.
     pub fn on_message(&self, id: u64, link: &dyn Outbox, kind: &str, payload: &str) {
-        let Some(webrtc) = self.viewers.lock().unwrap().get(&id).map(|b| b.webrtc.clone()) else {
+        let Some((webrtc, gate)) = self.viewers.lock().unwrap().get(&id).map(|b| (b.webrtc.clone(), b.gate.clone())) else {
             return;
         };
         let webrtc = &webrtc;
@@ -453,6 +475,11 @@ impl Host {
                 }
             }
             "ice" => add_ice(webrtc, payload),
+            crate::catchup::MSG => {
+                if let Ok(ms) = payload.trim().parse::<u64>() {
+                    gate.request(std::time::Duration::from_millis(ms));
+                }
+            }
             "ping" => {
                 let now = self.running_time().unwrap_or(0);
                 link.send("pong", &format!("{payload} {now}"));

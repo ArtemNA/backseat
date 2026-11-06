@@ -53,6 +53,8 @@ pub struct Viewer {
     /// Set when no direct connection could be made.
     pub ice_failed: Arc<std::sync::atomic::AtomicBool>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
+    /// How far behind the video is, and catch-up requests sent.
+    pub lag: Arc<crate::catchup::LagWatch>,
 }
 
 /// Receive-side RTP counters for video, since the session started.
@@ -110,7 +112,23 @@ impl Viewer {
         });
         let stats = ViewerStats::default();
         let jitterbuffers = Arc::new(Mutex::new(Vec::new()));
-        tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone());
+        let lag = Arc::new(crate::catchup::LagWatch::default());
+        let ask: Arc<dyn Fn(std::time::Duration) + Send + Sync> = {
+            let link = link.clone();
+            // Spoiled control for the catch-up gate: measure, never ask.
+            let off = std::env::var_os("STREAMER_DEBUG_NO_CATCHUP").is_some();
+            let log = std::env::var_os("STREAMER_DEBUG_CATCHUP").is_some();
+            let t0 = Instant::now();
+            Arc::new(move |d| {
+                if log {
+                    eprintln!("catchup {:>8.3} s: ask, lag {} ms", t0.elapsed().as_secs_f64(), d.as_millis());
+                }
+                if !off {
+                    link.send(crate::catchup::MSG, &d.as_millis().to_string());
+                }
+            })
+        };
+        tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone(), (lag.clone(), ask));
 
         #[cfg(windows)]
         // Headless (tests only): no window, no D3D device, no decoding.
@@ -162,6 +180,7 @@ impl Viewer {
             relay,
             ice_failed: failed,
             jitterbuffers,
+            lag,
         })
     }
 
@@ -289,7 +308,9 @@ const JB_DEFAULTS: &str = "rtx-next-seqnum=false";
 
 /// Defaults above, plus experiment overrides: STREAMER_JB_PROPS for rtpjitterbuffer
 /// and STREAMER_SESSION_PROPS for RTPSession, both as "name=value,...".
-fn tune_jitterbuffer(webrtc: &gst::Element, transit: Arc<Mutex<Vec<Series>>>, jbs: Arc<Mutex<Vec<gst::Element>>>) {
+type LagHook = (Arc<crate::catchup::LagWatch>, Arc<dyn Fn(std::time::Duration) + Send + Sync>);
+
+fn tune_jitterbuffer(webrtc: &gst::Element, transit: Arc<Mutex<Vec<Series>>>, jbs: Arc<Mutex<Vec<gst::Element>>>, lag: LagHook) {
     let jb_props = format!("{JB_DEFAULTS},{}", std::env::var("STREAMER_JB_PROPS").unwrap_or_default());
     let session_props = format!("{SESSION_DEFAULTS},{}", std::env::var("STREAMER_SESSION_PROPS").unwrap_or_default());
     let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) else {
@@ -311,7 +332,7 @@ fn tune_jitterbuffer(webrtc: &gst::Element, transit: Arc<Mutex<Vec<Series>>>, jb
         jbs.lock().unwrap().push(jb.clone());
         let series = Series::default();
         transit.lock().unwrap().push(series.clone());
-        watch_transit(&jb, series);
+        watch_transit(&jb, series, lag.clone());
         if !session_props.is_empty() {
             if let Some(s) = rtpbin.emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&session]) {
                 apply(&s, &session_props);
@@ -324,7 +345,7 @@ fn tune_jitterbuffer(webrtc: &gst::Element, transit: Arc<Mutex<Vec<Series>>>, jb
 /// Records each packet's transit (arrival on our clock minus its RTP time) at the
 /// jitterbuffer input, which is right after the network. A constant clock offset cancels out
 /// in the spread.
-fn watch_transit(jb: &gst::Element, transit: Series) {
+fn watch_transit(jb: &gst::Element, transit: Series, (lag, ask): LagHook) {
     let Some(pad) = jb.static_pad("sink") else { return };
     let epoch = Instant::now();
     // (last RTP timestamp, unwrapped high bits); None until the first video packet.
@@ -333,6 +354,7 @@ fn watch_transit(jb: &gst::Element, transit: Series) {
         let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let Ok(rtp) = gst_rtp::RTPBuffer::from_buffer_readable(buf) else { return gst::PadProbeReturn::Ok };
         let ts = rtp.timestamp();
+        let video = rtp.payload_type() as u32 == crate::host::VIDEO_PT;
         let mut st = state.lock().unwrap();
         let (last, wraps) = st.get_or_insert((ts, 0));
         // Packets may arrive out of order; only a big jump counts as a wrap.
@@ -346,6 +368,12 @@ fn watch_transit(jb: &gst::Element, transit: Series) {
         let rtp_ns = ((*wraps << 32) + ts as i64) as i128 * 1_000_000_000 / 90_000;
         let local_ns = epoch.elapsed().as_nanos() as i128;
         transit.push((local_ns - rtp_ns + TRANSIT_BIAS as i128) as u64);
+        if video {
+            if let Some(d) = lag.packet(Instant::now(), local_ns - rtp_ns) {
+                drop(st);
+                ask(d);
+            }
+        }
         gst::PadProbeReturn::Ok
     });
 }

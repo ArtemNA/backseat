@@ -293,13 +293,15 @@ fn main() {
             let t = viewer.take_video_transit();
             let j = viewer.jitter_report();
             println!(
-                "viewer jitter | arrival spread p50 {:.1} p99 {:.1} max {:.1} ms over {} packets | jitterbuffer late {} lost {} (since start)",
+                "viewer jitter | arrival spread p50 {:.1} p99 {:.1} max {:.1} ms over {} packets | jitterbuffer late {} lost {} (since start) | lag max {:.0} ms, catch-up requests {}",
                 t.spread_ms(0.5),
                 t.spread_ms(0.99),
                 t.spread_ms(1.0),
                 t.len(),
                 j.late,
                 j.lost,
+                viewer.lag.max_lag_us.swap(0, Ordering::Relaxed) as f64 / 1000.0,
+                viewer.lag.requests.load(Ordering::Relaxed),
             );
         }
         if let Some(r) = viewer.render_report() {

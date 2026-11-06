@@ -249,14 +249,16 @@ fn main() {
                 format!("  <- PROBLEMS: {}", problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
             };
             println!(
-                "host   viewer {} | lost {:.1}% | rtt {:.1} ms | nack {} | pli {} | rtx requests {} resent {}{mark}",
+                "host   viewer {} | lost {:.1}% | rtt {:.1} ms | nack {} | pli {} | rtx requests {} resent {} | catch-ups {} skipped frames {}{mark}",
                 q.id,
                 q.fraction_lost * 100.0,
                 q.rtt_ms,
                 q.nack,
                 q.pli,
                 q.rtx_requests,
-                q.rtx_packets
+                q.rtx_packets,
+                q.catchups,
+                q.skipped_frames,
             );
         }
         last = now;

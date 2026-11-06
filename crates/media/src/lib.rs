@@ -1,6 +1,7 @@
 //! Media core shared by the host and viewer binaries: GStreamer pipelines, the direct
 //! signaling link, clock sync for latency measurement, and platform specifics.
 
+pub mod catchup;
 pub mod clock;
 pub mod config;
 pub mod host;
