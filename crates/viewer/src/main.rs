@@ -208,9 +208,17 @@ fn main() {
         std::process::exit(1);
     }
     if let Some((client, streamer)) = subscribe.take() {
-        client.send(ClientMsg::Subscribe { streamer });
-    }
-    if let Some(q) = &quality {
+        // The quality rides on the subscription, so the stream starts at it.
+        // STREAMER_DEBUG_QUALITY_LATE asks only after subscribing: the spoiled variant.
+        let late = std::env::var_os("STREAMER_DEBUG_QUALITY_LATE").is_some();
+        client.send(ClientMsg::Subscribe { streamer, quality: if late { None } else { quality.clone() } });
+        if late {
+            if let Some(q) = &quality {
+                link.send(media::host::QUALITY_MSG, q);
+            }
+        }
+    } else if let Some(q) = &quality {
+        // Direct mode has no subscription: ask once the link is up.
         link.send(media::host::QUALITY_MSG, q);
     }
     // Test only: STREAMER_DEBUG_QUALITY_CYCLE="SECS;Q1;Q2;..." asks for each quality in turn.

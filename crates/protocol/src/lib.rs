@@ -25,8 +25,13 @@ pub enum ClientMsg {
     Join { room: String, name: String },
     /// Announces whether this peer offers a stream others can watch.
     SetStreaming { streaming: bool },
-    /// Asks a streamer to start sending to us.
-    Subscribe { streamer: PeerId },
+    /// Asks a streamer to start sending to us, optionally at a lower quality ("720p30 2000"),
+    /// so the stream starts there instead of at the host's own quality first.
+    Subscribe {
+        streamer: PeerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+    },
     Unsubscribe { streamer: PeerId },
     /// Opaque message to one peer in the same room: offer, answer, ice, ping, pong.
     Signal { to: PeerId, kind: String, payload: String },
@@ -39,8 +44,12 @@ pub enum ServerMsg {
     PeerJoined { peer: PeerInfo },
     PeerUpdated { peer: PeerInfo },
     PeerLeft { id: PeerId },
-    /// To a streamer: this viewer wants the stream.
-    SubscribeRequest { viewer: PeerId },
+    /// To a streamer: this viewer wants the stream, at this quality if given.
+    SubscribeRequest {
+        viewer: PeerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+    },
     /// To a streamer: this viewer no longer wants the stream, or left.
     UnsubscribeRequest { viewer: PeerId },
     Signal { from: PeerId, kind: String, payload: String },
@@ -81,7 +90,11 @@ mod tests {
 
     #[test]
     fn wire_format_is_tagged() {
-        let m = ClientMsg::Subscribe { streamer: 7 };
+        let m = ClientMsg::Subscribe { streamer: 7, quality: None };
         assert_eq!(m.to_json(), r#"{"type":"subscribe","streamer":7}"#);
+        let q = ClientMsg::Subscribe { streamer: 7, quality: Some("720p30 2000".into()) };
+        assert_eq!(parse_client(&q.to_json()).unwrap(), q);
+        // Older clients without the field still parse.
+        assert_eq!(parse_client(r#"{"type":"subscribe","streamer":7}"#).unwrap(), m);
     }
 }

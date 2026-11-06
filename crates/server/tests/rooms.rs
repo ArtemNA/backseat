@@ -94,15 +94,15 @@ async fn subscribe_relay_and_unsubscribe() {
     host.until(|m| matches!(m, ServerMsg::PeerJoined { .. })).await;
 
     // Not streaming yet: refused.
-    viewer.send(ClientMsg::Subscribe { streamer: host.id }).await;
+    viewer.send(ClientMsg::Subscribe { streamer: host.id, quality: None }).await;
     assert!(matches!(viewer.next().await, ServerMsg::Error { .. }));
 
     host.send(ClientMsg::SetStreaming { streaming: true }).await;
     let m = viewer.until(|m| matches!(m, ServerMsg::PeerUpdated { .. })).await;
     assert!(matches!(m, ServerMsg::PeerUpdated { peer } if peer.streaming));
 
-    viewer.send(ClientMsg::Subscribe { streamer: host.id }).await;
-    assert_eq!(host.next().await, ServerMsg::SubscribeRequest { viewer: viewer.id });
+    viewer.send(ClientMsg::Subscribe { streamer: host.id, quality: None }).await;
+    assert_eq!(host.next().await, ServerMsg::SubscribeRequest { viewer: viewer.id, quality: None });
 
     host.send(ClientMsg::Signal { to: viewer.id, kind: "offer".into(), payload: "v=0".into() }).await;
     assert_eq!(viewer.next().await, ServerMsg::Signal { from: host.id, kind: "offer".into(), payload: "v=0".into() });
@@ -137,7 +137,7 @@ async fn leaving_viewer_releases_its_subscription() {
     let (mut viewer, _) = Client::join(&url, "r", "viewer").await;
     host.send(ClientMsg::SetStreaming { streaming: true }).await;
     viewer.until(|m| matches!(m, ServerMsg::PeerUpdated { .. })).await;
-    viewer.send(ClientMsg::Subscribe { streamer: host.id }).await;
+    viewer.send(ClientMsg::Subscribe { streamer: host.id, quality: None }).await;
     host.until(|m| matches!(m, ServerMsg::SubscribeRequest { .. })).await;
 
     let vid = viewer.id;

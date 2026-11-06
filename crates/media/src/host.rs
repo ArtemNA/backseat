@@ -477,7 +477,8 @@ impl Host {
 
     /// Adds one viewer branch and starts negotiation over the link. The first viewer starts
     /// capture and encoding; until then the host uses no encoder and sends nothing.
-    pub fn add_viewer(&self, id: u64, link: Arc<dyn Outbox>) -> Result<(), String> {
+    /// `want`: the quality to start at, clamped to the host's; None is the host's own.
+    pub fn add_viewer(&self, id: u64, link: Arc<dyn Outbox>, want: Option<Quality>) -> Result<(), String> {
         let mut viewers = self.viewers.lock().unwrap();
         if viewers.contains_key(&id) {
             return Ok(());
@@ -485,7 +486,8 @@ impl Host {
         if debug_timeline() {
             eprintln!("timeline {:>9.1} ms: add viewer {id}", since_start_ms());
         }
-        let mut branch = self.build_branch(id, link)?;
+        let start = want.map_or(self.ceiling, |w| w.clamp_to(self.ceiling));
+        let mut branch = self.build_branch(id, link, start)?;
         if viewers.is_empty() {
             self.pipeline
                 .set_state(gst::State::Playing)
@@ -610,7 +612,7 @@ impl Host {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 
-    fn build_branch(&self, id: u64, link: Arc<dyn Outbox>) -> Result<Branch, String> {
+    fn build_branch(&self, id: u64, link: Arc<dyn Outbox>, start: Quality) -> Result<Branch, String> {
         let webrtc = gst::ElementFactory::make("webrtcbin")
             .name(format!("viewer-{id}"))
             .build()
@@ -651,8 +653,8 @@ impl Host {
         let video_pay = make_pay(&format!("rtp{}pay", self.cfg.codec.short()), VIDEO_PT);
         video_pay.set_property("config-interval", -1i32);
         video_pay.set_property_from_str("aggregate-mode", "zero-latency");
-        // Every viewer starts on the host's own quality and may ask for less.
-        let tee = self.layer_tee(self.ceiling)?;
+        // A viewer starts on the quality it subscribed with, and may change it later.
+        let tee = self.layer_tee(start)?;
         let video_queue = branch_queue();
         self.pipeline.add_many([&video_queue, &video_pay]).unwrap();
         gst::Element::link_many([&video_queue, &video_pay, &webrtc]).unwrap();
@@ -663,7 +665,7 @@ impl Host {
             pad.link(&video_in).map_err(|e| format!("viewer {id}: {e}"))?;
             unlinked.clear();
         }
-        let video = VideoLink { quality: self.ceiling, tee, pad, pending: None, retired: vec![] };
+        let video = VideoLink { quality: start, tee, pad, pending: None, retired: vec![] };
         let mut branch = Branch {
             webrtc,
             elements: vec![video_pay, video_queue.clone()],

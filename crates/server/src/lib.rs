@@ -121,7 +121,7 @@ impl Server {
                 rooms.broadcast(&room, id, &ServerMsg::PeerUpdated { peer: info });
                 None
             }
-            ClientMsg::Subscribe { streamer } => {
+            ClientMsg::Subscribe { streamer, quality } => {
                 if streamer == id || !rooms.same_room(id, streamer) {
                     return Some(format!("no peer {streamer} in this room"));
                 }
@@ -129,7 +129,7 @@ impl Server {
                     return Some(format!("peer {streamer} is not streaming"));
                 }
                 if rooms.peers.get_mut(&id)?.watching.insert(streamer) {
-                    rooms.send(streamer, ServerMsg::SubscribeRequest { viewer: id });
+                    rooms.send(streamer, ServerMsg::SubscribeRequest { viewer: id, quality });
                 }
                 None
             }

@@ -140,7 +140,7 @@ fn main() {
             });
             let (link, mut reader) = Link::new(stream);
             let link = Arc::new(link);
-            if let Err(e) = host.add_viewer(0, link.clone()) {
+            if let Err(e) = host.add_viewer(0, link.clone(), None) {
                 eprintln!("host: {e}");
                 std::process::exit(1);
             }
@@ -169,9 +169,17 @@ fn main() {
                 let mut outboxes: HashMap<PeerId, Arc<dyn Outbox>> = HashMap::new();
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        ServerMsg::SubscribeRequest { viewer } => {
+                        ServerMsg::SubscribeRequest { viewer, quality } => {
                             let out = client.to_peer(viewer);
-                            match host.add_viewer(viewer, out.clone()) {
+                            // A bad request falls back to the host's own quality.
+                            let want = quality.as_deref().and_then(|q| match media::config::Quality::parse_request(q, host.ceiling) {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    eprintln!("host: viewer {viewer} quality {q}: {e}");
+                                    None
+                                }
+                            });
+                            match host.add_viewer(viewer, out.clone(), want) {
                                 Ok(()) => {
                                     outboxes.insert(viewer, out);
                                     println!("host: viewer {viewer} subscribed ({} viewers)", host.viewer_count());
