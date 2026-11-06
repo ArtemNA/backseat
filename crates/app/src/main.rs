@@ -73,6 +73,9 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
 
 /// The signaling server fixed at build time (STREAMER_SERVER_URL when compiling), if any.
 /// Such a build has no server field and ignores any other address.
+/// For the spoiled variant of the click-watch gate only.
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
 const BUILT_IN_SERVER: Option<&str> = option_env!("STREAMER_SERVER_URL");
 
 fn built_in() -> Option<&'static str> {
@@ -91,7 +94,9 @@ fn built_in_server() -> Option<String> {
 }
 
 #[tauri::command]
-fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String) -> Result<(), String> {
+/// Async: runs off the main thread. On it, creating or closing a video window inside the
+/// main window waited for the main thread itself, and the app froze on Watch.
+async fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String) -> Result<(), String> {
     let server = built_in().map(String::from).unwrap_or(server);
     do_connect(app.inner(), &server, &room, &name).inspect_err(|e| eprintln!("connect failed: {e}"))
 }
@@ -123,10 +128,12 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str) -> Result<()
 }
 
 #[tauri::command]
-fn leave(app: tauri::State<'_, Arc<App>>) {
-    if let Some(s) = app.session.lock().unwrap().take() {
+async fn leave(app: tauri::State<'_, Arc<App>>) -> Result<(), String> {
+    let s = app.session.lock().unwrap().take();
+    if let Some(s) = s {
         s.leave();
     }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -253,6 +260,13 @@ fn test_open_golive() -> bool {
 /// Tests only: STREAMER_APP_TEST_ROOMS="room B" makes the page go to room B after a
 /// while, then back to the first room through its button in the rail, then open the
 /// menu of room B.
+/// Tests only: STREAMER_APP_CLICK_WATCH="name" makes the page press that streamer's
+/// Watch button, the way a user does (the command then runs like a click's would).
+#[tauri::command]
+fn test_click_watch() -> Option<String> {
+    std::env::var("STREAMER_APP_CLICK_WATCH").ok()
+}
+
 /// Whether a test joins a room by itself (then the page does not open the last room).
 #[tauri::command]
 fn test_autojoin() -> bool {
@@ -305,7 +319,7 @@ struct GoLive {
 }
 
 #[tauri::command]
-fn go_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(), String> {
+async fn go_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(), String> {
     do_go_live(app.inner(), req).inspect_err(|e| eprintln!("go_live failed: {e}"))
 }
 
@@ -331,24 +345,42 @@ fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn end_live(app: tauri::State<'_, Arc<App>>) {
-    if let Some(s) = app.session.lock().unwrap().clone() {
+async fn end_live(app: tauri::State<'_, Arc<App>>) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone();
+    if let Some(s) = s {
         s.stop_streaming();
     }
+    Ok(())
 }
 
 #[tauri::command]
-fn watch(app: tauri::State<'_, Arc<App>>, streamer: u64, quality: Option<String>) -> Result<(), String> {
+/// Async: runs off the main thread. On it, creating or closing a video window inside the
+/// main window waited for the main thread itself, and the app froze on Watch.
+async fn watch(app: tauri::State<'_, Arc<App>>, streamer: u64, quality: Option<String>) -> Result<(), String> {
+    if std::env::var_os("STREAMER_DEBUG_WATCH_ON_MAIN").is_some() {
+        // Spoiled variant for the gate: do the work on the main thread, as before.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = app.inner().clone();
+        let q = quality.clone();
+        let main = APP_HANDLE.get().cloned().ok_or("no app handle")?;
+        main.run_on_main_thread(move || {
+            let r = a.session.lock().unwrap().clone().ok_or("not in a room".to_string()).and_then(|s| s.watch(streamer, ViewerConfig::default(), q).map(|_| ()));
+            let _ = tx.send(r);
+        }).map_err(|e| e.to_string())?;
+        return rx.recv().map_err(|e| e.to_string())?;
+    }
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
     s.watch(streamer, ViewerConfig::default(), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
     Ok(())
 }
 
 #[tauri::command]
-fn unwatch(app: tauri::State<'_, Arc<App>>, streamer: u64) {
-    if let Some(s) = app.session.lock().unwrap().clone() {
+async fn unwatch(app: tauri::State<'_, Arc<App>>, streamer: u64) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone();
+    if let Some(s) = s {
         s.unwatch(streamer);
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -467,6 +499,7 @@ fn main() {
     automate(&app);
     tauri::Builder::default()
         .setup(|a| {
+            let _ = APP_HANDLE.set(a.handle().clone());
             // Video windows go inside the main window (the UI gives each a place).
             use tauri::Manager;
             if let Some(w) = a.get_webview_window("main") {
@@ -477,7 +510,7 @@ fn main() {
             Ok(())
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

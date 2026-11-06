@@ -528,6 +528,13 @@ invoke('test_ui_stress').then((tab) => {
     if (n % 2 === 0) { setLanguage(LANGS[(n / 2) % LANGS.length].id); $('main-header').dataset.key = ''; applyStrings(); }
   }, 1500);
 });
+invoke('test_click_watch').then((name) => {
+  if (!name) return;
+  const timer = setInterval(() => {
+    const chipEl = [...document.querySelectorAll('.chip')].find((c) => c.querySelector('b')?.textContent === name);
+    if (chipEl) { clearInterval(timer); chipEl.querySelector('button').click(); }
+  }, 300);
+});
 invoke('test_rooms').then((other) => {
   if (!other) return;
   setTimeout(async () => {

@@ -246,6 +246,7 @@ unsafe fn apply_place(hwnd: HWND) {
     if !popped {
         if !is_child {
             SetWindowLongW(hwnd, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS).0 as i32);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, WS_EX_NOPARENTNOTIFY.0 as i32);
             let _ = SetParent(hwnd, Some(parent_hwnd));
         }
         match slot {
@@ -620,8 +621,11 @@ unsafe fn run(
     // place); else a window of its own.
     let parent = default_parent();
     let hwnd = if parent != 0 {
+        // NOPARENTNOTIFY: creating and closing a child otherwise sends WM_PARENTNOTIFY to
+        // the main window and waits for its thread; when that thread waits for us (a
+        // command run on it), the app freezes.
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_NOPARENTNOTIFY,
             w!("streamer_viewer"),
             w!("Stream"),
             WS_CHILD | WS_CLIPSIBLINGS,
