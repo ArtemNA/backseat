@@ -50,11 +50,53 @@ pub fn encoder_candidates(codec: Codec) -> Vec<(String, EncoderKind)> {
     ]
 }
 
-/// Codecs this machine can stream: those with a hardware encoder.
+/// Whether this encoder really encodes here: a few frames of a small test picture through
+/// it, once per run (cached). The element existing is not enough: on an AMD laptop with a
+/// 2021 driver amfh265enc is there but fails to start ("Failed to set bit depth").
+pub fn encoder_works(name: &str, kind: EncoderKind, codec: Codec) -> bool {
+    use gst::prelude::*;
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+    if let Some(&ok) = CACHE.lock().unwrap().get(name) {
+        return ok;
+    }
+    let ok = gst::ElementFactory::find(name).is_some() && {
+        let desc = format!(
+            "videotestsrc num-buffers=5 ! video/x-raw,width=640,height=360,framerate=30/1 ! d3d11upload ! d3d11convert ! \
+             video/x-raw(memory:D3D11Memory),format=NV12 ! {name} {} ! fakesink",
+            encoder_properties(kind, codec, 2000, 30, 60)
+        );
+        match gst::parse::launch(&desc) {
+            Ok(p) => {
+                let ok = p.set_state(gst::State::Playing).is_ok()
+                    && p.bus().is_some_and(|bus| {
+                        matches!(
+                            bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Eos, gst::MessageType::Error]).map(|m| m.type_()),
+                            Some(gst::MessageType::Eos)
+                        )
+                    });
+                let _ = p.set_state(gst::State::Null);
+                ok
+            }
+            Err(_) => false,
+        }
+    };
+    if !ok && gst::ElementFactory::find(name).is_some() {
+        eprintln!("encoder {name} is installed but does not work here; not offered");
+    }
+    CACHE.lock().unwrap().insert(name.to_string(), ok);
+    ok
+}
+
+/// The first encoder for this codec that really works here.
+pub fn working_encoder(codec: Codec) -> Option<(String, EncoderKind)> {
+    encoder_candidates(codec).into_iter().find(|(name, kind)| encoder_works(name, *kind, codec))
+}
+
+/// Codecs this machine can stream: those with a hardware encoder that works.
 pub fn encodable_codecs() -> Vec<Codec> {
     [Codec::Av1, Codec::H265, Codec::H264]
         .into_iter()
-        .filter(|c| encoder_candidates(*c).iter().any(|(name, _)| gst::ElementFactory::find(name).is_some()))
+        .filter(|c| working_encoder(*c).is_some())
         // Tests only: act like a GPU without an AV1 encoder.
         .filter(|c| !(*c == Codec::Av1 && std::env::var_os("STREAMER_DEBUG_NO_AV1").is_some()))
         .collect()
@@ -75,7 +117,13 @@ pub fn encoder_properties(kind: EncoderKind, codec: Codec, kbit: u32, fps: u32, 
                 k / fps
             )
         }
-        EncoderKind::Amf => format!("usage=ultra-low-latency rate-control=cbr bitrate={kbit} gop-size={gop}"),
+        // On an AMD Vega laptop (driver 31.0.21925) amfh265enc in ultra-low-latency ignores the
+        // bitrate (13.4 Mbit/s for 8, 46 for 20); low-latency keeps it (8.2). H.264 keeps it
+        // in ultra-low-latency.
+        EncoderKind::Amf => {
+            let usage = if codec == Codec::H265 { "low-latency" } else { "ultra-low-latency" };
+            format!("usage={usage} rate-control=cbr bitrate={kbit} gop-size={gop}")
+        }
         EncoderKind::Qsv => format!("low-latency=true rate-control=cbr bitrate={kbit} gop-size={gop}"),
     }
 }

@@ -99,7 +99,7 @@ fn set_ui_language(lang: String) {
 
 /// Codecs this machine can stream (hardware encoders only), e.g. ["h265", "h264", "av1"].
 #[tauri::command]
-fn codecs() -> Vec<String> {
+async fn codecs() -> Vec<String> {
     media::platform::encodable_codecs().into_iter().map(|c| c.short().to_string()).collect()
 }
 
@@ -594,6 +594,10 @@ fn main() {
             }
         });
     }
+    // Try the encoders once in the background, so the go-live dialog has the answer ready.
+    std::thread::spawn(|| {
+        let _ = media::platform::encodable_codecs();
+    });
     app.sampler.start();
     automate(&app);
     tauri::Builder::default()

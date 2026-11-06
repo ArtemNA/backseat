@@ -187,10 +187,7 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
 
 impl Host {
     pub fn new(cfg: HostConfig) -> Result<Self, String> {
-        let (encoder, kind) = platform::encoder_candidates(cfg.codec)
-            .into_iter()
-            .find(|(name, _)| gst::ElementFactory::find(name).is_some())
-            .ok_or("no hardware encoder found for this codec")?;
+        let (encoder, kind) = platform::working_encoder(cfg.codec).ok_or("no working hardware encoder for this codec")?;
         let desc = format!("{} ! tee name=srctee allow-not-linked=true", video_source(&cfg));
         let pipeline = gst::parse::launch(&desc)
             .map_err(|e| format!("video pipeline: {e}"))?
