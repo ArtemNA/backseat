@@ -1,21 +1,92 @@
 <!doctype html>
-<html lang="uk">
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>streamer</title>
-  <style>
-    body { font: 14px system-ui, sans-serif; margin: 16px; background: #1e1f22; color: #e6e6e6; }
-    input, button { font: inherit; padding: 4px 8px; }
-    label { display: block; margin: 6px 0; }
-    #stats { margin-top: 12px; font-family: ui-monospace, monospace; white-space: pre-wrap; }
-  </style>
+  <title>Streamer</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <label>Сервер <input id="server" value="ws://127.0.0.1:7800/ws" size="30"></label>
-  <label>Кімната <input id="room" value="ui"></label>
-  <label>Стример <input id="streamer" value="pc"></label>
-  <button id="watch">Дивитись</button>
-  <div id="stats">—</div>
-  <script src="main.js"></script>
+  <!-- Join -->
+  <div id="join" class="join">
+    <form id="join-form">
+      <h1 data-t="connect.title"></h1>
+      <label class="field"><span data-t="connect.server"></span><input id="f-server" value="ws://127.0.0.1:7800/ws" required></label>
+      <label class="field"><span data-t="connect.room"></span><input id="f-room" value="default" required></label>
+      <label class="field"><span data-t="connect.name"></span><input id="f-name" required maxlength="32"></label>
+      <label class="field"><span data-t="connect.language"></span><select id="f-lang"></select></label>
+      <div id="join-error" class="banner error hidden"></div>
+      <button class="btn primary" type="submit" data-t="connect.join"></button>
+    </form>
+  </div>
+
+  <!-- Room -->
+  <div id="shell" class="shell hidden">
+    <nav class="rail" aria-label="Rooms">
+      <div id="room-icon" class="room-icon"></div>
+    </nav>
+    <aside class="side">
+      <header><span id="room-name" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        <button id="leave" class="icon-btn" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"></path></svg>
+        </button>
+      </header>
+      <div id="people" class="people"></div>
+      <div class="me">
+        <span id="me-avatar" class="avatar"></span>
+        <span class="who"><span data-t="room.you"></span><span id="me-state" class="small"></span></span>
+        <button id="go-live" class="btn primary" type="button">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="12" rx="2"></rect><path d="M8 21h8M12 17v4"></path></svg>
+          <span data-t="room.go_live"></span>
+        </button>
+      </div>
+    </aside>
+    <main class="main">
+      <header id="main-header"></header>
+      <div id="content" class="scroll"></div>
+    </main>
+  </div>
+
+  <!-- Go live -->
+  <dialog id="golive">
+    <form class="dlg" method="dialog" id="golive-form">
+      <header><h2 data-t="golive.title"></h2><div id="gl-sub" class="small"></div></header>
+      <div class="body">
+        <div class="seg" role="group">
+          <button type="button" id="gl-tab-screen" data-t="golive.screen"></button>
+          <button type="button" id="gl-tab-window" data-t="golive.window"></button>
+        </div>
+        <div id="gl-sources" class="sources"></div>
+        <div>
+          <div class="legend" data-t="golive.audio"></div>
+          <div class="row" style="margin-top:8px">
+            <label class="opt"><input type="radio" name="audio" value="system" checked> <span data-t="golive.audio_system"></span></label>
+            <label class="opt" id="gl-audio-app"><input type="radio" name="audio" value="app"> <span data-t="golive.audio_app"></span></label>
+            <label class="opt"><input type="radio" name="audio" value="none"> <span data-t="golive.audio_none"></span></label>
+          </div>
+        </div>
+        <div>
+          <div class="legend" data-t="golive.quality"></div>
+          <div class="row" style="margin-top:8px">
+            <div class="controls"><label><span data-t="golive.resolution"></span><span id="gl-res" class="seg"></span></label></div>
+            <div class="controls"><label><span data-t="golive.fps"></span><span id="gl-fps" class="seg"></span></label></div>
+            <div class="controls"><label><span data-t="golive.bitrate"></span><span id="gl-kbit" class="seg"></span></label></div>
+          </div>
+        </div>
+        <div class="box">
+          <div style="display:flex;justify-content:space-between"><span id="gl-upload-label" class="small"></span><b id="gl-upload" style="color:var(--bright)"></b></div>
+          <div class="meter"><div id="gl-upload-bar" style="width:0%"></div></div>
+          <span id="gl-upload-note" class="small"></span>
+        </div>
+        <div id="gl-error" class="banner error hidden"></div>
+      </div>
+      <footer>
+        <button type="button" class="btn ghost" id="gl-cancel" data-t="golive.cancel"></button>
+        <button type="button" class="btn primary" id="gl-start" data-t="golive.start"></button>
+      </footer>
+    </form>
+  </dialog>
+
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

@@ -120,6 +120,17 @@ fn video_source(cfg: &HostConfig) -> String {
              video/x-raw(memory:D3D11Memory),framerate={}/1",
             m.fps
         ),
+        // The frame rate must be set: WGC and DXGI otherwise negotiate 30 (stage 6 probe A).
+        Source::Monitor { handle } => format!(
+            "d3d11screencapturesrc capture-api=dxgi show-cursor=true monitor-handle={handle} ! \
+             video/x-raw(memory:D3D11Memory),framerate={}/1",
+            m.fps
+        ),
+        Source::Window { hwnd } => format!(
+            "d3d11screencapturesrc capture-api=wgc show-cursor=true window-handle={hwnd} ! \
+             video/x-raw(memory:D3D11Memory),framerate={}/1",
+            m.fps
+        ),
         Source::Bars => format!(
             "videotestsrc is-live=true pattern=smpte horizontal-speed=4 ! \
              video/x-raw,format=NV12,width={},height={},framerate={}/1 ! d3d11upload",
@@ -141,18 +152,30 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
             .property("volume", 0.3f64)
             .build()
             .map_err(|e| e.to_string()),
-        Source::Capture { .. } => {
+        Source::Capture { .. } | Source::Monitor { .. } | Source::Window { .. } => {
             let src = gst::ElementFactory::make("wasapi2src")
                 .property("loopback", true)
                 .property("low-latency", true)
                 .build()
                 .map_err(|e| format!("system audio capture unavailable: {e}"))?;
-            // Excludes our own playback, so a host who also watches does not echo it back.
-            if src.has_property("loopback-mode") {
-                src.set_property_from_str("loopback-mode", "exclude-process-tree");
-                src.set_property("loopback-target-pid", std::process::id());
-            } else {
+            if !src.has_property("loopback-mode") {
+                if cfg.audio_pid.is_some() {
+                    return Err("this Windows build cannot capture one program's audio".into());
+                }
                 eprintln!("warning: this Windows build cannot exclude our own audio from capture");
+                return Ok(src);
+            }
+            match cfg.audio_pid {
+                // One program only.
+                Some(pid) => {
+                    src.set_property_from_str("loopback-mode", "include-process-tree");
+                    src.set_property("loopback-target-pid", pid);
+                }
+                // Everything but our own playback, so a host who also watches does not echo it.
+                None => {
+                    src.set_property_from_str("loopback-mode", "exclude-process-tree");
+                    src.set_property("loopback-target-pid", std::process::id());
+                }
             }
             Ok(src)
         }
@@ -336,6 +359,11 @@ impl Host {
             }
         }
         trace("housekeeping exit");
+    }
+
+    /// The quality each viewer currently receives.
+    pub fn viewer_layers(&self) -> Vec<(u64, Quality)> {
+        self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.video.lock().unwrap().quality)).collect()
     }
 
     /// Per layer: quality, viewers on it, statistics.

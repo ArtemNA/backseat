@@ -65,6 +65,8 @@ pub struct Watch {
     pub streamer: PeerId,
     pub viewer: Arc<Viewer>,
     pub clock: HostClock,
+    /// The quality last asked for ("720p30 2000"), None for the streamer's own.
+    pub quality: Mutex<Option<String>>,
     link: Arc<dyn Outbox>,
     stop: Arc<AtomicBool>,
 }
@@ -177,7 +179,14 @@ impl Session {
         let clock = HostClock::default();
         let viewer = Arc::new(Viewer::new(cfg, clock.clone(), link.clone())?);
         viewer.start()?;
-        let w = Arc::new(Watch { streamer, viewer, clock, link, stop: Arc::new(AtomicBool::new(false)) });
+        let w = Arc::new(Watch {
+            streamer,
+            viewer,
+            clock,
+            quality: Mutex::new(quality.clone()),
+            link,
+            stop: Arc::new(AtomicBool::new(false)),
+        });
         self.state.lock().unwrap().watches.insert(streamer, w.clone());
         self.client.send(ClientMsg::Subscribe { streamer, quality });
         // Clock sync for latency figures; also notices a closed window.
@@ -201,6 +210,7 @@ impl Session {
     pub fn set_watch_quality(&self, streamer: PeerId, quality: &str) {
         if let Some(w) = self.state.lock().unwrap().watches.get(&streamer) {
             w.link.send(crate::host::QUALITY_MSG, quality);
+            *w.quality.lock().unwrap() = Some(quality.to_string());
         }
     }
 

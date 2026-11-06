@@ -35,6 +35,7 @@ fn parse() -> Result<Args, String> {
         codec: Codec::H265,
         keyframe_secs: 2,
         audio: true,
+        audio_pid: None,
         source: Source::Capture { monitor: -1 },
         ice: IceConfig::default(),
     };
@@ -70,6 +71,10 @@ fn parse() -> Result<Args, String> {
                 }
             }
             "--monitor" => monitor = num(val)? as i32,
+            // Capture one window instead of a monitor.
+            "--window" => cfg.source = Source::Window { hwnd: num(val)? as u64 },
+            // Capture only this program's audio.
+            "--audio-pid" => cfg.audio_pid = Some(num(val)? as u32),
             "--seconds" => seconds = num(val)? as u64,
             "--report-secs" => report_secs = num(val)? as u64,
             _ => return Err(format!("unknown argument {key}")),

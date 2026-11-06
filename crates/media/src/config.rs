@@ -133,8 +133,13 @@ mod tests {
 
 #[derive(Clone, Debug)]
 pub enum Source {
-    /// Monitor capture; -1 is the primary monitor.
+    /// Monitor capture by DXGI output index; -1 is the primary monitor.
     Capture { monitor: i32 },
+    /// Monitor capture by HMONITOR, as listed by `platform::monitors`.
+    Monitor { handle: u64 },
+    /// One window by HWND, through Windows Graphics Capture. A minimized window sends
+    /// nothing (stage 6 probe A).
+    Window { hwnd: u64 },
     /// Moving colour bars and test ticks, for repeatable measurements.
     Bars,
     /// Random noise: the hardest content for an encoder, for bitrate ceilings.
@@ -164,6 +169,8 @@ pub struct HostConfig {
     /// Periodic keyframe interval; viewers never request keyframes (decision D1).
     pub keyframe_secs: u32,
     pub audio: bool,
+    /// Capture only this process's audio (and its children) instead of the whole system.
+    pub audio_pid: Option<u32>,
     pub source: Source,
     pub ice: IceConfig,
 }

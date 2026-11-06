@@ -11,6 +11,7 @@ gst-webrtc.workspace = true
 gst-sdp.workspace = true
 gst-rtp.workspace = true
 protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
 # wss:// for a signaling server behind TLS, using the system's own TLS stack.
 tungstenite = { version = "0.30", features = ["native-tls"] }
 

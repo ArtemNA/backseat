@@ -1,0 +1,332 @@
+const { invoke } = window.__TAURI__.core;
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids) if (k != null) e.append(k);
+  return e;
+};
+
+const PRESETS = [2000, 4000, 8000, 12000, 20000, 35000, 50000];
+const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
+const state = { snap: null, choice: {}, cardsKey: '', liveKey: '', gl: { tab: 'screen', pick: null, res: '1080', fps: '60', kbit: 20000, sources: null } };
+
+// ---------- language ----------
+function applyStrings() {
+  document.querySelectorAll('[data-t]').forEach((n) => { n.textContent = t(n.dataset.t); });
+  $('leave').setAttribute('aria-label', t('room.leave'));
+  state.cardsKey = '';
+  state.liveKey = '';
+  if (state.snap) render(state.snap);
+}
+function fillLanguages() {
+  const sel = $('f-lang');
+  sel.replaceChildren(...LANGS.map((l) => el('option', { value: l.id, text: l.name, selected: l.id === lang })));
+  sel.addEventListener('change', () => { setLanguage(sel.value); applyStrings(); });
+}
+
+// ---------- helpers ----------
+const COLORS = ['#c2622d', '#3a8a5c', '#5d5fa8', '#7a4e9a', '#2f7f95', '#9a4e6b', '#7a6a2e'];
+function avatar(name) {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.codePointAt(0)) >>> 0;
+  return el('span', { class: 'avatar', style: `background:${COLORS[h % COLORS.length]}`, text: (name[0] || '?').toUpperCase() });
+}
+const mbit = (kbit) => (kbit / 1000).toLocaleString(lang);
+function clock(secs) {
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  return [h, m, s].map((x) => String(x).padStart(2, '0')).join(':');
+}
+// "720p30 2000" -> "720p30 · 2 Mbit/s"
+function requestLabel(q) {
+  if (!q) return t('card.source_quality');
+  const [mode, kbit] = q.split(' ');
+  return kbit ? `${mode} · ${mbit(+kbit)} ${t('unit.mbit')}` : mode;
+}
+const ms = (v) => (v >= 1 ? `${Math.round(v)} ${t('unit.ms')}` : v > 0 ? `<1 ${t('unit.ms')}` : '—');
+// "1280x720@30 4000 kbit/s" -> "720p30 · 4"
+function shortQuality(q) {
+  const m = /(\d+)x(\d+)@(\d+) (\d+) kbit/.exec(q || '');
+  return m ? `${m[2]}p${m[3]} · ${mbit(+m[4])}` : q || '—';
+}
+async function call(cmd, args, errBox) {
+  try {
+    return await invoke(cmd, args);
+  } catch (e) {
+    if (errBox) { errBox.textContent = String(e); errBox.classList.remove('hidden'); }
+    throw e;
+  }
+}
+
+// ---------- join ----------
+function loadForm() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('join') || '{}');
+    for (const k of ['server', 'room', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
+  } catch {}
+}
+$('join-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('join-error').classList.add('hidden');
+  const args = { server: $('f-server').value.trim(), room: $('f-room').value.trim(), name: $('f-name').value.trim() };
+  try { localStorage.setItem('join', JSON.stringify(args)); } catch {}
+  await call('connect', args, $('join-error'));
+  tick();
+});
+$('leave').addEventListener('click', async () => { await invoke('leave'); tick(); });
+
+// ---------- render ----------
+function render(s) {
+  $('join').classList.toggle('hidden', s.connected);
+  $('shell').classList.toggle('hidden', !s.connected);
+  if (!s.connected) return;
+  const me = s.peers.find((p) => p.me) || { name: '?' };
+  $('room-name').textContent = s.room;
+  $('room-icon').textContent = s.room.slice(0, 2).toUpperCase();
+  $('me-avatar').replaceWith(Object.assign(avatar(me.name), { id: 'me-avatar' }));
+  $('me-state').textContent = s.live ? t('room.live_for', { t: clock(s.live.since_secs) }) : t('room.not_live');
+  $('me-state').style.color = s.live ? '#ff9aa0' : '';
+  $('go-live').classList.toggle('hidden', !!s.live);
+
+  renderPeople(s);
+  renderHeader(s);
+  renderContent(s);
+}
+
+function renderPeople(s) {
+  const live = s.peers.filter((p) => p.streaming);
+  const rest = s.peers.filter((p) => !p.streaming);
+  const row = (p) => el('div', { class: 'person' + (p.streaming ? ' live' : '') },
+    avatar(p.name),
+    el('span', { class: 'who' }, el('span', { text: p.me ? `${p.name} (${t('room.you')})` : p.name })),
+    p.streaming ? el('span', { class: 'pill-live', text: 'LIVE' }) : null);
+  $('people').replaceChildren(
+    el('div', { class: 'section', text: t('room.live', { n: live.length }) }), ...live.map(row),
+    el('div', { class: 'section', text: t('room.here', { n: rest.length }) }), ...rest.map(row));
+}
+
+// Language, also from inside a room.
+function langPicker() {
+  const sel = el('select', { class: 'lang', 'aria-label': t('connect.language'), onchange: (e) => { setLanguage(e.target.value); $('main-header').dataset.key = ''; applyStrings(); } },
+    ...LANGS.map((l) => el('option', { value: l.id, text: l.name, selected: l.id === lang })));
+  return sel;
+}
+
+function renderHeader(s) {
+  const h = $('main-header');
+  if (s.live) {
+    const key = 'live';
+    if (h.dataset.key !== key) {
+      h.dataset.key = key;
+      h.replaceChildren(
+        el('span', { class: 'pill-live', text: 'LIVE' }),
+        el('span', { text: t('live.title') }),
+        el('span', { class: 'small', id: 'live-sub' }),
+        langPicker(),
+        el('button', { class: 'btn danger', type: 'button', text: t('live.end'), onclick: async () => { await invoke('end_live'); tick(); } }));
+    }
+    $('live-sub').textContent = `${shortQuality(s.live.ceiling)} ${t('unit.mbit')} · ${s.live.encoder}`;
+  } else if (h.dataset.key !== 'streams') {
+    h.dataset.key = 'streams';
+    h.replaceChildren(el('span', { text: t('room.streams') }), langPicker());
+  }
+}
+
+function renderContent(s) {
+  const others = s.peers.filter((p) => p.streaming && !p.me);
+  const cardsKey = others.map((p) => `${p.id}:${p.watching}`).join(',') + '|' + (s.live ? 'L' : '');
+  const box = $('content');
+  if (cardsKey !== state.cardsKey) {
+    state.cardsKey = cardsKey;
+    state.liveKey = '';
+    const parts = [];
+    if (s.live) parts.push(el('div', { id: 'live-panel', style: 'display:flex;flex-direction:column;gap:16px' }));
+    parts.push(el('div', { id: 'hint' }));
+    if (others.length) parts.push(el('div', { class: 'grid' }, ...others.map(card)));
+    else if (!s.live) parts.push(el('div', { class: 'empty', text: t('room.none') }));
+    box.replaceChildren(...parts);
+  }
+  // Numbers, in place.
+  let hint = null;
+  for (const w of s.watches) {
+    const c = document.querySelector(`[data-card="${w.streamer}"]`);
+    if (!c) continue;
+    c.querySelector('[data-k=rx]').textContent = `${Math.round(w.received_fps)} fps`;
+    const shown = c.querySelector('[data-k=shown]');
+    shown.textContent = `${Math.round(w.shown_fps)} fps`;
+    const throttled = w.received_fps > 20 && w.shown_fps < w.received_fps * 0.8;
+    shown.classList.toggle('warn', throttled);
+    c.querySelector('[data-k=lat]').textContent = ms(w.latency_ms);
+    c.querySelector('[data-k=sub]').textContent = `${t('card.watching')} · ${requestLabel(w.quality)}`;
+    // Show what is being watched in the pickers until the viewer picks something else.
+    const ch = state.choice[w.streamer];
+    if (ch && !ch.touched && w.quality) {
+      const [m, k] = w.quality.split(' ');
+      if (ch.mode !== m || ch.kbit !== (k || '')) {
+        ch.mode = m; ch.kbit = k || '';
+        const sels = c.querySelectorAll('select');
+        if (sels[0]) sels[0].value = ch.mode;
+        if (sels[1]) sels[1].value = ch.kbit;
+      }
+    }
+    if (throttled && !hint) {
+      const p = s.peers.find((x) => x.id === w.streamer);
+      hint = t('hint.background', { name: p ? p.name : '?', shown: Math.round(w.shown_fps), rx: Math.round(w.received_fps) });
+    }
+  }
+  const hb = $('hint');
+  if (hb) {
+    if (hint) hb.replaceChildren(el('div', { class: 'banner' }, el('span', { style: 'flex:1 1 320px', text: hint })));
+    else hb.replaceChildren();
+  }
+  if (s.live) renderLive(s.live);
+}
+
+function qualityControls(id, watching) {
+  const ch = state.choice[id] || (state.choice[id] = { mode: '', kbit: '' });
+  const mode = el('select', { onchange: (e) => { ch.mode = e.target.value; ch.touched = true; } },
+    el('option', { value: '', text: t('card.source_quality'), selected: ch.mode === '' }),
+    ...VIEW_MODES.map((m) => el('option', { value: m, text: m, selected: ch.mode === m })));
+  const kbit = el('select', { onchange: (e) => { ch.kbit = e.target.value; ch.touched = true; } },
+    el('option', { value: '', text: '—', selected: ch.kbit === '' }),
+    ...PRESETS.map((k) => el('option', { value: String(k), text: `${mbit(k)} ${t('unit.mbit')}`, selected: ch.kbit === String(k) })));
+  return [el('label', {}, t('card.quality'), mode), el('label', {}, t('card.bitrate'), kbit)];
+}
+function requestOf(id) {
+  const ch = state.choice[id] || {};
+  if (!ch.mode && !ch.kbit) return null;
+  return `${ch.mode || '1440p60'}${ch.kbit ? ' ' + ch.kbit : ''}`;
+}
+
+function card(p) {
+  const controls = el('div', { class: 'controls' }, ...qualityControls(p.id, p.watching));
+  if (p.watching) {
+    controls.append(
+      el('button', { class: 'btn', type: 'button', text: t('card.apply'), onclick: async () => { const q = requestOf(p.id); if (q) await invoke('set_quality', { streamer: p.id, quality: q }); } }),
+      el('button', { class: 'btn danger push', type: 'button', text: t('card.stop'), onclick: async () => { await invoke('unwatch', { streamer: p.id }); tick(); } }));
+  } else {
+    controls.append(el('button', { class: 'btn primary push', type: 'button', text: t('card.watch'), onclick: async () => { const ch = state.choice[p.id]; if (ch) ch.touched = false; await invoke('watch', { streamer: p.id, quality: requestOf(p.id) }); tick(); } }));
+  }
+  const stat = (label, k) => el('div', { class: 'stat' }, el('span', { text: label }), el('b', { 'data-k': k, text: '—' }));
+  return el('article', { class: 'card' + (p.watching ? ' on' : ''), 'data-card': p.id },
+    el('div', { class: 'thumb' }, el('span', { class: 'pill-live', text: 'LIVE' }), p.watching ? t('card.in_window') : p.name),
+    el('div', { class: 'card-body' },
+      el('div', { class: 'card-title' }, el('b', { text: p.name }), el('span', { class: 'small', 'data-k': 'sub', text: p.watching ? t('card.watching') : t('card.streaming') })),
+      p.watching ? el('div', { class: 'stats' }, stat(t('card.received'), 'rx'), stat(t('card.shown'), 'shown'), stat(t('card.latency'), 'lat')) : null,
+      controls));
+}
+
+function renderLive(l) {
+  const panel = $('live-panel');
+  if (!panel) return;
+  const active = l.layers.filter((x) => !x.parked);
+  const fps = Math.round(active.reduce((a, x) => Math.max(a, x.fps), 0));
+  const ceilingMbit = (+(/(\d+) kbit/.exec(l.ceiling) || [0, 0])[1]) / 1000;
+  const cap = Math.max(ceilingMbit * Math.max(l.viewers.length, 1), 1);
+  const rows = l.viewers.map((v) => {
+    const q = v.problems.find((p) => p.startsWith('queue:'));
+    const loss = v.problems.find((p) => p.startsWith('loss:'));
+    let stateCell;
+    if (q) stateCell = el('span', { class: 'state-warn' }, el('span', { class: 'dot', style: 'background:var(--warn)' }), t('live.queue', { s: (q.split(':')[1] / 1000).toFixed(1) }), el('div', { class: 'small', text: t('live.queue_note') }));
+    else if (loss) stateCell = el('span', { class: 'state-warn' }, el('span', { class: 'dot', style: 'background:var(--warn)' }), t('live.loss', { pct: loss.split(':')[1] }));
+    else stateCell = el('span', { class: 'state-ok' }, el('span', { class: 'dot', style: 'background:var(--ok)' }), t('live.ok'));
+    return el('div', { class: 'tr' },
+      el('span', { style: 'display:flex;align-items:center;gap:10px' }, avatar(v.name), v.name),
+      el('span', { text: shortQuality(v.quality) }),
+      el('span', { text: ms(v.rtt_ms) }),
+      stateCell);
+  });
+  panel.replaceChildren(
+    el('div', { class: 'tiles' },
+      el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.viewers') }), el('span', { class: 'num', text: String(l.viewers.length) })),
+      el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.encoding') }), el('span', { class: 'num', text: `${fps} fps` }),
+        el('span', { class: 'small', text: t('live.layers', { n: active.length, list: active.map((x) => shortQuality(x.quality)).join(', ') || '—' }) })),
+      el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.upload') }),
+        el('span', { class: 'num', text: `${l.upload_mbit.toLocaleString(lang, { maximumFractionDigits: 1 })} ${t('unit.mbit')}` }),
+        el('div', { class: 'meter' }, el('div', { style: `width:${Math.min(100, (l.upload_mbit / cap) * 100)}%` })))),
+    l.viewers.length
+      ? el('section', { class: 'table', 'aria-label': t('live.viewers') },
+          el('div', { class: 'tr head' }, el('span', { text: t('live.th_viewer') }), el('span', { text: t('live.th_quality') }), el('span', { text: t('live.th_rtt') }), el('span', { text: t('live.th_state') })),
+          ...rows)
+      : el('div', { class: 'empty', text: t('live.no_viewers') }),
+    el('p', { class: 'small', style: 'margin:0', text: t('live.isolation') }));
+}
+
+// ---------- go live ----------
+function seg(box, items, current, onPick) {
+  box.replaceChildren(...items.map(([v, label]) => el('button', { type: 'button', 'aria-pressed': String(v === current), text: label, onclick: () => onPick(v) })));
+}
+function renderGoLive() {
+  const g = state.gl, s = state.snap;
+  $('gl-sub').textContent = t('golive.sub', { room: s.room, n: Math.max(s.peers.length - 1, 0) });
+  $('gl-tab-screen').setAttribute('aria-pressed', String(g.tab === 'screen'));
+  $('gl-tab-window').setAttribute('aria-pressed', String(g.tab === 'window'));
+  const list = g.tab === 'screen'
+    ? (g.sources?.monitors || []).map((m) => ({ id: m.handle, title: `${m.name.replace('\\\\.\\', '')}${m.primary ? ' · ' + t('golive.primary') : ''}`, sub: `${m.width}×${m.height}` }))
+    : (g.sources?.windows || []).map((w) => ({ id: w.hwnd, title: w.title, sub: w.minimized ? t('golive.minimized') : w.exe, pid: w.pid }));
+  if (!list.some((x) => g.pick && x.id === g.pick.id)) g.pick = g.tab === 'screen' ? list[0] || null : null;
+  $('gl-sources').replaceChildren(...list.map((x) => el('button', { type: 'button', class: 'source', 'aria-pressed': String(g.pick?.id === x.id), onclick: () => { g.pick = x; renderGoLive(); } },
+    el('span', { text: x.title }), el('span', { class: 'small', text: x.sub }))));
+  $('gl-audio-app').classList.toggle('hidden', g.tab !== 'window');
+  if (g.tab !== 'window' && document.querySelector('input[name=audio]:checked')?.value === 'app') document.querySelector('input[name=audio][value=system]').checked = true;
+  seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; renderGoLive(); });
+  seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
+  seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
+  const n = Math.max(s.peers.length - 1, 1);
+  $('gl-upload-label').textContent = t('golive.upload', { n });
+  $('gl-upload').textContent = t('golive.upload_value', { mbit: mbit(g.kbit * n) });
+  $('gl-upload-bar').style.width = Math.min(100, (g.kbit * n) / 1000) + '%';
+  $('gl-upload-note').textContent = t('golive.upload_note', { kbit: mbit(g.kbit) });
+}
+$('go-live').addEventListener('click', async () => {
+  $('gl-error').classList.add('hidden');
+  state.gl.sources = await invoke('sources');
+  renderGoLive();
+  $('golive').showModal();
+});
+$('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); });
+$('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); });
+$('gl-cancel').addEventListener('click', () => $('golive').close());
+$('gl-start').addEventListener('click', async () => {
+  const g = state.gl;
+  if (!g.pick) { $('gl-error').textContent = t('golive.pick_window'); $('gl-error').classList.remove('hidden'); return; }
+  const audio = document.querySelector('input[name=audio]:checked').value;
+  await call('go_live', { req: { kind: g.tab === 'screen' ? 'monitor' : 'window', id: g.pick.id, audio, audio_pid: g.pick.pid ?? null, mode: `${g.res}p${g.fps}`, kbit: g.kbit } }, $('gl-error'));
+  $('golive').close();
+  tick();
+});
+
+// ---------- loop ----------
+function showNotice(n) {
+  if (!n) return;
+  const [kind, rest] = [n.split(':')[0], n.slice(n.indexOf(':') + 1)];
+  const text = kind === 'lost' ? t('notice.lost') : kind === 'watch_ended' ? t('notice.watch_ended', { reason: rest }) : t('notice.error', { msg: rest });
+  const box = $('join-error');
+  box.textContent = text;
+  box.classList.remove('hidden');
+}
+async function tick() {
+  try {
+    const s = await invoke('snapshot');
+    state.snap = s;
+    showNotice(s.notice);
+    render(s);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+setLanguage(lang);
+// Tests only: STREAMER_APP_LANG forces the language for screenshots.
+invoke('forced_language').then((l) => { if (l) { setLanguage(l); fillLanguages(); applyStrings(); } });
+invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
+fillLanguages();
+loadForm();
+applyStrings();
+tick();
+setInterval(tick, 1000);

@@ -2212,6 +2212,7 @@ dependencies = [
  "gstreamer-webrtc",
  "pkg-config",
  "protocol",
+ "serde",
  "tungstenite 0.30.0",
  "windows",
 ]
