@@ -23,6 +23,21 @@ pub struct ViewerStats {
     /// Encoder input to decoder output, audio.
     pub audio_latency: Series,
     pub frames: Arc<AtomicU64>,
+    /// Packet transit per received stream: local arrival minus RTP time, offset by
+    /// TRANSIT_BIAS. Only its spread means anything: how unevenly packets arrive.
+    pub transit: Arc<Mutex<Vec<Series>>>,
+}
+
+/// Keeps transit values positive for `Series`.
+pub const TRANSIT_BIAS: u64 = 1 << 62;
+
+/// Jitterbuffer counters since start, summed over all streams.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JitterReport {
+    pub pushed: u64,
+    pub lost: u64,
+    /// Packets that arrived after their deadline and were thrown away.
+    pub late: u64,
 }
 
 pub struct Viewer {
@@ -37,6 +52,7 @@ pub struct Viewer {
     pub relay: Option<Arc<crate::netsim::LossRelay>>,
     /// Set when no direct connection could be made.
     pub ice_failed: Arc<std::sync::atomic::AtomicBool>,
+    jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
 }
 
 /// Receive-side RTP counters for video, since the session started.
@@ -92,7 +108,9 @@ impl Viewer {
             l.send("ice", &format!("{mline} {cand}"));
             None
         });
-        tune_jitterbuffer(&webrtc);
+        let stats = ViewerStats::default();
+        let jitterbuffers = Arc::new(Mutex::new(Vec::new()));
+        tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone());
 
         #[cfg(windows)]
         // Headless (tests only): no window, no D3D device, no decoding.
@@ -102,7 +120,6 @@ impl Viewer {
             r
         });
 
-        let stats = ViewerStats::default();
         let started = Instant::now();
         let pipeline_weak = pipeline.downgrade();
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
@@ -144,7 +161,25 @@ impl Viewer {
             render: renderer.map(|r| r.stats).unwrap_or_default(),
             relay,
             ice_failed: failed,
+            jitterbuffers,
         })
+    }
+
+    /// Transit since the last call for the busiest stream, which is the video.
+    pub fn take_video_transit(&self) -> crate::stats::Summary {
+        let all: Vec<_> = self.stats.transit.lock().unwrap().iter().map(|s| s.take()).collect();
+        all.into_iter().max_by_key(|s| s.len()).unwrap_or_else(|| Series::default().take())
+    }
+
+    pub fn jitter_report(&self) -> JitterReport {
+        let mut r = JitterReport::default();
+        for jb in self.jitterbuffers.lock().unwrap().iter() {
+            let s = jb.property::<gst::Structure>("stats");
+            r.pushed += s.get::<u64>("num-pushed").unwrap_or(0);
+            r.lost += s.get::<u64>("num-lost").unwrap_or(0);
+            r.late += s.get::<u64>("num-late").unwrap_or(0);
+        }
+        r
     }
 
     /// Video receive counters from webrtcbin, or None before the stream starts.
@@ -254,7 +289,7 @@ const JB_DEFAULTS: &str = "rtx-next-seqnum=false";
 
 /// Defaults above, plus experiment overrides: STREAMER_JB_PROPS for rtpjitterbuffer
 /// and STREAMER_SESSION_PROPS for RTPSession, both as "name=value,...".
-fn tune_jitterbuffer(webrtc: &gst::Element) {
+fn tune_jitterbuffer(webrtc: &gst::Element, transit: Arc<Mutex<Vec<Series>>>, jbs: Arc<Mutex<Vec<gst::Element>>>) {
     let jb_props = format!("{JB_DEFAULTS},{}", std::env::var("STREAMER_JB_PROPS").unwrap_or_default());
     let session_props = format!("{SESSION_DEFAULTS},{}", std::env::var("STREAMER_SESSION_PROPS").unwrap_or_default());
     let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) else {
@@ -273,12 +308,45 @@ fn tune_jitterbuffer(webrtc: &gst::Element) {
         let jb = v[1].get::<gst::Element>().unwrap();
         let session = v[2].get::<u32>().unwrap();
         apply(jb.upcast_ref(), &jb_props);
+        jbs.lock().unwrap().push(jb.clone());
+        let series = Series::default();
+        transit.lock().unwrap().push(series.clone());
+        watch_transit(&jb, series);
         if !session_props.is_empty() {
             if let Some(s) = rtpbin.emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&session]) {
                 apply(&s, &session_props);
             }
         }
         None
+    });
+}
+
+/// Records each packet's transit (arrival on our clock minus its RTP time) at the
+/// jitterbuffer input, which is right after the network. A constant clock offset cancels out
+/// in the spread.
+fn watch_transit(jb: &gst::Element, transit: Series) {
+    let Some(pad) = jb.static_pad("sink") else { return };
+    let epoch = Instant::now();
+    // (last RTP timestamp, unwrapped high bits); None until the first video packet.
+    let state = Mutex::new(None::<(u32, i64)>);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
+        let Ok(rtp) = gst_rtp::RTPBuffer::from_buffer_readable(buf) else { return gst::PadProbeReturn::Ok };
+        let ts = rtp.timestamp();
+        let mut st = state.lock().unwrap();
+        let (last, wraps) = st.get_or_insert((ts, 0));
+        // Packets may arrive out of order; only a big jump counts as a wrap.
+        if ts < *last && *last - ts > u32::MAX / 2 {
+            *wraps += 1;
+        } else if ts > *last && ts - *last > u32::MAX / 2 {
+            *wraps -= 1;
+        }
+        *last = ts;
+        // 90 kHz is the video clock; audio comes out wrong but is never reported.
+        let rtp_ns = ((*wraps << 32) + ts as i64) as i128 * 1_000_000_000 / 90_000;
+        let local_ns = epoch.elapsed().as_nanos() as i128;
+        transit.push((local_ns - rtp_ns + TRANSIT_BIAS as i128) as u64);
+        gst::PadProbeReturn::Ok
     });
 }
 

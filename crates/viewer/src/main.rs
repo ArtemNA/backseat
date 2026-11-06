@@ -289,6 +289,19 @@ fn main() {
                 max_queue_ms,
             );
         }
+        {
+            let t = viewer.take_video_transit();
+            let j = viewer.jitter_report();
+            println!(
+                "viewer jitter | arrival spread p50 {:.1} p99 {:.1} max {:.1} ms over {} packets | jitterbuffer late {} lost {} (since start)",
+                t.spread_ms(0.5),
+                t.spread_ms(0.99),
+                t.spread_ms(1.0),
+                t.len(),
+                j.late,
+                j.lost,
+            );
+        }
         if let Some(r) = viewer.render_report() {
             println!(
                 "viewer present | shown {:.1} fps | skipped total {} | Present max {:.1} ms | decoder lock held max {:.1} ms",

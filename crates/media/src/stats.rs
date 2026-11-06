@@ -38,6 +38,15 @@ impl Summary {
         self.0[i] as f64 / 1e6
     }
 
+    /// Percentile above the smallest value, in milliseconds, for nanosecond values.
+    pub fn spread_ms(&self, p: f64) -> f64 {
+        if self.0.is_empty() {
+            return f64::NAN;
+        }
+        let i = ((self.0.len() - 1) as f64 * p).round() as usize;
+        (self.0[i] - self.0[0]) as f64 / 1e6
+    }
+
     pub fn count_over(&self, ns: u64) -> usize {
         self.0.iter().filter(|&&x| x > ns).count()
     }
