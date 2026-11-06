@@ -125,6 +125,9 @@ pub struct WindowInfo {
     /// The program's file name, e.g. "eldenring.exe".
     pub exe: String,
     pub minimized: bool,
+    /// Client area in pixels (0 while minimized), to suggest a streaming resolution.
+    pub width: u32,
+    pub height: u32,
 }
 
 #[cfg(windows)]
@@ -190,12 +193,16 @@ pub fn windows() -> Vec<WindowInfo> {
             }
             let _ = CloseHandle(p);
         }
+        let mut rc = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(h, &mut rc);
         out.push(WindowInfo {
             hwnd: h.0 as u64,
             title: String::from_utf16_lossy(&buf[..n as usize]),
             pid,
             exe,
             minimized: IsIconic(h).as_bool(),
+            width: (rc.right - rc.left).max(0) as u32,
+            height: (rc.bottom - rc.top).max(0) as u32,
         });
         true.into()
     }

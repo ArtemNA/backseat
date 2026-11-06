@@ -168,7 +168,7 @@ fn sources() -> Sources {
     }
     // Test runs show test entries only, never the user's own window titles.
     let windows = if dev_sources() {
-        vec![media::platform::WindowInfo { hwnd: 0, title: "Test game window".into(), pid: 0, exe: "game.exe".into(), minimized: false }]
+        vec![media::platform::WindowInfo { hwnd: 0, title: "Test game window".into(), pid: 0, exe: "game.exe".into(), minimized: false, width: 2560, height: 1440 }]
     } else {
         media::platform::windows()
     };

@@ -567,9 +567,12 @@ function renderGoLive() {
   $('gl-tab-screen').setAttribute('aria-pressed', String(g.tab === 'screen'));
   $('gl-tab-window').setAttribute('aria-pressed', String(g.tab === 'window'));
   const list = g.tab === 'screen'
-    ? (g.sources?.monitors || []).map((m) => ({ id: m.handle, title: `${m.name.replace('\\\\.\\', '')}${m.primary ? ' · ' + t('golive.primary') : ''}`, sub: `${m.width}×${m.height}` }))
-    : (g.sources?.windows || []).map((w) => ({ id: w.hwnd, title: w.title, sub: w.exe, minimized: w.minimized, pid: w.pid }));
+    ? (g.sources?.monitors || []).map((m) => ({ id: m.handle, title: `${m.name.replace('\\\\.\\', '')}${m.primary ? ' · ' + t('golive.primary') : ''}`, sub: `${m.width}×${m.height}`, h: m.height }))
+    : (g.sources?.windows || []).map((w) => ({ id: w.hwnd, title: w.title, sub: w.exe, minimized: w.minimized, pid: w.pid, h: w.height }));
   if (!list.some((x) => g.pick && x.id === g.pick.id)) g.pick = g.tab === 'screen' ? list[0] || null : null;
+  // The resolution follows the source until the user picks one: 1440p for a source 1440
+  // tall or more, 1080p from 1080, else 720p.
+  if (!g.resPicked && g.pick && g.pick.h > 0) g.res = g.pick.h >= 1440 ? '1440' : g.pick.h >= 1080 ? '1080' : '720';
   const shot = (id) => g.thumbs[`${g.tab}:${id}`] || {};
   $('gl-sources').replaceChildren(...list.map((x) => el('button', { type: 'button', class: 'source', 'aria-pressed': String(g.pick?.id === x.id), 'data-src': x.id, onclick: () => { g.pick = x; renderGoLive(); } },
     el('span', { class: 'shot' }, shot(x.id).image ? el('img', { src: shot(x.id).image, alt: '' }) : el('span', { class: 'small', text: x.minimized ? t('golive.minimized') : '' })),
@@ -577,7 +580,7 @@ function renderGoLive() {
     el('span', { class: 'small', text: x.sub }))));
   $('gl-audio-app').classList.toggle('hidden', g.tab !== 'window');
   if (g.tab !== 'window' && document.querySelector('input[name=audio]:checked')?.value === 'app') document.querySelector('input[name=audio][value=system]').checked = true;
-  seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; renderGoLive(); });
+  seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; g.resPicked = true; renderGoLive(); });
   seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
   seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
   // Only codecs this machine encodes in hardware; AV1 needs a recent GPU.
