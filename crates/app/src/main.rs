@@ -19,6 +19,14 @@ struct App {
     sampler: sampler::Sampler,
 }
 
+impl App {
+    /// A message for the UI, also written to the log.
+    fn notify(&self, msg: String) {
+        eprintln!("notice: {msg}");
+        *self.notice.lock().unwrap() = Some(msg);
+    }
+}
+
 #[derive(Serialize)]
 struct PeerView {
     id: u64,
@@ -65,7 +73,7 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
 
 #[tauri::command]
 fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, name: String) -> Result<(), String> {
-    do_connect(app.inner(), &server, &room, &name)
+    do_connect(app.inner(), &server, &room, &name).inspect_err(|e| eprintln!("connect failed: {e}"))
 }
 
 fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str) -> Result<(), String> {
@@ -79,10 +87,10 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str) -> Result<()
     std::thread::spawn(move || {
         while let Ok(e) = events.recv() {
             match e {
-                Event::WatchEnded { reason, .. } => *a.notice.lock().unwrap() = Some(format!("watch_ended:{reason}")),
-                Event::Error(m) => *a.notice.lock().unwrap() = Some(format!("error:{m}")),
+                Event::WatchEnded { reason, .. } => a.notify(format!("watch_ended:{reason}")),
+                Event::Error(m) => a.notify(format!("error:{m}")),
                 Event::Lost => {
-                    *a.notice.lock().unwrap() = Some("lost".into());
+                    a.notify("lost".into());
                     *a.session.lock().unwrap() = None;
                     break;
                 }
@@ -233,7 +241,7 @@ struct GoLive {
 
 #[tauri::command]
 fn go_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(), String> {
-    do_go_live(app.inner(), req)
+    do_go_live(app.inner(), req).inspect_err(|e| eprintln!("go_live failed: {e}"))
 }
 
 fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
@@ -267,7 +275,7 @@ fn end_live(app: tauri::State<'_, Arc<App>>) {
 #[tauri::command]
 fn watch(app: tauri::State<'_, Arc<App>>, streamer: u64, quality: Option<String>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
-    s.watch(streamer, ViewerConfig::default(), quality)?;
+    s.watch(streamer, ViewerConfig::default(), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
     Ok(())
 }
 
@@ -301,7 +309,7 @@ fn automate(app: &Arc<App>) {
             return;
         }
         if let Err(e) = do_connect(&app, p[0], p[1], p[2]) {
-            *app.notice.lock().unwrap() = Some(format!("error:{e}"));
+            app.notify(format!("error:{e}"));
             return;
         }
         if let Ok(live) = std::env::var("STREAMER_APP_AUTOLIVE") {
@@ -315,7 +323,7 @@ fn automate(app: &Arc<App>) {
             };
             let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000) };
             if let Err(e) = do_go_live(&app, req) {
-                *app.notice.lock().unwrap() = Some(format!("error:{e}"));
+                app.notify(format!("error:{e}"));
             }
         }
         if let Ok(w) = std::env::var("STREAMER_APP_AUTOWATCH") {
@@ -331,7 +339,7 @@ fn automate(app: &Arc<App>) {
                         let Some(p) = s.peers().into_iter().find(|p| p.streaming && &p.name == name && p.id != s.id) else { return true };
                         match s.watch(p.id, ViewerConfig::default(), quality.clone()) {
                             Ok(w) => test_window_actions(w.viewer.window),
-                            Err(e) => *app.notice.lock().unwrap() = Some(format!("error:{e}")),
+                            Err(e) => app.notify(format!("error:{e}")),
                         }
                         false
                     });
