@@ -78,7 +78,7 @@ impl Viewer {
             }
             None
         });
-        let relay = (cfg.loss_pct > 0.0).then(|| crate::netsim::LossRelay::start(cfg.loss_pct));
+        let relay = cfg.impair.active().then(|| crate::netsim::LossRelay::start(cfg.impair));
         let (l, r) = (link.clone(), relay.clone());
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
@@ -155,6 +155,9 @@ impl Viewer {
             return None;
         }
         let reply = promise.get_reply()?;
+        if std::env::var_os("STREAMER_DEBUG_STATS").is_some() {
+            eprintln!("stats reply {reply}");
+        }
         let num = |s: &gst::StructureRef, f: &str| {
             s.get::<u64>(f)
                 .map(|v| v as i64)

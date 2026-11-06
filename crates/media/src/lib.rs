@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod host;
 pub mod ice;
+pub mod marker;
 pub mod netsim;
 pub mod platform;
 pub mod server_client;
@@ -26,11 +27,20 @@ pub fn init() {
 pub(crate) fn drain_bus(pipeline: &gst::Pipeline, label: &'static str) {
     use gst::prelude::*;
     let bus = pipeline.bus().expect("pipeline has a bus");
+    let weak = pipeline.downgrade();
     std::thread::Builder::new()
         .name(format!("{label}-bus"))
         .spawn(move || {
             for msg in bus.iter_timed(gst::ClockTime::NONE) {
                 match msg.view() {
+                    // Branches added at runtime change the latency. Without recalculating
+                    // it, rtpsession cannot map packets to running time, sends no sender
+                    // reports, and the viewers' receiver reports carry no round-trip time.
+                    gst::MessageView::Latency(_) if std::env::var_os("STREAMER_DEBUG_NO_LATENCY").is_none() => {
+                        if let Some(p) = weak.upgrade() {
+                            let _ = p.recalculate_latency();
+                        }
+                    }
                     gst::MessageView::Error(e) => {
                         eprintln!("{label}: error from {:?}: {} ({:?})", e.src().map(|s| s.name()), e.error(), e.debug())
                     }

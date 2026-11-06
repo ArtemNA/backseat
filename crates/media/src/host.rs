@@ -221,7 +221,13 @@ impl Host {
                 w.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
                 if promise.wait() == gst::PromiseResult::Replied {
                     if let Some(reply) = promise.get_reply() {
+                        if std::env::var_os("STREAMER_DEBUG_STATS").is_some() {
+                            eprintln!("stats reply {reply}");
+                        }
                         for s in reply.iter().filter_map(|(_, v)| v.get::<gst::Structure>().ok()) {
+                            if std::env::var_os("STREAMER_DEBUG_STATS").is_some() {
+                                eprintln!("stats {s}");
+                            }
                             let kind = s.get::<&str>("kind").unwrap_or("video");
                             if kind != "video" {
                                 continue;

@@ -217,6 +217,7 @@ fn main() {
         )
     };
     let mut last = load();
+    let mut marker = media::marker::Marker::default();
     while !gone.load(Ordering::SeqCst) && (args.seconds == 0 || started.elapsed().as_secs() < args.seconds) {
         std::thread::sleep(Duration::from_secs(args.report_secs));
         let now = load();
@@ -241,7 +242,12 @@ fn main() {
             s.key_requests_dropped.load(Ordering::Relaxed),
         );
         for q in host.viewer_quality() {
-            let mark = if q.fraction_lost > 0.02 { "  <- PROBLEMS" } else { "" };
+            let problems = marker.assess(&q);
+            let mark = if problems.is_empty() {
+                String::new()
+            } else {
+                format!("  <- PROBLEMS: {}", problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+            };
             println!(
                 "host   viewer {} | lost {:.1}% | rtt {:.1} ms | nack {} | pli {} | rtx requests {} resent {}{mark}",
                 q.id,

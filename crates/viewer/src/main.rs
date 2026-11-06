@@ -42,7 +42,7 @@ fn main() {
             decoder: None,
             audio_sync: true,
             headless: false,
-            loss_pct: 0.0,
+            impair: Default::default(),
             ice: media::config::IceConfig::default(),
         };
     let (mut seconds, mut report_secs) = (0u64, 5u64);
@@ -95,7 +95,11 @@ fn main() {
                     }
                     "--latency" => val.parse().map(|v| cfg.latency_ms = v).is_ok(),
                     // Test only: drop this percentage of the host's RTP packets.
-                    "--debug-loss" => val.parse().map(|v| cfg.loss_pct = v).is_ok(),
+                    "--debug-loss" => val.parse().map(|v| cfg.impair.loss_pct = v).is_ok(),
+                    // Test only: squeeze the host's traffic through a link of this many kbit/s.
+                    "--debug-cap-kbit" => val.parse().map(|v| cfg.impair.cap_kbit = v).is_ok(),
+                    // Test only: add this one-way delay to the host's traffic, in ms.
+                    "--debug-delay" => val.parse().map(|v| cfg.impair.delay_ms = v).is_ok(),
                     "--decoder" => {
                         cfg.decoder = Some(val.clone());
                         true
@@ -260,13 +264,20 @@ fn main() {
             clock.best_rtt_ns().map(|r| r as f64 / 2e6).unwrap_or(f64::NAN),
         );
         if let Some(i) = viewer.inbound() {
-            let (dropped, forwarded) = viewer
+            let (dropped, forwarded, overflow, max_queue_ms) = viewer
                 .relay
                 .as_ref()
-                .map(|r| (r.dropped.load(Ordering::Relaxed), r.forwarded.load(Ordering::Relaxed)))
-                .unwrap_or((0, 0));
+                .map(|r| {
+                    (
+                        r.dropped.load(Ordering::Relaxed),
+                        r.forwarded.load(Ordering::Relaxed),
+                        r.overflow.load(Ordering::Relaxed),
+                        r.max_queue_us.swap(0, Ordering::Relaxed) as f64 / 1000.0,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0.0));
             println!(
-                "viewer rtp | received {} lost {} repaired {} nack {} pli {} | test relay dropped {} of {}",
+                "viewer rtp | received {} lost {} repaired {} nack {} pli {} | test relay dropped {} of {} overflow {} queue max {:.0} ms",
                 i.received,
                 i.lost,
                 i.repaired,
@@ -274,6 +285,8 @@ fn main() {
                 i.pli,
                 dropped,
                 dropped + forwarded,
+                overflow,
+                max_queue_ms,
             );
         }
         if let Some(r) = viewer.render_report() {
