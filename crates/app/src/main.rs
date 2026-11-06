@@ -118,11 +118,19 @@ async fn connect(app: tauri::State<'_, Arc<App>>, server: String, room: String, 
 
 /// `title` names the room if it is new (a room made here, with its invite code as `room`).
 fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Option<&str>) -> Result<(), String> {
+    // One join at a time. Connect runs off the main thread, so an invite link arriving twice
+    // (the page opens the app, and the user also presses its button) joined twice and left
+    // both connections alive: the same person twice in the room.
+    static JOINING: Mutex<()> = Mutex::new(());
+    let _one = JOINING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = app.session.lock().unwrap().take() {
         old.leave();
     }
     let (s, events) = Session::join_titled(server, room, name, title)?;
-    *app.session.lock().unwrap() = Some(s.clone());
+    // Whatever got in meanwhile leaves.
+    if let Some(other) = app.session.lock().unwrap().replace(s.clone()) {
+        other.leave();
+    }
     app.sampler.attach(s.clone());
     let a = app.clone();
     std::thread::spawn(move || {
@@ -565,9 +573,26 @@ fn main() {
         // Runs before any other thread starts.
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", std::env::temp_dir().join("backseat-test-webview"));
     }
-    if !testing && media::instance::send_to_running(&link_arg().unwrap_or_else(|| "show".into())) {
-        return;
-    }
+    // The pipe is claimed before anything else, so of two starts at once exactly one runs.
+    let claim = if testing {
+        None
+    } else {
+        match media::instance::claim() {
+            Some(c) => Some(c),
+            None => {
+                // Another start holds the pipe: hand it this one's link and leave. Even if it
+                // does not answer in time, leave: a second app would join the room twice.
+                if media::instance::send_to_running(&link_arg().unwrap_or_else(|| "show".into())) {
+                    return;
+                }
+                // The other app may have just quit; then this one runs.
+                match media::instance::claim() {
+                    Some(c) => Some(c),
+                    None => return,
+                }
+            }
+        }
+    };
     if let Some(p) = media::logfile::start() {
         eprintln!("log file: {}", p.display());
     }
@@ -575,9 +600,9 @@ fn main() {
     media::logfile::gst_warnings();
     let app = Arc::new(App::default());
     *app.link.lock().unwrap() = link_arg();
-    if !testing {
+    if let Some(claim) = claim {
         let a = app.clone();
-        media::instance::listen(move |msg| {
+        media::instance::listen(claim, move |msg| {
             let msg = msg.trim().to_string();
             eprintln!("instance: a later start sent {}", if msg.starts_with("backseat://") { "a link" } else { "show" });
             if msg.starts_with("backseat://") {

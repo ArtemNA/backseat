@@ -141,6 +141,10 @@ function inviteLink(r) {
 async function handleLink(link) {
   const code = parseCode(link);
   if (!code) return;
+  // The same link twice (the page opened the app and the button was pressed too): once.
+  if ((state.current && state.current.room === code) || state.linkBusy === code) return;
+  state.linkBusy = code;
+  setTimeout(() => { if (state.linkBusy === code) state.linkBusy = null; }, 10000);
   const known = savedRooms().find((x) => x.room === code);
   if (known) { if (!sameRoom(known, state.current)) await switchRoom(known); return; }
   const fixed = await invoke('built_in_server');

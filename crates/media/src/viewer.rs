@@ -506,6 +506,14 @@ fn add_video(
     }
     if std::env::var_os("STREAMER_DEBUG_DECODER").is_some() {
         eprintln!("viewer: video decoder {decoder_name}");
+        decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+            if let Some(gst::EventView::Caps(c)) = info.event().map(|e| e.view()) {
+                if let Some(s) = c.caps().structure(0) {
+                    eprintln!("viewer: decoded frames {}x{}", s.get::<i32>("width").unwrap_or(0), s.get::<i32>("height").unwrap_or(0));
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
     }
     chain.extend(tail?);
     link_branch(pipeline, pad, &chain)?;

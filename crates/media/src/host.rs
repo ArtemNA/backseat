@@ -234,6 +234,35 @@ impl Host {
         })
     }
 
+    /// The encoded width for a quality: its height times the source's shape, even, at most
+    /// 4096 (AMD's limit). Modes are named by height; a 21:9 screen at 1440p stays
+    /// 3440x1440 instead of being squeezed into 2560x1440. A 16:9 or unknown source gives
+    /// the mode's own width.
+    fn layer_width(&self, q: Quality) -> u32 {
+        let src = self
+            .pipeline
+            .by_name("srctee")
+            .and_then(|t| t.static_pad("sink"))
+            .and_then(|p| p.current_caps())
+            .and_then(|c| {
+                let s = c.structure(0)?;
+                Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
+            });
+        // Before the first frame the tee has no caps yet: take the size from the source.
+        let src = src.or_else(|| source_size(&self.cfg.source));
+        let w = match src {
+            Some((sw, sh)) if sw > 0 && sh > 0 => {
+                let exact = q.height as f64 * sw as f64 / sh as f64;
+                ((exact / 2.0).round() as u32 * 2).clamp(2, 4096)
+            }
+            _ => q.width,
+        };
+        if std::env::var_os("STREAMER_DEBUG_LAYER_SIZE").is_some() {
+            eprintln!("layer {q}: source {src:?} -> encoded {w}x{}", q.height);
+        }
+        w
+    }
+
     /// Builds the encoder chain for one quality and starts it with the pipeline.
     fn make_layer(&self, q: Quality) -> Result<Layer, String> {
         let c = self.cfg.codec.short();
@@ -245,7 +274,7 @@ impl Host {
              d3d11convert ! capsfilter name=vsize caps=\"video/x-raw(memory:D3D11Memory),format=NV12,width={w},height={h}\" ! \
              {enc} name=venc {props} ! {parse} ! \
              tee name=ltee allow-not-linked=true",
-            w = q.width,
+            w = self.layer_width(q),
             h = q.height,
             enc = self.encoder,
             props = platform::encoder_properties(self.kind, self.cfg.codec, q.kbit, q.fps, q.fps * self.cfg.keyframe_secs),
@@ -786,6 +815,24 @@ impl Host {
 /// Probe for viewer-chosen modes: STREAMER_DEBUG_SWITCH_SECS=N alternates the encoded size
 /// between the mode and 1280x720 every N seconds, so decoders meet a new resolution mid-stream
 /// exactly as when a viewer moves to another encoder.
+/// The captured size of a screen or window source, as far as it is known before capture
+/// starts; None for test sources (they are made at the mode's size).
+fn source_size(source: &Source) -> Option<(i32, i32)> {
+    let monitor = |pick: &dyn Fn(&platform::MonitorInfo) -> bool| {
+        platform::monitors().into_iter().find(|m| pick(m)).map(|m| (m.width as i32, m.height as i32))
+    };
+    match source {
+        Source::Monitor { handle } => monitor(&|m| m.handle == *handle),
+        Source::Capture { monitor: i } if *i < 0 => monitor(&|m| m.primary),
+        Source::Capture { monitor: i } => platform::monitors().into_iter().nth(*i as usize).map(|m| (m.width as i32, m.height as i32)),
+        Source::Window { hwnd } => platform::windows()
+            .into_iter()
+            .find(|w| w.hwnd == *hwnd && w.width > 0 && w.height > 0)
+            .map(|w| (w.width as i32, w.height as i32)),
+        _ => None,
+    }
+}
+
 fn debug_switch_size(layer: &gst::Bin, w: u32, h: u32) {
     let Some(secs) = std::env::var("STREAMER_DEBUG_SWITCH_SECS").ok().and_then(|v| v.parse::<u64>().ok()) else {
         return;
