@@ -497,6 +497,29 @@ fn add_audio(
         sink.set_property("buffer-time", 40_000i64);
         sink.set_property("latency-time", 10_000i64);
     }
+    // Test only: STREAMER_DEBUG_AUDIO_LEVEL prints the received level once a second and plays
+    // nothing, to check what the host captured without recording it.
+    let debug_level = std::env::var_os("STREAMER_DEBUG_AUDIO_LEVEL").is_some();
+    let sink = if debug_level { make("fakesink")? } else { sink };
+    if debug_level {
+        let acc = std::sync::Mutex::new((0f64, 0u64, Instant::now()));
+        decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) else { return gst::PadProbeReturn::Ok };
+            // opusdec gives interleaved S16LE.
+            let mut a = acc.lock().unwrap();
+            for s in map.as_slice().chunks_exact(2) {
+                let v = i16::from_le_bytes([s[0], s[1]]) as f64 / 32768.0;
+                a.0 += v * v;
+                a.1 += 1;
+            }
+            if a.2.elapsed() >= std::time::Duration::from_secs(1) && a.1 > 0 {
+                let rms = (a.0 / a.1 as f64).sqrt();
+                eprintln!("audio level: {:.1} dB", 20.0 * rms.max(1e-9).log10());
+                *a = (0.0, 0, Instant::now());
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
     let chain = vec![depay.clone(), decoder.clone(), make("audioconvert")?, make("audioresample")?, sink];
     link_branch(pipeline, pad, &chain)?;
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
