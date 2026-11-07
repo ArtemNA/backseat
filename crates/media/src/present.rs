@@ -115,6 +115,17 @@ impl Window {
     }
 
     /// Whether the window still exists.
+    /// Places the video where it already is (tests: the UI's `place` calls).
+    pub fn place_again(&self) {
+        self.update(|_| ());
+    }
+
+    pub fn set_audio_handler(&self, handler: AudioHandler) {
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
+            st.audio = Some(handler);
+        }
+    }
+
     pub fn alive(&self) -> bool {
         WINDOWS.lock().unwrap().contains_key(&self.hwnd)
     }
@@ -205,6 +216,104 @@ struct WinState {
     hidden: bool,
     /// Fullscreen was entered from inside the main window: go back there on exit.
     fs_from_embedded: bool,
+    /// Sets and reads the stream's sound for the controls drawn over the video.
+    audio: Option<AudioHandler>,
+    /// The controls show until then (the mouse moved).
+    controls_until: Option<std::time::Instant>,
+    /// The volume bar is being dragged.
+    dragging: bool,
+}
+
+/// Sets mute and/or volume (0..1) when given and returns both as they now are.
+pub type AudioHandler = Arc<dyn Fn(Option<bool>, Option<f32>) -> (bool, f32) + Send + Sync>;
+
+/// How long the controls stay after the mouse stops.
+const CONTROLS_FOR: std::time::Duration = std::time::Duration::from_millis(2500);
+
+unsafe fn hide_controls(hwnd: HWND) {
+    if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+        st.controls_until = None;
+    }
+}
+
+/// The controls' look while they show.
+fn controls_of(hwnd: HWND) -> Option<crate::controls::Look> {
+    let (audio, fullscreen) = {
+        let map = WINDOWS.lock().unwrap();
+        let st = map.get(&(hwnd.0 as isize))?;
+        if !st.dragging && st.controls_until.is_none_or(|t| t < std::time::Instant::now()) {
+            return None;
+        }
+        (st.audio.clone()?, st.fullscreen.is_some())
+    };
+    let (muted, volume) = audio(None, None);
+    Some(crate::controls::Look { muted, volume, fullscreen })
+}
+
+/// The client size and DPI scale of a window.
+unsafe fn client_and_scale(hwnd: HWND) -> ((u32, u32), f32) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    (((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32), GetDpiForWindow(hwnd).max(96) as f32 / 96.0)
+}
+
+/// Mouse input for the controls. True when it was theirs.
+unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
+    use crate::controls::Hit;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+    let (x, y) = ((l.0 & 0xFFFF) as i16 as i32, ((l.0 >> 16) & 0xFFFF) as i16 as i32);
+    let (audio, showing, dragging) = {
+        let mut map = WINDOWS.lock().unwrap();
+        let Some(st) = map.get_mut(&(hwnd.0 as isize)) else { return false };
+        let showing = st.controls_until.is_some_and(|t| t > std::time::Instant::now());
+        if msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL {
+            st.controls_until = Some(std::time::Instant::now() + CONTROLS_FOR);
+        }
+        if msg == WM_LBUTTONUP {
+            st.dragging = false;
+        }
+        (st.audio.clone(), showing, st.dragging)
+    };
+    let Some(audio) = audio else { return false };
+    let (size, scale) = client_and_scale(hwnd);
+    match msg {
+        WM_MOUSEWHEEL => {
+            let notches = ((w.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+            let (_, v) = audio(None, None);
+            audio(Some(false), Some(v + notches * 0.05));
+            true
+        }
+        WM_MOUSEMOVE if dragging => {
+            audio(Some(false), Some(crate::controls::bar_level(size, scale, x)));
+            true
+        }
+        WM_LBUTTONUP if dragging => {
+            let _ = ReleaseCapture();
+            true
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if showing => match crate::controls::hit(size, scale, x, y) {
+            Hit::Mute => {
+                let (m, _) = audio(None, None);
+                audio(Some(!m), None);
+                true
+            }
+            Hit::Bar(level) => {
+                audio(Some(false), Some(level));
+                if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                    st.dragging = true;
+                }
+                SetCapture(hwnd);
+                true
+            }
+            Hit::Fullscreen => {
+                fullscreen(hwnd, 2);
+                true
+            }
+            Hit::Panel => true,
+            Hit::Outside => false,
+        },
+        _ => false,
+    }
 }
 
 /// The overlay text and its version while the overlay is on.
@@ -265,8 +374,9 @@ unsafe fn apply_place(hwnd: HWND) {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
-    } else if is_child {
-        // Out into its own window, near the main window, 1280x720 of picture.
+    } else if is_child || GetWindowLongW(hwnd, GWL_STYLE) & WS_POPUP.0 as i32 != 0 {
+        // Out into its own window, near the main window, 1280x720 of picture (also when
+        // it was popped out while fullscreen from inside the app).
         let _ = SetParent(hwnd, None);
         SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
         let mut pr = RECT::default();
@@ -324,7 +434,9 @@ unsafe fn paint_status(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn fullscreen(hwnd: HWND, mode: usize) {
+/// The fullscreen switch before the fix: holds the state lock across the Win32 calls.
+/// STREAMER_DEBUG_FS_OLD selects it; the spoiled variant for the fullscreen gate.
+unsafe fn fullscreen_old(hwnd: HWND, mode: usize) {
     let mut map = WINDOWS.lock().unwrap();
     let Some(st) = map.get_mut(&(hwnd.0 as isize)) else { return };
     let on = match mode {
@@ -336,7 +448,6 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         return;
     }
     if on {
-        // From inside the main window: become a window of its own first.
         let embedded = st.parent != 0 && !st.popped;
         st.fs_from_embedded = embedded;
         if embedded {
@@ -355,7 +466,6 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
         st.fullscreen = Some((place, style));
     } else if st.fs_from_embedded {
-        // Back into its place in the main window.
         st.fullscreen = None;
         st.fs_from_embedded = false;
         drop(map);
@@ -365,6 +475,76 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         let _ = SetWindowPlacement(hwnd, &place);
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
+}
+/// Fullscreen on (1), off (0) or toggled (2). Like `apply_place`, never holds the state lock
+/// while calling into Win32: taking an embedded video out of the main window sends messages
+/// to the main window's thread, and that thread takes the lock for every `place` call. Held
+/// across those calls, the lock froze both the app and the video (found going in and out
+/// of fullscreen several times while watching).
+unsafe fn fullscreen(hwnd: HWND, mode: usize) {
+    if std::env::var_os("STREAMER_DEBUG_FS_OLD").is_some() {
+        return fullscreen_old(hwnd, mode);
+    }
+    let (on, embedded) = {
+        let map = WINDOWS.lock().unwrap();
+        let Some(st) = map.get(&(hwnd.0 as isize)) else { return };
+        let on = match mode {
+            0 => false,
+            1 => true,
+            _ => st.fullscreen.is_none(),
+        };
+        if on == st.fullscreen.is_some() {
+            return;
+        }
+        (on, st.parent != 0 && !st.popped)
+    };
+    if on {
+        // Marked first, so a `place` arriving meanwhile leaves the window alone.
+        let mark = |f: &mut WinState| {
+            f.fullscreen = Some((WINDOWPLACEMENT::default(), 0));
+            f.fs_from_embedded = embedded;
+        };
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+            mark(st);
+        }
+        // From inside the main window: become a window of its own first.
+        if embedded {
+            SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
+            let _ = SetParent(hwnd, None);
+        }
+        let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        let _ = GetWindowPlacement(hwnd, &mut place);
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        let r = mi.rcMonitor;
+        SetWindowLongW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as i32)) | WS_POPUP.0 as i32);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+        if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+            st.fullscreen = Some((place, style));
+        }
+    } else {
+        let (from_embedded, saved) = {
+            let mut map = WINDOWS.lock().unwrap();
+            let Some(st) = map.get_mut(&(hwnd.0 as isize)) else { return };
+            let from = std::mem::take(&mut st.fs_from_embedded);
+            (from, st.fullscreen.take())
+        };
+        if from_embedded {
+            // Back into its place in the main window (or a window of its own if it was
+            // popped out meanwhile).
+            apply_place(hwnd);
+        } else if let Some((place, style)) = saved {
+            SetWindowLongW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPlacement(hwnd, &place);
+            let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+            // Put back into the app meanwhile: go there now.
+            apply_place(hwnd);
+        }
+    }
+    hide_controls(hwnd);
 }
 
 #[derive(Default)]
@@ -436,6 +616,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                 apply_place(hwnd);
                 LRESULT(0)
             }
+            WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONUP if controls_mouse(hwnd, msg, w, l) => LRESULT(0),
+            WM_MOUSEMOVE | WM_LBUTTONUP => DefWindowProcW(hwnd, msg, w, l),
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if controls_mouse(hwnd, msg, w, l) => LRESULT(0),
             WM_LBUTTONDOWN => {
                 // Inside the main window, a click gives the video the keys (F11, Esc, F3).
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
@@ -673,6 +856,9 @@ unsafe fn run(
             popped: false,
             hidden: false,
             fs_from_embedded: false,
+            audio: None,
+            controls_until: None,
+            dragging: false,
         },
     );
 
@@ -710,6 +896,7 @@ unsafe fn run(
     let mut applied = (0u32, 0u32);
     let mut pending = ((0u32, 0u32), std::time::Instant::now());
     let mut overlay: Option<crate::overlay::Overlay> = None;
+    let mut controls: Option<crate::controls::Controls> = None;
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -843,6 +1030,18 @@ unsafe fn run(
             }
             if let Some(o) = overlay.as_mut() {
                 o.draw(&pcontext, &back, size, version, &text);
+            }
+        }
+        if let Some(look) = controls_of(hwnd) {
+            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            if controls.as_ref().is_some_and(|c| c.scale() != scale) {
+                controls = None;
+            }
+            if controls.is_none() {
+                controls = crate::controls::Controls::new(&pdevice, scale).map_err(|e| eprintln!("controls: {e}")).ok();
+            }
+            if let Some(c) = controls.as_mut() {
+                c.draw(&pcontext, &back, size, look);
             }
         }
         drop(back);

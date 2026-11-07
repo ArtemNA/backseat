@@ -59,7 +59,7 @@ pub struct Viewer {
     /// request to watch, so the network was never tried.
     pub offered: Arc<std::sync::atomic::AtomicBool>,
     /// Sound off for this stream (the stream itself keeps coming).
-    muted: Arc<std::sync::atomic::AtomicBool>,
+    audio: Arc<Audio>,
     /// The video codec and the decoder in use ("AV1", "dav1ddec"), once video arrives.
     pub video_codec: Arc<Mutex<Option<(String, String)>>>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
@@ -162,14 +162,31 @@ impl Viewer {
         let started = Instant::now();
         let pipeline_weak = pipeline.downgrade();
         let (stats2, cfg2) = (stats.clone(), cfg.clone());
-        let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let muted2 = muted.clone();
+        let audio = Arc::new(Audio::default());
+        let audio2 = audio.clone();
         let video_codec: Arc<Mutex<Option<(String, String)>>> = Arc::default();
         let video_codec2 = video_codec.clone();
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         #[cfg(windows)]
         let window = renderer.as_ref().map(|r| r.window);
+        #[cfg(windows)]
+        if let Some(w) = &window {
+            // The video window's own sound controls (fullscreen, popped out) act here.
+            let (a, p) = (audio.clone(), pipeline.downgrade());
+            w.set_audio_handler(Arc::new(move |muted, volume| {
+                if let Some(m) = muted {
+                    a.muted.store(m, Ordering::SeqCst);
+                }
+                if let Some(v) = volume {
+                    a.volume.store((v.clamp(0.0, 1.0) * 100.0).round() as u32, Ordering::SeqCst);
+                }
+                if let Some(p) = p.upgrade() {
+                    a.apply(&p);
+                }
+                (a.muted.load(Ordering::SeqCst), a.volume.load(Ordering::SeqCst) as f32 / 100.0)
+            }));
+        }
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
@@ -192,7 +209,7 @@ impl Viewer {
                     }
                     add_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, tail)
                 }
-                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, muted2.load(Ordering::SeqCst)),
+                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, &audio2),
                 _ => add_fakesink(&pipeline, pad),
             };
             if let Err(e) = result {
@@ -213,7 +230,7 @@ impl Viewer {
             relay,
             ice_failed: failed,
             offered,
-            muted,
+            audio,
             video_codec,
             jitterbuffers,
             lag,
@@ -295,7 +312,7 @@ impl Viewer {
 
     /// Turns this stream's sound off or on, now and for an audio branch made later.
     pub fn set_muted(&self, on: bool) {
-        self.muted.store(on, Ordering::SeqCst);
+        self.audio.muted.store(on, Ordering::SeqCst);
         match self.pipeline.by_name(AUDIO_VOLUME) {
             Some(v) => v.set_property("mute", on),
             None => eprintln!("viewer: no audio branch to mute yet"),
@@ -303,7 +320,12 @@ impl Viewer {
     }
 
     pub fn muted(&self) -> bool {
-        self.muted.load(Ordering::SeqCst)
+        self.audio.muted.load(Ordering::SeqCst)
+    }
+
+    /// Sound level, 0..1 (1: as received).
+    pub fn volume(&self) -> f32 {
+        self.audio.volume.load(Ordering::SeqCst) as f32 / 100.0
     }
 
     pub fn window_closed(&self) -> bool {
@@ -534,8 +556,29 @@ fn add_video(
     Ok(())
 }
 
-/// The element that mutes a viewer's sound.
+/// The element that mutes a viewer's sound and sets its level.
 const AUDIO_VOLUME: &str = "avolume";
+
+/// A viewer's sound: muted and level in percent, kept for an audio branch made later.
+struct Audio {
+    muted: std::sync::atomic::AtomicBool,
+    volume: std::sync::atomic::AtomicU32,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self { muted: false.into(), volume: 100.into() }
+    }
+}
+
+impl Audio {
+    fn apply(&self, pipeline: &gst::Pipeline) {
+        if let Some(v) = pipeline.by_name(AUDIO_VOLUME) {
+            v.set_property("mute", self.muted.load(Ordering::SeqCst));
+            v.set_property("volume", self.volume.load(Ordering::SeqCst) as f64 / 100.0);
+        }
+    }
+}
 
 fn add_audio(
     pipeline: &gst::Pipeline,
@@ -544,7 +587,7 @@ fn add_audio(
     stats: &ViewerStats,
     started: Instant,
     audio_sync: bool,
-    muted: bool,
+    audio: &Audio,
 ) -> Result<(), String> {
     let depay = make("rtpopusdepay")?;
     let decoder = make("opusdec")?;
@@ -555,7 +598,8 @@ fn add_audio(
     // see change. The stream keeps coming, so unmuting is instant and stays in sync.
     let volume = make("volume")?;
     volume.set_property("name", AUDIO_VOLUME);
-    volume.set_property("mute", muted);
+    volume.set_property("mute", audio.muted.load(Ordering::SeqCst));
+    volume.set_property("volume", audio.volume.load(Ordering::SeqCst) as f64 / 100.0);
     // With sync the sink follows the stream timing and corrects clock drift between the
     // machines; without it audio piles up in front of the device (stage 1 on macOS: ~300 ms).
     sink.set_property("sync", audio_sync);

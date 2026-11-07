@@ -526,6 +526,38 @@ fn automate(app: &Arc<App>) {
 fn test_window_actions(w: Option<media::present::Window>) {
     let (Some(w), Some(mode)) = (w, std::env::var("STREAMER_APP_AUTOWINDOW").ok()) else { return };
     // "embed": pop out at +6 s, back in at +12 s, fullscreen at +18 s, back at +24 s.
+    // "fsloop": from +5 s, fullscreen on and off 30 times at uneven intervals while the main
+    // thread keeps placing the video (as the UI does while it lays out), then stays embedded.
+    if mode == "fsloop" {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let spam = {
+                let (stop, w) = (stop.clone(), w);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(h) = APP_HANDLE.get() {
+                            let _ = h.run_on_main_thread(move || {
+                                let st = w.state();
+                                let _ = st;
+                                w.place_again();
+                            });
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                })
+            };
+            for i in 0..30u64 {
+                w.toggle_fullscreen();
+                std::thread::sleep(std::time::Duration::from_millis(150 + (i * 137) % 700));
+            }
+            w.set_fullscreen(false);
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = spam.join();
+            eprintln!("test: fsloop done");
+        });
+        return;
+    }
     if mode == "embed" {
         std::thread::spawn(move || {
             let step = |secs| std::thread::sleep(std::time::Duration::from_secs(secs));

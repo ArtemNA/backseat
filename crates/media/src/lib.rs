@@ -19,6 +19,8 @@ pub mod thumbs;
 pub mod viewer;
 
 #[cfg(windows)]
+mod controls;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 pub mod present;
