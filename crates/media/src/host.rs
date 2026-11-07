@@ -121,6 +121,11 @@ struct Branch {
 }
 
 fn video_source(cfg: &HostConfig) -> String {
+    // Test only: STREAMER_DEBUG_SOURCE replaces the capture with any pipeline description
+    // that ends in D3D11 memory (e.g. a raw clip from disk played in real time).
+    if let Ok(desc) = std::env::var("STREAMER_DEBUG_SOURCE") {
+        return desc;
+    }
     let m = cfg.mode;
     match cfg.source {
         Source::Capture { monitor } => format!(
