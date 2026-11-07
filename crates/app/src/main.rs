@@ -119,6 +119,12 @@ fn updates_enabled() -> bool {
     on
 }
 
+/// Tests only: STREAMER_APP_TEST_SETTINGS=general|updates opens the settings at start.
+#[tauri::command]
+fn test_open_settings() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_SETTINGS").ok()
+}
+
 #[tauri::command]
 fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -807,7 +813,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

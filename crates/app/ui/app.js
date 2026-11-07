@@ -818,6 +818,7 @@ invoke('test_rooms').then((other) => {
     }, 5000);
   }, 5000);
 });
+invoke('test_open_settings').then((tab) => { if (tab) setTimeout(() => openSettings(tab), 2500); });
 invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
 fillLanguages();

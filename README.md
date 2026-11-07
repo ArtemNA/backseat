@@ -29,6 +29,11 @@ own window.
   sound.
 - **Low latency**: lost packets are repaired by retransmission, and the viewer shows the
   measured latency in its stats.
+- **Change a stream while live**: switch the screen or window, resolution, frame rate or
+  bitrate without viewers reconnecting.
+- **Sound controls on the video**, also in fullscreen: mute, volume (mouse wheel too).
+- **Tray and updates**: closing the window keeps Backseat in the tray; new versions from
+  GitHub Releases are installed at start (can be turned off in Settings).
 - **English, Ukrainian and Russian** interface; it follows the system language.
 
 ## Requirements
