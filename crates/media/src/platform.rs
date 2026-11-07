@@ -105,16 +105,22 @@ pub fn encodable_codecs() -> Vec<Codec> {
 /// Low-latency CBR settings without B-frames, per encoder family.
 pub fn encoder_properties(kind: EncoderKind, codec: Codec, kbit: u32, fps: u32, gop: u32) -> String {
     match kind {
-        // Sunshine-like: ultra-low-latency, CBR, VBV of one frame, no reordering.
+        // Sunshine-like: ultra-low-latency, CBR, no reordering. VBV of 8 frames, not one: with
+        // one frame every periodic keyframe got almost no bits (PSNR-Y 33.6 -> 26.1 dB at
+        // 6 Mbit/s, blur every 2 s for 30+ frames) and H.265 overshot its rate by 13-34%.
+        // 8 frames: +0.2 dB H.265, +0.5 dB AV1 at equal rate, rate on target, encoder
+        // latency unchanged; keyframes grow to ~0.7 Mbit (docs/research/quality-low-bitrate.md).
+        // STREAMER_DEBUG_VBV_FRAMES overrides it (1: the old setting, for A/B runs).
         // The element multiplies its kbit value by 1024, so convert to get 1000-based kbit/s.
         EncoderKind::Nvenc => {
             let k = (kbit as u64 * 1000 / 1024) as u32;
+            let vbv_frames: u32 = std::env::var("STREAMER_DEBUG_VBV_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
             // AV1 repeats its sequence header with every key frame and has no AUDs.
             let h26x = if codec == Codec::Av1 { "" } else { " repeat-sequence-header=true aud=false" };
             format!(
                 "preset=p4 tune=ultra-low-latency rc-mode=cbr bitrate={k} vbv-buffer-size={} gop-size={gop} \
                  bframes=0 zerolatency=true{h26x}",
-                k / fps
+                k * vbv_frames / fps
             )
         }
         // On an AMD Vega laptop (driver 31.0.21925) amfh265enc in ultra-low-latency ignores the
