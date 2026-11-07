@@ -259,6 +259,8 @@ impl Session {
         if self.host().is_some() {
             self.stop_streaming();
         }
+        // On purpose: the server drops us now instead of keeping our place for a reconnect.
+        self.client.send(ClientMsg::Leave);
     }
 
     fn dispatch(&self, m: ServerMsg) {
@@ -312,7 +314,30 @@ impl Session {
             ServerMsg::Error { message } => {
                 let _ = self.events.send(Event::Error(message));
             }
-            ServerMsg::Welcome { .. } => {}
+            // The connection broke and we took our place back (see ServerClient): the room
+            // may have changed meanwhile, and messages about it were lost.
+            ServerMsg::Welcome { peers: others, .. } => {
+                let (peers, gone_watches, gone_viewers) = {
+                    let mut st = self.state.lock().unwrap();
+                    let me = st.peers.iter().find(|p| p.id == self.id).cloned();
+                    let mut peers = others;
+                    peers.extend(me);
+                    let live = |id: &PeerId| peers.iter().any(|p| p.id == *id && p.streaming);
+                    let here = |id: &PeerId| peers.iter().any(|p| p.id == *id);
+                    let gone_watches: Vec<PeerId> = st.watches.keys().filter(|id| !live(id)).copied().collect();
+                    let gone_viewers: Vec<PeerId> = st.viewers.keys().filter(|id| !here(id)).copied().collect();
+                    st.peers = peers.clone();
+                    (peers, gone_watches, gone_viewers)
+                };
+                eprintln!("session: back on the server; {} watches and {} viewers gone meanwhile", gone_watches.len(), gone_viewers.len());
+                let _ = self.events.send(Event::Peers(peers));
+                for id in gone_watches {
+                    self.end_watch(id, "the streamer left", false);
+                }
+                for id in gone_viewers {
+                    self.drop_viewer(id);
+                }
+            }
         }
     }
 

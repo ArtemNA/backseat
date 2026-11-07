@@ -89,6 +89,9 @@ impl LagWatch {
 pub struct Gate {
     resume_at: Mutex<Option<Instant>>,
     waiting_key: AtomicBool,
+    /// A new viewer: nothing goes out before the first keyframe, and those frames are not
+    /// counted as skipped (they were never the viewer's).
+    starting: AtomicBool,
     pub pauses: AtomicU64,
     pub skipped_frames: AtomicU64,
 }
@@ -120,12 +123,25 @@ impl Gate {
         }
         if self.waiting_key.load(Ordering::SeqCst) {
             if !keyframe {
-                self.skipped_frames.fetch_add(1, Ordering::Relaxed);
+                if !self.starting.load(Ordering::SeqCst) {
+                    self.skipped_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 return false;
             }
             self.waiting_key.store(false, Ordering::SeqCst);
+            self.starting.store(false, Ordering::SeqCst);
         }
         true
+    }
+
+    /// For a viewer that joins a running layer: the first frame it gets is a keyframe. Delta
+    /// frames before it made the viewer's AV1 depayloader queue up to a GOP (2.3 s, hundreds
+    /// of warnings per start) and the decoder see decreasing timestamps.
+    pub fn starting() -> Self {
+        let g = Self::default();
+        g.waiting_key.store(true, Ordering::SeqCst);
+        g.starting.store(true, Ordering::SeqCst);
+        g
     }
 }
 

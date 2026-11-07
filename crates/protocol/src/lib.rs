@@ -30,7 +30,13 @@ pub enum ClientMsg {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// Takes back our place after the connection broke: same id, nobody else told.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<Resume>,
     },
+    /// Leaving on purpose: the server drops us at once instead of keeping our place for a
+    /// reconnect.
+    Leave,
     /// Announces whether this peer offers a stream others can watch.
     SetStreaming { streaming: bool },
     /// Asks a streamer to start sending to us, optionally at a lower quality ("720p30 2000"),
@@ -49,6 +55,13 @@ pub enum ClientMsg {
     Alive,
 }
 
+/// What a client keeps from its Welcome to take its place back after a broken connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    pub id: PeerId,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
@@ -59,6 +72,9 @@ pub enum ServerMsg {
         /// The room's display name, if its first member gave one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// Secret for `Join::resume`; servers before 0.1.6 send none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     PeerJoined { peer: PeerInfo },
     PeerUpdated { peer: PeerInfo },
@@ -103,7 +119,7 @@ mod tests {
     fn round_trip() {
         let m = ClientMsg::Signal { to: 3, kind: "offer".into(), payload: "v=0\r\n".into() };
         assert_eq!(parse_client(&m.to_json()).unwrap(), m);
-        let s = ServerMsg::Welcome { id: 1, room: "r".into(), peers: vec![], title: Some("Friends".into()) };
+        let s = ServerMsg::Welcome { id: 1, room: "r".into(), peers: vec![], title: Some("Friends".into()), token: Some("t".into()) };
         assert_eq!(parse_server(&s.to_json()).unwrap(), s);
     }
 
@@ -117,7 +133,7 @@ mod tests {
         assert_eq!(parse_client(r#"{"type":"subscribe","streamer":7}"#).unwrap(), m);
         assert_eq!(
             parse_client(r#"{"type":"join","room":"r","name":"n"}"#).unwrap(),
-            ClientMsg::Join { room: "r".into(), name: "n".into(), title: None }
+            ClientMsg::Join { room: "r".into(), name: "n".into(), title: None, resume: None }
         );
         assert!(matches!(parse_server(r#"{"type":"welcome","id":1,"room":"r","peers":[]}"#).unwrap(), ServerMsg::Welcome { title: None, .. }));
     }

@@ -9,6 +9,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// The default config with a short resume grace, so a broken client goes in 0.3 s here.
+fn cfg() -> server::Config {
+    server::Config { resume_grace: Duration::from_millis(300), ..server::Config::default() }
+}
+
 async fn start(cfg: server::Config) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -20,17 +25,23 @@ async fn start(cfg: server::Config) -> String {
 struct Client {
     ws: Ws,
     id: PeerId,
+    token: Option<String>,
 }
 
 impl Client {
     async fn join(url: &str, room: &str, name: &str) -> (Self, Vec<protocol::PeerInfo>) {
+        Self::join_as(url, room, name, None).await
+    }
+
+    async fn join_as(url: &str, room: &str, name: &str, resume: Option<protocol::Resume>) -> (Self, Vec<protocol::PeerInfo>) {
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        let join = ClientMsg::Join { room: room.into(), name: name.into(), title: None };
+        let join = ClientMsg::Join { room: room.into(), name: name.into(), title: None, resume };
         ws.send(Message::Text(join.to_json().into())).await.unwrap();
-        let mut c = Client { ws, id: 0 };
+        let mut c = Client { ws, id: 0, token: None };
         match c.next().await {
-            ServerMsg::Welcome { id, peers, .. } => {
+            ServerMsg::Welcome { id, peers, token, .. } => {
                 c.id = id;
+                c.token = token;
                 (c, peers)
             }
             other => panic!("expected welcome, got {other:?}"),
@@ -69,7 +80,7 @@ impl Client {
 
 #[tokio::test]
 async fn eight_clients_see_each_other() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let mut clients = vec![];
     for i in 0..8 {
         let (c, peers) = Client::join(&url, "room", &format!("p{i}")).await;
@@ -88,7 +99,7 @@ async fn eight_clients_see_each_other() {
 
 #[tokio::test]
 async fn subscribe_relay_and_unsubscribe() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let (mut host, _) = Client::join(&url, "r", "host").await;
     let (mut viewer, _) = Client::join(&url, "r", "viewer").await;
     host.until(|m| matches!(m, ServerMsg::PeerJoined { .. })).await;
@@ -115,7 +126,7 @@ async fn subscribe_relay_and_unsubscribe() {
 
 #[tokio::test]
 async fn rooms_are_isolated() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let (mut a, _) = Client::join(&url, "one", "a").await;
     let (mut b, peers) = Client::join(&url, "two", "b").await;
     assert!(peers.is_empty());
@@ -132,7 +143,7 @@ async fn rooms_are_isolated() {
 
 #[tokio::test]
 async fn leaving_viewer_releases_its_subscription() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let (mut host, _) = Client::join(&url, "r", "host").await;
     let (mut viewer, _) = Client::join(&url, "r", "viewer").await;
     host.send(ClientMsg::SetStreaming { streaming: true }).await;
@@ -151,7 +162,7 @@ async fn leaving_viewer_releases_its_subscription() {
 /// server timeout to prove this test fails when detection is too slow.
 #[tokio::test]
 async fn silent_client_is_dropped_within_10_s() {
-    let mut cfg = server::Config::default();
+    let mut cfg = cfg();
     if let Some(secs) = std::env::var("STREAMER_TEST_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()) {
         cfg.idle_timeout = Duration::from_secs(secs);
     }
@@ -182,7 +193,7 @@ async fn silent_client_is_dropped_within_10_s() {
 /// the client reads (so pongs go back) but stops sending Alive. It must leave the room.
 #[tokio::test]
 async fn silent_heartbeat_client_is_dropped() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let (mut ghost, _) = Client::join(&url, "room", "ghost").await;
     ghost.send(ClientMsg::Alive).await;
     let (mut other, peers) = Client::join(&url, "room", "other").await;
@@ -210,7 +221,7 @@ async fn silent_heartbeat_client_is_dropped() {
 /// A client that never sent Alive (older builds) is kept while it answers pings.
 #[tokio::test]
 async fn client_without_heartbeat_stays() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let (old, _) = Client::join(&url, "room", "old").await;
     let mut ws = old.ws;
     let reader = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
@@ -223,14 +234,14 @@ async fn client_without_heartbeat_stays() {
 /// The first member's title names the room for everyone after; it goes with the room.
 #[tokio::test]
 async fn room_title_is_kept_while_the_room_lives() {
-    let url = start(server::Config::default()).await;
+    let url = start(cfg()).await;
     let join = |title: Option<&str>| {
         let (url, title) = (url.clone(), title.map(String::from));
         async move {
             let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.unwrap();
-            let m = ClientMsg::Join { room: "K7Q29XMB4TQ1".into(), name: "n".into(), title };
+            let m = ClientMsg::Join { room: "K7Q29XMB4TQ1".into(), name: "n".into(), title, resume: None };
             ws.send(Message::Text(m.to_json().into())).await.unwrap();
-            let mut c = Client { ws, id: 0 };
+            let mut c = Client { ws, id: 0, token: None };
             match c.next().await {
                 ServerMsg::Welcome { title, .. } => (c, title),
                 other => panic!("expected welcome, got {other:?}"),
@@ -247,4 +258,45 @@ async fn room_title_is_kept_while_the_room_lives() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (_fresh, t4) = join(None).await;
     assert_eq!(t4, None, "the title goes when the room empties");
+}
+
+#[tokio::test]
+async fn broken_connection_resumes_unnoticed() {
+    // The real grace, so the place is surely kept across the reconnect.
+    let url = start(server::Config::default()).await;
+    let (mut a, _) = Client::join(&url, "r", "a").await;
+    let (b, _) = Client::join(&url, "r", "b").await;
+    a.until(|m| matches!(m, ServerMsg::PeerJoined { .. })).await;
+    let (id, token) = (b.id, b.token.clone().expect("a token"));
+    drop(b); // the connection breaks without a Leave
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (b2, peers) = Client::join_as(&url, "r", "b", Some(protocol::Resume { id, token })).await;
+    assert_eq!(b2.id, id, "the same id comes back");
+    assert!(peers.iter().any(|p| p.id == a.id) && !peers.iter().any(|p| p.id == id), "peers are the others");
+    // a hears nothing about b leaving or joining.
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            if let Some(Ok(Message::Text(t))) = a.ws.next().await {
+                return protocol::parse_server(&t).unwrap();
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "a was told something: {quiet:?}");
+}
+
+#[tokio::test]
+async fn leave_drops_at_once_and_a_wrong_token_gets_a_new_id() {
+    let url = start(server::Config::default()).await;
+    let (mut a, _) = Client::join(&url, "r", "a").await;
+    let (mut b, _) = Client::join(&url, "r", "b").await;
+    a.until(|m| matches!(m, ServerMsg::PeerJoined { .. })).await;
+    let id = b.id;
+    b.send(ClientMsg::Leave).await;
+    let t = Instant::now();
+    let m = a.until(|m| matches!(m, ServerMsg::PeerLeft { .. })).await;
+    assert_eq!(m, ServerMsg::PeerLeft { id });
+    assert!(t.elapsed() < Duration::from_secs(1), "Leave is at once, not after the grace");
+    let (c, _) = Client::join_as(&url, "r", "b", Some(protocol::Resume { id, token: "guess".into() })).await;
+    assert_ne!(c.id, id, "a wrong token does not take a place");
 }

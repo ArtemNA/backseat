@@ -684,6 +684,18 @@ impl Host {
                 src.link(&sink).map_err(|e| format!("viewer {id}: {e}"))?;
             }
         }
+        // A keyframe now, so the new viewer (who gets nothing before one) need not wait up
+        // to a GOP. Marked, so the filter that keeps viewers' own requests away lets it pass.
+        if !join_key_off() {
+            let pad = branch.video.lock().unwrap().pad.clone();
+            let s = gst::Structure::builder("GstForceKeyUnit")
+                .field("running-time", u64::MAX)
+                .field("all-headers", true)
+                .field("count", 0u32)
+                .field(HOST_KEY_REQUEST, true)
+                .build();
+            pad.send_event(gst::event::CustomUpstream::new(s));
+        }
         viewers.insert(id, branch);
         Ok(())
     }
@@ -858,7 +870,8 @@ impl Host {
             webrtc,
             elements: vec![video_pay, video_queue.clone()],
             tee_pads: vec![],
-            gate: Default::default(),
+            // STREAMER_DEBUG_NO_JOIN_KEY: deltas go out from the start (the spoiled variant).
+            gate: Arc::new(if join_key_off() { Default::default() } else { crate::catchup::Gate::starting() }),
             video: Arc::new(Mutex::new(video)),
             video_in,
             unlinked,
@@ -1112,7 +1125,8 @@ fn watch_layer(tee: &gst::Element, s: Arc<HostStats>) {
     });
     let forward = std::env::var_os("STREAMER_DEBUG_FORWARD_KEY_REQUESTS").is_some();
     tee_sink.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
-        let is_request = info.event().and_then(|e| e.structure()).is_some_and(|st| st.name() == "GstForceKeyUnit");
+        let st = info.event().and_then(|e| e.structure());
+        let is_request = st.is_some_and(|st| st.name() == "GstForceKeyUnit" && !st.has_field(HOST_KEY_REQUEST));
         if is_request {
             s.key_requests_dropped.fetch_add(1, Ordering::Relaxed);
             if !forward {
@@ -1121,6 +1135,13 @@ fn watch_layer(tee: &gst::Element, s: Arc<HostStats>) {
         }
         gst::PadProbeReturn::Ok
     });
+}
+
+/// Marks the host's own keyframe request for a joining viewer (`add_viewer`).
+const HOST_KEY_REQUEST: &str = "backseat-join";
+
+fn join_key_off() -> bool {
+    std::env::var_os("STREAMER_DEBUG_NO_JOIN_KEY").is_some()
 }
 
 fn make_pay(factory: &str, pt: u32) -> gst::Element {

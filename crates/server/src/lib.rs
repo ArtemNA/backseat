@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, PeerId, PeerInfo, ServerMsg, MAX_NAME_LEN, MAX_PAYLOAD_LEN, MAX_ROOM_LEN, MAX_TITLE_LEN};
+use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg, MAX_NAME_LEN, MAX_PAYLOAD_LEN, MAX_ROOM_LEN, MAX_TITLE_LEN};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,12 +20,15 @@ pub struct Config {
     /// A client silent for this long is dropped from its room.
     pub idle_timeout: Duration,
     pub max_room_size: usize,
+    /// A peer whose connection broke keeps its place this long, so it can come back with
+    /// `Join::resume` while its direct streams go on; nobody is told it went.
+    pub resume_grace: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         // Detects a vanished client in 4-6 s, inside the 10 s stage 2 target.
-        Self { ping_interval: Duration::from_secs(2), idle_timeout: Duration::from_secs(4), max_room_size: 16 }
+        Self { ping_interval: Duration::from_secs(2), idle_timeout: Duration::from_secs(4), max_room_size: 16, resume_grace: Duration::from_secs(20) }
     }
 }
 
@@ -35,6 +38,21 @@ struct Peer {
     tx: mpsc::UnboundedSender<ServerMsg>,
     /// Streamers this peer watches.
     watching: HashSet<PeerId>,
+    /// Secret for taking this place back (`Join::resume`).
+    token: String,
+    /// The connection that holds the place now; a broken older one must not remove it.
+    conn: u64,
+    /// The connection broke and the peer has not come back yet.
+    away: bool,
+}
+
+/// A secret nobody else can guess: two hashes keyed from the OS's randomness.
+fn new_token(id: PeerId) -> String {
+    use std::hash::BuildHasher;
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let a = std::collections::hash_map::RandomState::new().hash_one((id, t));
+    let b = std::collections::hash_map::RandomState::new().hash_one((t, id, a));
+    format!("{a:016x}{b:016x}")
 }
 
 #[derive(Default)]
@@ -87,13 +105,14 @@ pub struct Server {
     cfg: Config,
     rooms: Mutex<Rooms>,
     next_id: AtomicU64,
+    next_conn: AtomicU64,
     /// Bytes received from all clients, for checking that no media passes through.
     pub bytes_in: AtomicU64,
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Arc<Self> {
-        Arc::new(Self { cfg, rooms: Mutex::default(), next_id: AtomicU64::new(1), bytes_in: AtomicU64::new(0) })
+        Arc::new(Self { cfg, rooms: Mutex::default(), next_id: AtomicU64::new(1), next_conn: AtomicU64::new(1), bytes_in: AtomicU64::new(0) })
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -115,7 +134,7 @@ impl Server {
         let mut rooms = self.rooms.lock().unwrap();
         match msg {
             ClientMsg::Join { .. } => Some("already joined".into()),
-            ClientMsg::Alive => None,
+            ClientMsg::Alive | ClientMsg::Leave => None,
             ClientMsg::SetStreaming { streaming } => {
                 let p = rooms.peers.get_mut(&id)?;
                 p.info.streaming = streaming;
@@ -164,11 +183,26 @@ impl Server {
         }
     }
 
-    fn join(&self, room: String, name: String, title: Option<String>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<PeerId, String> {
+    /// Joins `room`, or takes back a kept place with `resume`. Returns the peer id and the
+    /// connection number that now holds it.
+    fn join(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
         if room.is_empty() || room.len() > MAX_ROOM_LEN || name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err("room or name is empty or too long".into());
         }
+        let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let mut rooms = self.rooms.lock().unwrap();
+        if let Some(r) = resume {
+            let others: Vec<PeerInfo> = rooms.peers.iter().filter(|(k, p)| **k != r.id && p.room == room).map(|(_, p)| p.info.clone()).collect();
+            let title = rooms.titles.get(&room).cloned();
+            if let Some(p) = rooms.peers.get_mut(&r.id).filter(|p| p.token == r.token && p.room == room) {
+                p.tx = tx.clone();
+                p.conn = conn;
+                p.away = false;
+                let _ = tx.send(ServerMsg::Welcome { id: r.id, room, peers: others, title, token: Some(r.token) });
+                return Ok((r.id, conn));
+            }
+            // Too late or unknown: an ordinary join below, with a new id.
+        }
         let members: Vec<PeerInfo> =
             rooms.peers.values().filter(|p| p.room == room).map(|p| p.info.clone()).collect();
         if members.len() >= self.cfg.max_room_size {
@@ -180,14 +214,35 @@ impl Server {
             rooms.titles.entry(room.clone()).or_insert(t);
         }
         let title = rooms.titles.get(&room).cloned();
-        let _ = tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members, title });
+        let token = new_token(id);
+        let _ = tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members, title, token: Some(token.clone()) });
         rooms.broadcast(&room, id, &ServerMsg::PeerJoined { peer: info.clone() });
-        rooms.peers.insert(id, Peer { info, room, tx, watching: HashSet::new() });
-        Ok(id)
+        rooms.peers.insert(id, Peer { info, room, tx, watching: HashSet::new(), token, conn, away: false });
+        Ok((id, conn))
     }
 
     fn leave(&self, id: PeerId) {
         self.rooms.lock().unwrap().remove(id);
+    }
+
+    /// Connection `conn` of `id` broke: keep the place for the grace period, then drop it
+    /// unless a newer connection took it back.
+    fn broke(self: &Arc<Self>, id: PeerId, conn: u64) {
+        {
+            let mut rooms = self.rooms.lock().unwrap();
+            match rooms.peers.get_mut(&id) {
+                Some(p) if p.conn == conn => p.away = true,
+                _ => return,
+            }
+        }
+        let (me, grace) = (self.clone(), self.cfg.resume_grace);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let mut rooms = me.rooms.lock().unwrap();
+            if rooms.peers.get(&id).is_some_and(|p| p.away && p.conn == conn) {
+                rooms.remove(id);
+            }
+        });
     }
 }
 
@@ -247,6 +302,7 @@ async fn upgrade(ws: WebSocketUpgrade, State(server): State<Arc<Server>>) -> axu
 
 /// One client connection: Join first, then messages until close or silence.
 async fn session(server: Arc<Server>, socket: WebSocket) {
+    let server = &server;
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
     let cfg = server.cfg;
@@ -267,6 +323,9 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
     });
 
     let mut id: Option<PeerId> = None;
+    let mut conn = 0u64;
+    // Left on purpose (ClientMsg::Leave): no place kept.
+    let mut left = false;
     // Set by the first Alive: from then on only the client's own messages prove it is
     // there, since a proxy may answer our pings for a client that is gone.
     let mut heartbeat = false;
@@ -301,8 +360,15 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
         };
         match (id, msg) {
             (Some(_), ClientMsg::Alive) => heartbeat = true,
-            (None, ClientMsg::Join { room, name, title }) => match server.join(room, name, title, tx.clone()) {
-                Ok(new_id) => id = Some(new_id),
+            (_, ClientMsg::Leave) => {
+                left = true;
+                break;
+            }
+            (None, ClientMsg::Join { room, name, title, resume }) => match server.join(room, name, title, resume, tx.clone()) {
+                Ok((new_id, c)) => {
+                    id = Some(new_id);
+                    conn = c;
+                }
                 Err(e) => {
                     let _ = tx.send(ServerMsg::Error { message: e });
                 }
@@ -317,8 +383,11 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
             }
         }
     }
-    if let Some(me) = id {
-        server.leave(me);
+    // STREAMER_DEBUG_NO_RESUME drops a broken peer at once, as before: the spoiled variant.
+    match id {
+        Some(me) if left || std::env::var_os("STREAMER_DEBUG_NO_RESUME").is_some() => server.leave(me),
+        Some(me) => server.broke(me, conn),
+        None => {}
     }
     drop(tx);
     let _ = writer.await;
