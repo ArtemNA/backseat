@@ -184,6 +184,9 @@ impl Viewer {
                 if let Some(p) = p.upgrade() {
                     a.apply(&p);
                 }
+                if muted.is_some() || volume.is_some() {
+                    eprintln!("viewer: sound {} at {}%", if a.muted.load(Ordering::SeqCst) { "muted" } else { "on" }, a.volume.load(Ordering::SeqCst));
+                }
                 (a.muted.load(Ordering::SeqCst), a.volume.load(Ordering::SeqCst) as f32 / 100.0)
             }));
         }
