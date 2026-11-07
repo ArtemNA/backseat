@@ -2,6 +2,11 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.1.5
+
+- **New icon** for the app, its window, the tray and the installer.
+- **Better picture on AMD (H.265).** The encoder uses its quality preset: a slightly sharper picture at the same bitrate, with the same latency. AMD H.264 stays as it was: its low-latency mode would fix the blur after key frames but went about 50% over the chosen bitrate.
+
 ## 0.1.4
 
 - **Better picture at low bitrates (NVIDIA).** The encoder's rate buffer now holds 8 frames instead of one. Key frames (every 2 s) no longer turn the picture blurry for half a second, H.265 keeps to the chosen bitrate instead of going 13–34% over, and the latency stays the same.

@@ -124,11 +124,19 @@ pub fn encoder_properties(kind: EncoderKind, codec: Codec, kbit: u32, fps: u32, 
             )
         }
         // On an AMD Vega laptop (driver 31.0.21925) amfh265enc in ultra-low-latency ignores the
-        // bitrate (13.4 Mbit/s for 8, 46 for 20); low-latency keeps it (8.2). H.264 keeps it
-        // in ultra-low-latency.
+        // bitrate (13.4 Mbit/s for 8, 46 for 20); low-latency keeps it (8.2).
+        // Measured on the Vega laptop, 1080p60 6 Mbit/s (docs/research/quality-low-bitrate.md):
+        // H.265 low-latency has no keyframe dip; preset=quality adds 0.46 dB PSNR-Y at the same
+        // rate with the same latency (20.3-20.5 vs 20.3-21.0 ms). H.264 in ultra-low-latency
+        // starves keyframes (26.9 dB for 30 frames after one vs 29.4, worst 24.3) and
+        // low-latency fixes that, but live it went 49% over the rate (8.95 Mbit/s for 6), so
+        // H.264 stays in ultra-low-latency. The GStreamer element has no buffer-size setting.
+        // STREAMER_DEBUG_AMF_USAGE / _PRESET / _EXTRA override them for A/B runs.
         EncoderKind::Amf => {
-            let usage = if codec == Codec::H265 { "low-latency" } else { "ultra-low-latency" };
-            format!("usage={usage} rate-control=cbr bitrate={kbit} gop-size={gop}")
+            let usage = std::env::var("STREAMER_DEBUG_AMF_USAGE").unwrap_or_else(|_| if codec == Codec::H265 { "low-latency" } else { "ultra-low-latency" }.into());
+            let preset = std::env::var("STREAMER_DEBUG_AMF_PRESET").ok().or_else(|| (codec == Codec::H265).then(|| "quality".into())).map(|p| format!(" preset={p}")).unwrap_or_default();
+            let extra = std::env::var("STREAMER_DEBUG_AMF_EXTRA").map(|e| format!(" {e}")).unwrap_or_default();
+            format!("usage={usage} rate-control=cbr bitrate={kbit} gop-size={gop}{preset}{extra}")
         }
         EncoderKind::Qsv => format!("low-latency=true rate-control=cbr bitrate={kbit} gop-size={gop}"),
     }
