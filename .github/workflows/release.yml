@@ -1,0 +1,135 @@
+# Builds the Windows installer. A pushed tag vX.Y.Z also publishes it as the GitHub
+# release "Backseat X.Y.Z"; a manual run only uploads it as a workflow artifact.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+    branches: [ci-release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GST_VERSION: 1.28.8
+  # SHA-256 of gstreamer-1.0-msvc-x86_64-1.28.8.exe (the .sha256sum published next to it).
+  GST_SHA256: e4c41ee6ee9c6c32a45d198463ec08d79bac3bd5fa58adc93d13fe4a08abc9d9
+  GST_DIR: C:\gstreamer\1.0\msvc_x86_64
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match the version $v in Cargo.toml"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Cache GStreamer installer
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\gst-download
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}
+
+      - name: Install GStreamer
+        run: |
+          $exe = "C:\gst-download\gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+          if (-not (Test-Path $exe)) {
+            New-Item -ItemType Directory C:\gst-download -Force | Out-Null
+            $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+            curl.exe -fsSL --retry 3 -o $exe $url
+            if ($LASTEXITCODE) { throw "download failed: $url" }
+          }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:GST_SHA256) { Remove-Item $exe; throw "GStreamer installer hash $hash, expected $env:GST_SHA256" }
+          # Inno Setup installer: runtime and development files in one folder.
+          $p = Start-Process $exe -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/TASKS=""', "/DIR=`"$env:GST_DIR`"", '/LOG="C:\gst-install.log"'
+          if ($p.ExitCode) { Get-Content C:\gst-install.log -Tail 50; throw "GStreamer setup exit code $($p.ExitCode)" }
+          foreach ($f in 'bin\gstreamer-1.0-0.dll', 'bin\pkg-config.exe', 'lib\pkgconfig\gstreamer-1.0.pc',
+                         'lib\gstreamer-1.0\gstrsrtp.dll', 'lib\gstreamer-1.0\gstdav1d.dll') {
+            if (-not (Test-Path "$env:GST_DIR\$f")) { throw "missing after install: $f" }
+          }
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GST_DIR\" >> $env:GITHUB_ENV
+
+      - name: Install NSIS
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE) { throw 'choco install nsis failed' }
+          }
+
+      - name: Download the WebView2 bootstrapper
+        run: |
+          New-Item -ItemType Directory C:\wv2 -Force | Out-Null
+          curl.exe -fsSL --retry 3 -o C:\wv2\MicrosoftEdgeWebview2Setup.exe 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+          if ($LASTEXITCODE) { throw 'WebView2 bootstrapper download failed' }
+          $sig = Get-AuthenticodeSignature C:\wv2\MicrosoftEdgeWebview2Setup.exe
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "WebView2 bootstrapper signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the installer
+        run: |
+          # No fixed signaling server: users type theirs in the app.
+          Remove-Item Env:STREAMER_SERVER_URL -ErrorAction SilentlyContinue
+          ./tools/installer.ps1 -WebView2 C:\wv2\MicrosoftEdgeWebview2Setup.exe
+          $name = "backseat-setup-${{ steps.version.outputs.version }}.exe"
+          if (-not (Test-Path "dist\$name")) { throw "dist\$name was not built" }
+          $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+          # LF line ending, as sha256sum -c expects.
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", "$hash  $name`n")
+          Get-Content dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backseat-setup-${{ steps.version.outputs.version }}
+          path: |
+            dist/backseat-setup-${{ steps.version.outputs.version }}.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Notes: the "## X.Y.Z" section of CHANGELOG.md, else generated from the commits.
+          $notes = ''
+          if (Test-Path CHANGELOG.md) {
+            $in = $false
+            $lines = foreach ($l in Get-Content CHANGELOG.md) {
+              if ($l -match '^## ') { $in = $l -match "^## \[?$([regex]::Escape($env:VERSION))\]?(\s|$)"; continue }
+              if ($in) { $l }
+            }
+            $notes = ($lines -join "`n").Trim()
+          }
+          $ghArgs = @($env:GITHUB_REF_NAME, "dist/backseat-setup-$env:VERSION.exe", 'dist/SHA256SUMS.txt',
+                    '--title', "Backseat $env:VERSION", '--verify-tag')
+          if ($notes) {
+            Set-Content -Path notes.md -Value $notes -Encoding utf8NoBOM
+            $ghArgs += @('--notes-file', 'notes.md')
+          } else {
+            $ghArgs += '--generate-notes'
+          }
+          gh release create @ghArgs
+          if ($LASTEXITCODE) { throw 'gh release create failed' }

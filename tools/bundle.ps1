@@ -3,11 +3,13 @@
 # Every DLL import of every shipped binary must resolve inside the folder or to a DLL that
 # ships with Windows itself; otherwise the script fails and names what is missing.
 #
-#   tools\bundle.ps1 [-Out dist\backseat] [-NoBuild] [-Server wss://host/ws]
+#   tools\bundle.ps1 [-Out dist\backseat] [-NoBuild] [-Server wss://host/ws] [-Gst <dir>]
 # -Server fixes the signaling server: the app then has no server field.
+# -Gst is the GStreamer root; by default .toolchain\gstreamer, else the folder in
+# GSTREAMER_1_0_ROOT_MSVC_X86_64 (the CI build).
 param(
   [string]$Out = 'dist\backseat',
-  [string]$Gst = '.toolchain\gstreamer',
+  [string]$Gst = '',
   [switch]$NoBuild,
   [string]$Server = '',
   # Tests only: leave this file out, to prove the import check notices.
@@ -16,6 +18,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
+if (-not $Gst) {
+  $Gst = if (Test-Path '.toolchain\gstreamer') { '.toolchain\gstreamer' } else { $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 }
+  if (-not $Gst) { throw 'GStreamer not found: pass -Gst or set GSTREAMER_1_0_ROOT_MSVC_X86_64' }
+}
 $Gst = (Resolve-Path $Gst).Path
 
 # Plugins the app uses on Windows (element names in crates/media, mapped to plugins).
@@ -40,7 +46,7 @@ $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
 if (-not $dumpbin -or -not $crt) { throw 'Visual Studio dumpbin or the VC++ redistributable folder not found' }
 
 if (-not $NoBuild) {
-  . "$root\.scratch\env.ps1" 2>$null
+  if (Test-Path "$root\.scratch\env.ps1") { . "$root\.scratch\env.ps1" 2>$null } else { $env:PATH = "$Gst\bin;$env:PATH" }
   Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
   $env:PKG_CONFIG_PATH = "$Gst\lib\pkgconfig"
   # Compiled into the app (option_env!); empty means the user types the server.
