@@ -76,8 +76,24 @@
       <div class="body set-body">
         <nav class="set-tabs">
           <button type="button" data-tab="general" data-t="set.general"></button>
+          <button type="button" data-tab="stream" data-t="set.stream"></button>
+          <button type="button" data-tab="watch" data-t="set.watch"></button>
           <button type="button" data-tab="updates" data-t="set.updates"></button>
         </nav>
+        <section id="set-stream" class="set-page hidden">
+          <span class="small" data-t="set.stream_hint"></span>
+          <label class="field"><span data-t="golive.resolution"></span><select id="set-s-res"></select></label>
+          <label class="field"><span data-t="golive.fps"></span><select id="set-s-fps"></select></label>
+          <label class="field"><span data-t="golive.bitrate"></span><select id="set-s-kbit"></select></label>
+          <label class="field"><span data-t="golive.codec"></span><select id="set-s-codec"></select></label>
+          <label class="field"><span data-t="golive.audio"></span><select id="set-s-audio"></select></label>
+        </section>
+        <section id="set-watch" class="set-page hidden">
+          <span class="small" data-t="set.watch_hint"></span>
+          <label class="field"><span data-t="set.max_res"></span><select id="set-w-res"></select></label>
+          <label class="field"><span data-t="set.max_fps"></span><select id="set-w-fps"></select></label>
+          <label class="field"><span data-t="set.max_kbit"></span><select id="set-w-kbit"></select></label>
+        </section>
         <section id="set-general" class="set-page">
           <label class="field" id="set-server-row"><span data-t="set.server"></span><input id="set-server" placeholder="wss://example.com/ws" autocomplete="off"></label>
           <span class="small" id="set-server-hint" data-t="set.server_hint"></span>

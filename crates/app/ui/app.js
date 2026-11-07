@@ -280,8 +280,36 @@ function saveSettings(s) {
 }
 function setTab(tab) {
   for (const b of document.querySelectorAll('.set-tabs button')) b.setAttribute('aria-pressed', String(b.dataset.tab === tab));
-  $('set-general').classList.toggle('hidden', tab !== 'general');
-  $('set-updates').classList.toggle('hidden', tab !== 'updates');
+  for (const p of ['general', 'stream', 'watch', 'updates']) $('set-' + p).classList.toggle('hidden', tab !== p);
+}
+// Defaults for going live and the most to receive when watching ('' = auto / as the streamer).
+function streamPrefs() { return { res: '', fps: '', kbit: '', codec: '', ...(settings().stream || {}) }; }
+function watchPrefs() { return { res: '', fps: '', kbit: '', ...(settings().watch || {}) }; }
+// What a new watch asks for: the preferred maximum, which the streamer clamps to what it
+// sends (each part separately). Null: the streamer's own quality.
+function watchRequest() {
+  const w = watchPrefs();
+  if (!w.res && !w.fps && !w.kbit) return null;
+  return `${w.res || '1440'}p${w.fps || '60'}${w.kbit ? ' ' + w.kbit : ''}`;
+}
+function fillPrefSelect(id, items, value, onChange) {
+  const sel = $(id);
+  sel.replaceChildren(...items.map(([v, label]) => el('option', { value: v, text: label, selected: String(v) === String(value) })));
+  sel.onchange = () => onChange(sel.value);
+}
+function fillPrefs() {
+  const s = streamPrefs(), w = watchPrefs();
+  const saveS = (k) => (v) => saveSettings({ ...settings(), stream: { ...streamPrefs(), [k]: v } });
+  const saveW = (k) => (v) => saveSettings({ ...settings(), watch: { ...watchPrefs(), [k]: v } });
+  const kbits = PRESETS.map((k) => [String(k), `${mbit(k)} ${t('unit.mbit')}`]);
+  fillPrefSelect('set-s-res', [['', t('set.auto_res')], ['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], s.res, saveS('res'));
+  fillPrefSelect('set-s-fps', [['', t('set.auto')], ['30', '30'], ['60', '60']], s.fps, saveS('fps'));
+  fillPrefSelect('set-s-kbit', [['', t('set.auto')], ...kbits], s.kbit, saveS('kbit'));
+  fillPrefSelect('set-s-codec', [['', t('set.auto')], ['av1', 'AV1'], ['h265', 'H.265'], ['h264', 'H.264']], s.codec, saveS('codec'));
+  fillPrefSelect('set-s-audio', [['', t('set.audio_auto')], ['system', t('golive.audio_system')], ['none', t('golive.audio_none')]], s.audio || '', saveS('audio'));
+  fillPrefSelect('set-w-res', [['', t('set.as_streamer')], ['1440', '1440p'], ['1080', '1080p'], ['720', '720p']], w.res, saveW('res'));
+  fillPrefSelect('set-w-fps', [['', t('set.as_streamer')], ['60', '60'], ['30', '30']], w.fps, saveW('fps'));
+  fillPrefSelect('set-w-kbit', [['', t('set.as_streamer')], ...kbits], w.kbit, saveW('kbit'));
 }
 async function openSettings(tab) {
   const s = settings();
@@ -293,6 +321,7 @@ async function openSettings(tab) {
   $('set-tray').checked = s.tray;
   $('set-auto').checked = s.autoUpdate;
   $('set-version').textContent = t('set.version', { v: await invoke('app_version') });
+  fillPrefs();
   showUpdate();
   setTab(tab || 'general');
   if (!$('settings').open) $('settings').showModal();
@@ -562,7 +591,7 @@ function setMuteButton(b, muted) {
 // Someone live we are not watching.
 function chip(p) {
   return el('div', { class: 'chip' }, avatar(p.name), el('b', { text: p.name }),
-    el('button', { class: 'btn primary', type: 'button', text: t('card.watch'), onclick: async () => { await invoke('watch', { streamer: p.id, quality: null }); tick(); } }));
+    el('button', { class: 'btn primary', type: 'button', text: t('card.watch'), onclick: async () => { await invoke('watch', { streamer: p.id, quality: watchRequest() }); tick(); } }));
 }
 
 // Keeps each native video window over its .video box, and hides them all while
@@ -653,6 +682,14 @@ function renderGoLive() {
     el('span', { class: 'src-title' }, shot(x.id).icon ? el('img', { class: 'src-icon', src: shot(x.id).icon, alt: '' }) : null, el('span', { text: x.title })),
     el('span', { class: 'small', text: x.sub }))));
   $('gl-audio-app').classList.toggle('hidden', g.tab !== 'window');
+  // Sound follows the source until picked by hand: one program's sound for a window, the
+  // system's for a screen ("auto"), or what the settings say.
+  if (!g.audioPicked && !g.editing) {
+    const p = streamPrefs().audio || '';
+    const want = p === 'none' ? 'none' : p === 'system' ? 'system' : g.tab === 'window' ? 'app' : 'system';
+    const r = document.querySelector(`input[name=audio][value=${want}]`);
+    if (r) r.checked = true;
+  }
   if (g.tab !== 'window' && document.querySelector('input[name=audio]:checked')?.value === 'app') document.querySelector('input[name=audio][value=system]').checked = true;
   seg($('gl-res'), [['720', '720p'], ['1080', '1080p'], ['1440', '1440p']], g.res, (v) => { g.res = v; g.resPicked = true; renderGoLive(); });
   seg($('gl-fps'), [['30', '30'], ['60', '60']], g.fps, (v) => { g.fps = v; renderGoLive(); });
@@ -695,6 +732,17 @@ function renderGoLive() {
 // The go-live dialog; `editing`: change the running stream instead of starting one.
 async function openGoLive(editing) {
   state.gl.editing = !!editing;
+  if (!editing) {
+    // The settings' defaults, each time; what this computer cannot do falls back in renderGoLive.
+    const d = streamPrefs(), g = state.gl;
+    g.resPicked = !!d.res;
+    if (d.res) g.res = d.res;
+    if (d.fps) g.fps = d.fps;
+    if (d.kbit) g.kbit = +d.kbit;
+    g.codecPicked = !!d.codec;
+    if (d.codec) g.codec = d.codec;
+    g.audioPicked = false;
+  }
   $('gl-error').classList.add('hidden');
   state.gl.sources = await invoke('sources');
   if (!state.gl.codecs) state.gl.codecs = await invoke('codecs');
@@ -704,6 +752,7 @@ async function openGoLive(editing) {
   refreshThumbs().then(renderGoLive);
 }
 $('go-live').addEventListener('click', () => openGoLive(false));
+for (const r of document.querySelectorAll('input[name=audio]')) r.addEventListener('change', () => { state.gl.audioPicked = true; });
 $('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); refreshThumbs(); });
 $('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); refreshThumbs(); });
 $('gl-cancel').addEventListener('click', () => $('golive').close());
@@ -820,7 +869,9 @@ invoke('test_rooms').then((other) => {
 });
 invoke('test_open_settings').then((tab) => { if (tab) setTimeout(() => openSettings(tab), 2500); });
 invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
-invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); }, 3000); });
+invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); if (on === 'audio') setTimeout(() => { const pick = () => document.querySelector('input[name=audio]:checked')?.value; const screen = pick(); $('gl-tab-window').click(); setTimeout(() => invoke('test_report', { msg: `audio screen ${screen} window ${pick()} prefs ${JSON.stringify(settings().stream)}` }), 800); }, 2500); }, 3000); });
+// Tests only: settings given by the test run, before anything reads them.
+invoke('test_prefs').then((p) => { if (p) saveSettings({ ...settings(), ...JSON.parse(p) }); });
 fillLanguages();
 loadForm();
 invoke('set_close_to_tray', { on: settings().tray });

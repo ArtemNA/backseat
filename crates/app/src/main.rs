@@ -167,6 +167,12 @@ fn updates_enabled() -> bool {
     on
 }
 
+/// Tests only: STREAMER_APP_TEST_PREFS, JSON merged into the saved settings at start.
+#[tauri::command]
+fn test_prefs() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_PREFS").ok()
+}
+
 /// Tests only: STREAMER_APP_TEST_SETTINGS=general|updates opens the settings at start.
 #[tauri::command]
 fn test_open_settings() -> Option<String> {
@@ -480,7 +486,7 @@ fn test_form() -> Option<String> {
 
 #[tauri::command]
 fn test_report(msg: String) {
-    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() {
+    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() || std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some() {
         eprintln!("test: {msg}");
     }
 }
@@ -570,7 +576,9 @@ async fn update_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(),
 
 fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
-    s.start_streaming(live_config(&req)?)?;
+    let cfg = live_config(&req)?;
+    eprintln!("live: {}x{}@{} {} kbit/s {} audio {}", cfg.mode.width, cfg.mode.height, cfg.mode.fps, cfg.kbit, cfg.codec.short(), if !cfg.audio { "none" } else if cfg.audio_pid.is_some() { "app" } else { "system" });
+    s.start_streaming(cfg)?;
     Ok(())
 }
 
@@ -868,7 +876,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .build(tauri::generate_context!())
         .expect("tauri app")
         .run(|h, e| {
