@@ -25,6 +25,54 @@ struct App {
     close_to_tray: std::sync::atomic::AtomicBool,
     /// The release found by the last check, for `install_update`.
     release: Mutex<Option<update::Release>>,
+    /// Key of the open room in the saved places (`resume_key`).
+    joined: Mutex<Option<String>>,
+}
+
+/// Places this app holds on servers, saved so a new start after a crash, a forced close or
+/// an update takes its own place back instead of joining as a second copy of the same
+/// person (the server keeps a place 20 s for a broken connection). Key: server, room, name.
+fn resume_key(server: &str, room: &str, name: &str) -> String {
+    format!("{server}|{room}|{name}")
+}
+
+fn resume_file() -> Option<std::path::PathBuf> {
+    // Test runs start several apps on purpose; they would take each other's places. The
+    // restart gate turns it on with STREAMER_APP_TEST_RESUME.
+    let testing = std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_") && k != "STREAMER_APP_TEST_RESUME");
+    if testing && std::env::var_os("STREAMER_APP_TEST_RESUME").is_none() {
+        return None;
+    }
+    let name = std::env::var("STREAMER_APP_TEST_RESUME").ok().filter(|v| v.ends_with(".json")).unwrap_or_else(|| "places.json".into());
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Backseat").join(name))
+}
+
+fn saved_places() -> std::collections::HashMap<String, protocol::Resume> {
+    resume_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Saves (Some) or forgets (None) the place for `key`.
+fn save_place(key: &str, place: Option<protocol::Resume>) {
+    let Some(path) = resume_file() else { return };
+    let mut all = saved_places();
+    match place {
+        Some(r) => all.insert(key.to_string(), r),
+        None => all.remove(key),
+    };
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let _ = std::fs::write(&path, serde_json::to_string(&all).unwrap_or_default());
+}
+
+/// Leaves the open room for good: the server is told before we go on, and the saved
+/// place is forgotten. `wait`: how long to wait for the server to be told (exiting).
+fn leave_for_good(app: &App, wait: std::time::Duration) {
+    let s = app.session.lock().unwrap().take();
+    if let Some(s) = s {
+        s.leave_and_wait(wait);
+    }
+    if let Some(k) = app.joined.lock().unwrap().take() {
+        save_place(&k, None);
+    }
 }
 
 impl App {
@@ -151,9 +199,7 @@ async fn install_update(app: tauri::State<'_, Arc<App>>) -> Result<(), String> {
     eprintln!("update: downloaded and checked {}", path.display());
     update::run_installer(&path)?;
     if std::env::var_os("STREAMER_UPDATE_DRY").is_none() {
-        if let Some(s) = app.session.lock().unwrap().take() {
-            s.leave();
-        }
+        leave_for_good(&app, std::time::Duration::from_millis(500));
         if let Some(h) = APP_HANDLE.get() {
             h.exit(0);
         }
@@ -197,9 +243,7 @@ fn make_tray(a: &tauri::App) -> tauri::Result<()> {
         "show" => show_main_window(),
         "quit" => {
             use tauri::Manager;
-            if let Some(s) = h.state::<Arc<App>>().session.lock().unwrap().take() {
-                s.leave();
-            }
+            leave_for_good(&h.state::<Arc<App>>(), std::time::Duration::from_millis(500));
             h.exit(0);
         }
         _ => {}
@@ -239,10 +283,11 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     // both connections alive: the same person twice in the room.
     static JOINING: Mutex<()> = Mutex::new(());
     let _one = JOINING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = app.session.lock().unwrap().take() {
-        old.leave();
-    }
-    let (s, events) = Session::join_titled(server, room, name, title)?;
+    leave_for_good(app, std::time::Duration::from_millis(300));
+    let key = resume_key(server, room, name);
+    let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
+    save_place(&key, s.resume());
+    *app.joined.lock().unwrap() = Some(key);
     // Whatever got in meanwhile leaves.
     if let Some(other) = app.session.lock().unwrap().replace(s.clone()) {
         other.leave();
@@ -267,6 +312,9 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                             s.leave();
                         }
                     }
+                    if let Some(k) = a.joined.lock().unwrap().take() {
+                        save_place(&k, None);
+                    }
                     break;
                 }
                 _ => {}
@@ -278,10 +326,7 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
 
 #[tauri::command]
 async fn leave(app: tauri::State<'_, Arc<App>>) -> Result<(), String> {
-    let s = app.session.lock().unwrap().take();
-    if let Some(s) = s {
-        s.leave();
-    }
+    leave_for_good(&app, std::time::Duration::from_millis(300));
     Ok(())
 }
 
@@ -824,6 +869,13 @@ fn main() {
         })
         .manage(app)
         .invoke_handler(tauri::generate_handler![test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
-        .run(tauri::generate_context!())
-        .expect("tauri app");
+        .build(tauri::generate_context!())
+        .expect("tauri app")
+        .run(|h, e| {
+            // Any way out (the tray's Quit, closing with the tray off) tells the server first.
+            if let tauri::RunEvent::Exit = e {
+                use tauri::Manager;
+                leave_for_good(&h.state::<Arc<App>>(), std::time::Duration::from_millis(500));
+            }
+        });
 }

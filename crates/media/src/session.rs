@@ -12,7 +12,7 @@ use crate::host::Host;
 use crate::server_client::ServerClient;
 use crate::signal::Outbox;
 use crate::viewer::Viewer;
-use protocol::{ClientMsg, PeerId, PeerInfo, ServerMsg};
+use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -98,7 +98,21 @@ impl Session {
 
     /// Like `join`; `title` names the room if it is new.
     pub fn join_titled(url: &str, room: &str, name: &str, title: Option<&str>) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
-        let (client, rx) = ServerClient::join_titled(url, room, name, title)?;
+        Self::join_resuming(url, room, name, title, None)
+    }
+
+    /// Like `join_titled`, taking back the place an earlier start of the app kept (see
+    /// `ServerClient::join_resuming`). That start's stream and watches are gone: the server
+    /// and the streamers it watched are told so.
+    pub fn join_resuming(url: &str, room: &str, name: &str, title: Option<&str>, resume: Option<Resume>) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
+        let (client, rx) = ServerClient::join_resuming(url, room, name, title, resume)?;
+        if client.resumed {
+            eprintln!("session: took back our place {} from an earlier start", client.id);
+            client.send(ClientMsg::SetStreaming { streaming: false });
+            for p in client.peers.iter().filter(|p| p.streaming) {
+                client.send(ClientMsg::Unsubscribe { streamer: p.id });
+            }
+        }
         let (tx, events) = mpsc::channel();
         let me = PeerInfo { id: client.id, name: name.into(), streaming: false };
         let mut peers = client.peers.clone();
@@ -126,6 +140,17 @@ impl Session {
             })
             .map_err(|e| e.to_string())?;
         Ok((s, events))
+    }
+
+    /// What a later start of the app needs to take this place back.
+    pub fn resume(&self) -> Option<Resume> {
+        self.client.resume.clone()
+    }
+
+    /// Leaves and waits up to `wait` until the server is told: for an app about to exit.
+    pub fn leave_and_wait(&self, wait: Duration) {
+        self.leave();
+        self.client.leave_and_wait(wait);
     }
 
     pub fn peers(&self) -> Vec<PeerInfo> {

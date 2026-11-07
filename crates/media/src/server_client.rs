@@ -153,6 +153,11 @@ pub struct ServerClient {
     pub peers: Vec<PeerInfo>,
     /// The room's display name from the server, if it has one.
     pub title: Option<String>,
+    /// For taking this place back later, also from a new start of the app.
+    pub resume: Option<Resume>,
+    /// The join took back a place kept from an earlier start (`join_resuming`).
+    pub resumed: bool,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerClient {
@@ -165,9 +170,19 @@ impl ServerClient {
 
     /// Like `join`; `title` names the room if it is new.
     pub fn join_titled(url: &str, room: &str, name: &str, title: Option<&str>) -> Result<(Arc<Self>, mpsc::Receiver<ServerMsg>), String> {
+        Self::join_resuming(url, room, name, title, None)
+    }
+
+    /// Like `join_titled`; `resume` takes back the place an earlier start of the app held
+    /// (it closed without leaving: an update, a crash), so the room does not see us twice.
+    /// The server gives a new place when that one is gone.
+    pub fn join_resuming(url: &str, room: &str, name: &str, title: Option<&str>, resume: Option<Resume>) -> Result<(Arc<Self>, mpsc::Receiver<ServerMsg>), String> {
+        let wanted = resume.as_ref().map(|r| r.id);
+        let first = ClientMsg::Join { room: room.into(), name: name.into(), title: title.map(String::from), resume };
+        let (mut ws, w) = connect(url, &first)?;
         let join = ClientMsg::Join { room: room.into(), name: name.into(), title: title.map(String::from), resume: None };
-        let (mut ws, w) = connect(url, &join)?;
         let (id, token) = (w.id, w.token.clone());
+        let resumed = wanted == Some(id);
         let (out_tx, out_rx) = mpsc::channel::<ClientMsg>();
         let (in_tx, in_rx) = mpsc::channel::<ServerMsg>();
         let url = url.to_string();
@@ -175,7 +190,7 @@ impl ServerClient {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|s| Instant::now() + Duration::from_secs(s));
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("signaling".into())
             .spawn(move || loop {
                 match pump(&mut ws, &out_rx, &in_tx, &mut break_at) {
@@ -213,11 +228,23 @@ impl ServerClient {
                 }
             })
             .unwrap();
-        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title }), in_rx))
+        let resume = w.token.clone().map(|token| Resume { id, token });
+        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
     }
 
     pub fn send(&self, m: ClientMsg) {
         let _ = self.out.send(m);
+    }
+
+    /// Leaves and waits up to `wait` for the message to go out: the app is about to exit,
+    /// and a Leave that never left would keep our place (and our name in the room) for 20 s.
+    pub fn leave_and_wait(&self, wait: Duration) {
+        self.send(ClientMsg::Leave);
+        let Some(t) = self.thread.lock().unwrap().take() else { return };
+        let until = Instant::now() + wait;
+        while !t.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// An outbox that delivers signaling messages to one peer through the server.
