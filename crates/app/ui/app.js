@@ -450,6 +450,7 @@ function renderHeader(s) {
         el('span', { text: t('live.title') }),
         el('span', { class: 'small', id: 'live-sub' }),
         langPicker(),
+        el('button', { class: 'btn', type: 'button', text: t('live.change'), onclick: () => openGoLive(true) }),
         el('button', { class: 'btn danger', type: 'button', text: t('live.end'), onclick: async () => { await invoke('end_live'); tick(); } }));
     }
     $('live-sub').textContent = `${shortQuality(s.live.ceiling)} ${t('unit.mbit')} · ${s.live.encoder}`;
@@ -658,7 +659,8 @@ function renderGoLive() {
   seg($('gl-kbit'), PRESETS.map((k) => [k, mbit(k)]), g.kbit, (v) => { g.kbit = v; renderGoLive(); });
   // Only codecs this machine encodes in hardware; AV1 needs a recent GPU.
   // AV1 first and chosen when the GPU encodes it, with its own default bitrate.
-  const codecs = [['av1', 'AV1'], ['h265', 'H.265'], ['h264', 'H.264']].filter(([c]) => (g.codecs || ['h265', 'h264']).includes(c));
+  // While live the codec stays (changing it would need every viewer to reconnect).
+  const codecs = [['av1', 'AV1'], ['h265', 'H.265'], ['h264', 'H.264']].filter(([c]) => (g.codecs || ['h265', 'h264']).includes(c) && (!g.editing || c === g.codec));
   if (!g.codecPicked && codecs.length && g.codec !== codecs[0][0]) {
     if (codecs[0][0] === 'av1' && g.kbit === 20000) g.kbit = 15000;
     g.codec = codecs[0][0];
@@ -673,6 +675,9 @@ function renderGoLive() {
     renderGoLive();
   });
   $('gl-codec-note').textContent = t(g.codec === 'h264' ? 'golive.codec_h264' : g.codec === 'av1' ? 'golive.codec_av1' : 'golive.codec_h265');
+  // While live, sound stays on or off as it started; which sound may change.
+  for (const r of document.querySelectorAll('input[name=audio]')) r.disabled = !!g.editing && (g.liveAudio === 'none') !== (r.value === 'none');
+  $('gl-start').textContent = g.editing ? t('live.apply') : t('golive.start');
   const n = Math.max(s.peers.length - 1, 1);
   const need = (g.kbit * n) / 1000;
   const limit = uploadLimit();
@@ -687,7 +692,9 @@ function renderGoLive() {
   over.classList.toggle('hidden', !(limit && need > limit));
   over.textContent = limit && need > limit ? t('up.over', { need: fmt(need), limit: fmt(limit) }) : '';
 }
-$('go-live').addEventListener('click', async () => {
+// The go-live dialog; `editing`: change the running stream instead of starting one.
+async function openGoLive(editing) {
+  state.gl.editing = !!editing;
   $('gl-error').classList.add('hidden');
   state.gl.sources = await invoke('sources');
   if (!state.gl.codecs) state.gl.codecs = await invoke('codecs');
@@ -695,7 +702,8 @@ $('go-live').addEventListener('click', async () => {
   renderGoLive();
   $('golive').showModal();
   refreshThumbs().then(renderGoLive);
-});
+}
+$('go-live').addEventListener('click', () => openGoLive(false));
 $('gl-tab-screen').addEventListener('click', () => { state.gl.tab = 'screen'; renderGoLive(); refreshThumbs(); });
 $('gl-tab-window').addEventListener('click', () => { state.gl.tab = 'window'; renderGoLive(); refreshThumbs(); });
 $('gl-cancel').addEventListener('click', () => $('golive').close());
@@ -704,7 +712,13 @@ $('gl-start').addEventListener('click', async () => {
   const g = state.gl;
   if (!g.pick) { $('gl-error').textContent = t('golive.pick_window'); $('gl-error').classList.remove('hidden'); return; }
   const audio = document.querySelector('input[name=audio]:checked').value;
-  await call('go_live', { req: { kind: g.tab === 'screen' ? 'monitor' : 'window', id: g.pick.id, audio, audio_pid: g.pick.pid ?? null, mode: `${g.res}p${g.fps}`, kbit: g.kbit, codec: g.codec } }, $('gl-error'));
+  const req = { kind: g.tab === 'screen' ? 'monitor' : 'window', id: g.pick.id, audio, audio_pid: g.pick.pid ?? null, mode: `${g.res}p${g.fps}`, kbit: g.kbit, codec: g.codec };
+  if (g.editing) {
+    try { await call('update_live', { req }, $('gl-error')); } catch { return; }
+  } else {
+    await call('go_live', { req }, $('gl-error'));
+    g.liveAudio = audio;
+  }
   $('golive').close();
   tick();
 });

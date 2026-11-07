@@ -331,7 +331,7 @@ impl Session {
     fn add_viewer(&self, viewer: PeerId, quality: Option<String>) {
         let Some(host) = self.host() else { return };
         // A bad request falls back to the host's own quality.
-        let want = quality.as_deref().and_then(|q| match Quality::parse_request(q, host.ceiling) {
+        let want = quality.as_deref().and_then(|q| match Quality::parse_request(q, host.ceiling()) {
             Ok(w) => Some(w),
             Err(e) => {
                 let _ = self.events.send(Event::Error(format!("viewer {viewer} quality {q}: {e}")));
@@ -342,7 +342,7 @@ impl Session {
         match host.add_viewer(viewer, out.clone(), want) {
             Ok(()) => {
                 self.state.lock().unwrap().viewers.insert(viewer, out);
-                let _ = self.events.send(Event::ViewerJoined { viewer, quality: want.map(|w| w.clamp_to(host.ceiling)) });
+                let _ = self.events.send(Event::ViewerJoined { viewer, quality: want.map(|w| w.clamp_to(host.ceiling())) });
             }
             Err(e) => {
                 let _ = self.events.send(Event::Error(format!("cannot add viewer {viewer}: {e}")));

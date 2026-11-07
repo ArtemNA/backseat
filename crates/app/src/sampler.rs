@@ -317,8 +317,8 @@ fn sample(inner: &Mutex<Inner>) {
             );
         }
         LiveStats {
-            ceiling_mbit: h.ceiling.kbit as f64 / 1000.0,
-            ceiling: h.ceiling.to_string(),
+            ceiling_mbit: h.ceiling().kbit as f64 / 1000.0,
+            ceiling: h.ceiling().to_string(),
             encoder: h.encoder.clone(),
             viewers,
             layers,

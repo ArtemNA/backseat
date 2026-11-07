@@ -36,9 +36,12 @@ pub struct Host {
     pub stats: Arc<HostStats>,
     pub encoder: String,
     kind: platform::EncoderKind,
-    cfg: HostConfig,
+    /// Changes while live (`reconfigure`): source, quality, one program's audio.
+    cfg: Mutex<HostConfig>,
     /// The host's own quality: the most any viewer gets.
-    pub ceiling: Quality,
+    ceiling: Mutex<Quality>,
+    /// The source was replaced while live: layer sizes come from the new one's description.
+    source_changed: AtomicBool,
     /// Viewer branches by viewer id. The lock also serializes start, stop and teardown.
     /// Lock order: `viewers`, then `layers`. Streaming threads take neither.
     viewers: Mutex<HashMap<u64, Branch>>,
@@ -109,6 +112,8 @@ struct Branch {
     video: Arc<Mutex<VideoLink>>,
     /// Input of the branch's video queue, where a layer's tee pad links.
     video_in: gst::Pad,
+    /// The quality the viewer asked for; None: the host's own, whatever it becomes.
+    want: Option<Quality>,
     /// Tee pads and the branch inputs they feed, linked only once the branch plays: a tee
     /// pushing into a branch still in NULL gets FLUSHING and passes it up, which stopped
     /// the layer, the capture tee and the capture (stress test, 2026-11-06).
@@ -227,11 +232,107 @@ impl Host {
             stats: Arc::new(HostStats::default()),
             encoder: encoder.to_string(),
             kind,
-            cfg,
-            ceiling,
+            cfg: Mutex::new(cfg),
+            ceiling: Mutex::new(ceiling),
+            source_changed: AtomicBool::new(false),
             viewers: Mutex::default(),
             layers: Mutex::default(),
         })
+    }
+
+    pub fn cfg(&self) -> HostConfig {
+        self.cfg.lock().unwrap().clone()
+    }
+
+    /// The host's own quality: the most any viewer gets.
+    pub fn ceiling(&self) -> Quality {
+        *self.ceiling.lock().unwrap()
+    }
+
+    /// Changes the stream while it runs: the picture source, the quality, which program's
+    /// sound. Viewers stay connected. Each viewer's quality follows: one that watches at the
+    /// host's own quality moves with it, up or down; one that asked for less keeps that,
+    /// unless the new quality is lower still. The codec, and sound on or off, cannot change
+    /// this way (they change what was negotiated with each viewer).
+    pub fn reconfigure(&self, new: HostConfig) -> Result<(), String> {
+        let old = self.cfg();
+        if new.codec != old.codec {
+            return Err("the codec cannot change while live".into());
+        }
+        if new.audio != old.audio {
+            return Err("sound on or off cannot change while live".into());
+        }
+        eprintln!("host: reconfigure from {} to {}", self.ceiling(), Quality::new(new.mode, new.kbit));
+        let viewers = self.viewers.lock().unwrap();
+        if new.source != old.source || new.mode.fps != old.mode.fps {
+            self.swap_video_source(&new)?;
+            self.source_changed.store(new.source != old.source, Ordering::SeqCst);
+        }
+        if new.audio && new.audio_pid != old.audio_pid {
+            self.swap_audio_source(&new)?;
+        }
+        let ceiling = Quality::new(new.mode, new.kbit);
+        *self.cfg.lock().unwrap() = new;
+        *self.ceiling.lock().unwrap() = ceiling;
+        // Layers keep their quality; their picture takes the new source's shape.
+        for (q, l) in self.layers.lock().unwrap().iter() {
+            if let Some(f) = l.bin.by_name("vsize") {
+                let w = self.layer_width(*q);
+                let caps = gst::Caps::builder("video/x-raw").features(["memory:D3D11Memory"]).field("format", "NV12").field("width", w as i32).field("height", q.height as i32).build();
+                f.set_property("caps", &caps);
+            }
+        }
+        let moves: Vec<(u64, Quality)> = viewers
+            .iter()
+            .map(|(id, b)| (*id, b.want.map_or(ceiling, |w| w.clamp_to(ceiling))))
+            .collect();
+        drop(viewers);
+        // STREAMER_DEBUG_NO_FOLLOW: viewers keep their layer (the spoiled variant).
+        let moves = if std::env::var_os("STREAMER_DEBUG_NO_FOLLOW").is_some() { vec![] } else { moves };
+        for (id, q) in moves {
+            self.move_viewer(id, q)?;
+        }
+        eprintln!("host: reconfigured to {ceiling}");
+        Ok(())
+    }
+
+    /// Replaces the capture in front of the capture tee; the layers and viewers stay.
+    fn swap_video_source(&self, cfg: &HostConfig) -> Result<(), String> {
+        let tee = self.pipeline.by_name("srctee").ok_or("no capture tee")?;
+        let sink = tee.static_pad("sink").ok_or("no tee sink")?;
+        // Everything upstream of the tee is the old source.
+        let mut old = Vec::new();
+        let mut pad = sink.peer();
+        while let Some(p) = pad {
+            let Some(e) = p.parent_element() else { break };
+            pad = e.sink_pads().first().and_then(|s| s.peer());
+            old.push(e);
+        }
+        let bin = gst::parse::bin_from_description(&video_source(cfg), true).map_err(|e| format!("new source: {e}"))?;
+        for e in &old {
+            let _ = e.set_state(gst::State::Null);
+        }
+        for e in &old {
+            let _ = self.pipeline.remove(e);
+        }
+        self.pipeline.add(&bin).map_err(|e| e.to_string())?;
+        bin.static_pad("src").ok_or("new source has no output")?.link(&sink).map_err(|e| format!("new source: {e}"))?;
+        bin.sync_state_with_parent().map_err(|e| format!("new source: {e}"))?;
+        eprintln!("host: new source {:?} in place", cfg.source);
+        Ok(())
+    }
+
+    /// Replaces the sound capture (whole system or one program).
+    fn swap_audio_source(&self, cfg: &HostConfig) -> Result<(), String> {
+        let src = self.pipeline.iterate_sources().into_iter().flatten().find(|e| e.factory().is_some_and(|f| f.name() == "wasapi2src")).ok_or("no sound capture")?;
+        let next = src.static_pad("src").and_then(|p| p.peer()).ok_or("sound capture not linked")?;
+        let new = audio_source(cfg)?;
+        let _ = src.set_state(gst::State::Null);
+        let _ = self.pipeline.remove(&src);
+        self.pipeline.add(&new).map_err(|e| e.to_string())?;
+        new.static_pad("src").ok_or("no sound output")?.link(&next).map_err(|e| format!("sound: {e}"))?;
+        new.sync_state_with_parent().map_err(|e| format!("sound: {e}"))?;
+        Ok(())
     }
 
     /// The encoded width for a quality: its height times the source's shape, even, at most
@@ -249,7 +350,9 @@ impl Host {
                 Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
             });
         // Before the first frame the tee has no caps yet: take the size from the source.
-        let src = src.or_else(|| source_size(&self.cfg.source));
+        // Right after the source changed (`reconfigure`) the tee still has the old one's.
+        let src = if self.source_changed.load(Ordering::SeqCst) { None } else { src };
+        let src = src.or_else(|| source_size(&self.cfg().source));
         let w = match src {
             Some((sw, sh)) if sw > 0 && sh > 0 => {
                 let exact = q.height as f64 * sw as f64 / sh as f64;
@@ -265,10 +368,10 @@ impl Host {
 
     /// Builds the encoder chain for one quality and starts it with the pipeline.
     fn make_layer(&self, q: Quality) -> Result<Layer, String> {
-        let c = self.cfg.codec.short();
+        let c = self.cfg().codec.short();
         // A leaky queue first: a slow encoder drops its own frames and never holds up the
         // capture or the other layers.
-        let rate = if q.fps < self.cfg.mode.fps { format!("videorate drop-only=true max-rate={} ! ", q.fps) } else { String::new() };
+        let rate = if q.fps < self.cfg().mode.fps { format!("videorate drop-only=true max-rate={} ! ", q.fps) } else { String::new() };
         let desc = format!(
             "queue name=lqueue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! {rate}\
              d3d11convert ! capsfilter name=vsize caps=\"video/x-raw(memory:D3D11Memory),format=NV12,width={w},height={h}\" ! \
@@ -277,8 +380,8 @@ impl Host {
             w = self.layer_width(q),
             h = q.height,
             enc = self.encoder,
-            props = platform::encoder_properties(self.kind, self.cfg.codec, q.kbit, q.fps, q.fps * self.cfg.keyframe_secs),
-            parse = if self.cfg.codec == crate::config::Codec::Av1 {
+            props = platform::encoder_properties(self.kind, self.cfg().codec, q.kbit, q.fps, q.fps * self.cfg().keyframe_secs),
+            parse = if self.cfg().codec == crate::config::Codec::Av1 {
                 "av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu".to_string()
             } else {
                 format!("{c}parse config-interval=-1 ! video/x-{c},alignment=au")
@@ -287,10 +390,10 @@ impl Host {
         let bin = gst::parse::bin_from_description(&desc, true).map_err(|e| format!("layer {q}: {e}"))?;
         bin.set_property("name", format!("layer-{}x{}-{}-{}", q.width, q.height, q.fps, q.kbit));
         let tee = bin.by_name("ltee").unwrap();
-        if q.fps < self.cfg.mode.fps && std::env::var_os("STREAMER_DEBUG_VIDEORATE_ONLY").is_none() {
+        if q.fps < self.cfg().mode.fps && std::env::var_os("STREAMER_DEBUG_VIDEORATE_ONLY").is_none() {
             thin_frames(&bin.by_name("lqueue").unwrap(), q.fps);
         }
-        let stats = if q == self.ceiling { self.stats.clone() } else { Arc::new(HostStats::default()) };
+        let stats = if q == self.ceiling() { self.stats.clone() } else { Arc::new(HostStats::default()) };
         watch_layer(&tee, stats.clone());
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;
         let feed = self.pipeline.by_name("srctee").unwrap().request_pad_simple("src_%u").unwrap();
@@ -305,7 +408,7 @@ impl Host {
         });
         feed.link(&bin.static_pad("sink").unwrap()).map_err(|e| format!("layer {q}: {e}"))?;
         bin.sync_state_with_parent().map_err(|e| format!("layer {q}: {e}"))?;
-        if q == self.ceiling {
+        if q == self.ceiling() {
             debug_switch_size(&bin, q.width, q.height);
         }
         if debug_timeline() {
@@ -423,7 +526,15 @@ impl Host {
     /// current layer until the new one sends a keyframe, so the picture never stops.
     pub fn set_quality(&self, id: u64, want: Quality) -> Result<Quality, String> {
         // STREAMER_DEBUG_NO_CLAMP is the spoiled variant for the layers gate.
-        let q = if std::env::var_os("STREAMER_DEBUG_NO_CLAMP").is_some() { want } else { want.clamp_to(self.ceiling) };
+        let q = if std::env::var_os("STREAMER_DEBUG_NO_CLAMP").is_some() { want } else { want.clamp_to(self.ceiling()) };
+        if let Some(b) = self.viewers.lock().unwrap().get_mut(&id) {
+            // Asking for the host's own quality means following it.
+            b.want = (want != self.ceiling()).then_some(want);
+        }
+        self.move_viewer(id, q)
+    }
+
+    fn move_viewer(&self, id: u64, q: Quality) -> Result<Quality, String> {
         trace("set_quality enter");
         let viewers = self.viewers.lock().unwrap();
         let Some(b) = viewers.get(&id) else { return Err(format!("no viewer {id}")) };
@@ -551,8 +662,9 @@ impl Host {
         if debug_timeline() {
             eprintln!("timeline {:>9.1} ms: add viewer {id}", since_start_ms());
         }
-        let start = want.map_or(self.ceiling, |w| w.clamp_to(self.ceiling));
+        let start = want.map_or(self.ceiling(), |w| w.clamp_to(self.ceiling()));
         let mut branch = self.build_branch(id, link, start)?;
+        branch.want = want.filter(|w| *w != self.ceiling());
         if viewers.is_empty() {
             self.pipeline
                 .set_state(gst::State::Playing)
@@ -683,8 +795,8 @@ impl Host {
             .build()
             .unwrap();
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
-        crate::ice::configure(&webrtc, &self.cfg.ice);
-        crate::ice::watch(&webrtc, format!("viewer {id}"), self.cfg.ice.turn.is_some(), || {});
+        crate::ice::configure(&webrtc, &self.cfg().ice);
+        crate::ice::watch(&webrtc, format!("viewer {id}"), self.cfg().ice.turn.is_some(), || {});
 
         let l = link.clone();
         webrtc.connect("on-ice-candidate", false, move |v| {
@@ -715,7 +827,7 @@ impl Host {
         });
 
         self.pipeline.add(&webrtc).unwrap();
-        let video_pay = make_pay(&format!("rtp{}pay", self.cfg.codec.short()), VIDEO_PT);
+        let video_pay = make_pay(&format!("rtp{}pay", self.cfg().codec.short()), VIDEO_PT);
         // H.26x payloaders: parameter sets with every key frame, no waiting to aggregate.
         if video_pay.has_property("config-interval") {
             video_pay.set_property("config-interval", -1i32);
@@ -737,6 +849,7 @@ impl Host {
         }
         let video = VideoLink { quality: start, tee, pad, pending: None, retired: vec![] };
         let mut branch = Branch {
+            want: None,
             webrtc,
             elements: vec![video_pay, video_queue.clone()],
             tee_pads: vec![],
@@ -757,7 +870,7 @@ impl Host {
                 gst::PadProbeReturn::Drop
             }
         });
-        if self.cfg.audio {
+        if self.cfg().audio {
             self.feed(&mut branch, "atee", make_pay("rtpopuspay", AUDIO_PT));
         }
         Ok(branch)
@@ -794,7 +907,7 @@ impl Host {
                 }
             }
             "ice" => add_ice(webrtc, payload),
-            QUALITY_MSG => match Quality::parse_request(payload, self.ceiling).and_then(|want| self.set_quality(id, want)) {
+            QUALITY_MSG => match Quality::parse_request(payload, self.ceiling()).and_then(|want| self.set_quality(id, want)) {
                 Ok(q) => println!("host: viewer {id} asked for {}, gets {q}", payload.trim()),
                 Err(e) => eprintln!("host: viewer {id} quality request {}: {e}", payload.trim()),
             },

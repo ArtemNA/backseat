@@ -138,7 +138,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     /// Monitor capture by DXGI output index; -1 is the primary monitor.
     Capture { monitor: i32 },

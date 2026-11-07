@@ -193,6 +193,27 @@ fn main() {
         args.cfg.audio
     );
 
+    // Test only: STREAMER_DEBUG_RECONFIGURE="SECS MODE KBIT SOURCE" changes the running stream
+    // after SECS seconds (SOURCE: bars, noise or capture), as the app's Change button does.
+    if let Ok(v) = std::env::var("STREAMER_DEBUG_RECONFIGURE") {
+        let p: Vec<String> = v.split_whitespace().map(String::from).collect();
+        let (h, base) = (host.clone(), args.cfg.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(p[0].parse().unwrap_or(10)));
+            let mut cfg = base;
+            cfg.mode = media::config::VideoMode::parse(&p[1]).expect("mode");
+            cfg.kbit = p[2].parse().expect("kbit");
+            cfg.source = match p.get(3).map(String::as_str) {
+                Some("noise") => media::config::Source::Noise,
+                Some("capture") => media::config::Source::Capture { monitor: 0 },
+                _ => media::config::Source::Bars,
+            };
+            match h.reconfigure(cfg) {
+                Ok(()) => println!("host: reconfigured to {} {} {}", p[1], p[2], p.get(3).map(String::as_str).unwrap_or("bars")),
+                Err(e) => println!("host: reconfigure failed: {e}"),
+            }
+        });
+    }
     let started = Instant::now();
     let s = &host.stats;
     let load = || {
@@ -231,7 +252,7 @@ fn main() {
         );
         host.housekeeping();
         // Layers below the host's own quality, started because some viewer asked for less.
-        for l in host.layers().into_iter().filter(|l| l.quality != host.ceiling) {
+        for l in host.layers().into_iter().filter(|l| l.quality != host.ceiling()) {
             let s = &l.stats;
             let (frames, bytes, keys) = (
                 s.frames.swap(0, Ordering::Relaxed),

@@ -480,14 +480,13 @@ async fn go_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(), Str
     do_go_live(app.inner(), req).inspect_err(|e| eprintln!("go_live failed: {e}"))
 }
 
-fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
-    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+fn live_config(req: &GoLive) -> Result<HostConfig, String> {
     let source = match req.kind.as_str() {
         "window" => Source::Window { hwnd: req.id },
         _ if req.id == 0 && dev_sources() => Source::Bars,
         _ => Source::Monitor { handle: req.id },
     };
-    let cfg = HostConfig {
+    Ok(HostConfig {
         mode: VideoMode::parse(&req.mode)?,
         kbit: req.kbit,
         codec: req.codec.as_deref().map(Codec::parse).transpose()?.unwrap_or(Codec::H265),
@@ -496,8 +495,21 @@ fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
         audio_pid: if req.audio == "app" { req.audio_pid } else { None },
         source,
         ice: IceConfig::default(),
-    };
-    s.start_streaming(cfg)?;
+    })
+}
+
+/// Changes the running stream (source, quality, which program's sound); viewers stay.
+#[tauri::command]
+async fn update_live(app: tauri::State<'_, Arc<App>>, req: GoLive) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    let h = s.host().ok_or("not live")?;
+    let cfg = live_config(&req)?;
+    tauri::async_runtime::spawn_blocking(move || h.reconfigure(cfg)).await.map_err(|e| e.to_string())?.inspect_err(|e| eprintln!("update_live failed: {e}"))
+}
+
+fn do_go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    s.start_streaming(live_config(&req)?)?;
     Ok(())
 }
 
@@ -795,7 +807,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }
