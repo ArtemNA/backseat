@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.1.6
+
+- **A broken connection to the server no longer ends the stream.** If the connection to the signaling server drops (it happens with hosted servers now and then), Backseat reconnects in the background and takes its place back; streams go on, and nobody in the room sees you leave. Before, the streamer's app could close at that moment.
+- **Streams start faster.** A viewer who joins a running stream gets the picture within a second instead of after up to two.
+- Cleaner log files: harmless start-up messages are counted instead of written out.
+
 ## 0.1.5
 
 - **New icon** for the app, its window, the tray and the installer.
