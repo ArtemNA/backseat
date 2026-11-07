@@ -19,6 +19,7 @@
       <div id="join-error" class="banner error hidden"></div>
       <button id="join-submit" class="btn primary" type="submit"></button>
       <button id="join-back" class="btn hidden" type="button" data-t="join.back"></button>
+      <button id="join-settings" class="btn ghost" type="button" data-t="set.open"></button>
     </form>
   </div>
 
@@ -40,6 +41,9 @@
       <div class="me">
         <span id="me-avatar" class="avatar"></span>
         <span class="who"><span data-t="room.you"></span><span id="me-state" class="small"></span></span>
+        <button id="settings-btn" class="icon-btn" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </button>
         <button id="go-live" class="btn primary" type="button">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="12" rx="2"></rect><path d="M8 21h8M12 17v4"></path></svg>
           <span data-t="room.go_live"></span>
@@ -62,6 +66,35 @@
         <button class="btn" value="cancel" type="submit" formnovalidate data-t="common.cancel"></button>
         <button id="rename-save" class="btn primary" value="save" type="submit" data-t="common.save"></button>
       </div>
+    </form>
+  </dialog>
+
+  <!-- Settings -->
+  <dialog id="settings">
+    <form class="dlg" method="dialog">
+      <header><h2 data-t="set.title"></h2></header>
+      <div class="body set-body">
+        <nav class="set-tabs">
+          <button type="button" data-tab="general" data-t="set.general"></button>
+          <button type="button" data-tab="updates" data-t="set.updates"></button>
+        </nav>
+        <section id="set-general" class="set-page">
+          <label class="field" id="set-server-row"><span data-t="set.server"></span><input id="set-server" placeholder="wss://example.com/ws" autocomplete="off"></label>
+          <span class="small" id="set-server-hint" data-t="set.server_hint"></span>
+          <label class="field"><span data-t="connect.language"></span><select id="set-lang"></select></label>
+          <label class="opt"><input type="checkbox" id="set-tray"> <span data-t="set.tray"></span></label>
+        </section>
+        <section id="set-updates" class="set-page hidden">
+          <b id="set-version" style="color:var(--bright)"></b>
+          <label class="opt"><input type="checkbox" id="set-auto"> <span data-t="set.auto_update"></span></label>
+          <div class="row" style="gap:10px;align-items:center">
+            <button type="button" class="btn" id="set-check" data-t="set.check"></button>
+            <button type="button" class="btn primary hidden" id="set-install" data-t="set.install"></button>
+          </div>
+          <div id="set-status" class="small"></div>
+        </section>
+      </div>
+      <footer><button class="btn primary" value="close" type="submit" data-t="set.close"></button></footer>
     </form>
   </dialog>
 

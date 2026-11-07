@@ -35,7 +35,10 @@ a { color: #8fb4ff; }
 
 /* Shell */
 .shell { display: flex; height: 100vh; }
-.rail { width: 72px; background: var(--rail); display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 0; }
+.rail { width: 72px; background: var(--rail); display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; flex: none; }
+.rail::-webkit-scrollbar { display: none; }
+.rail > * { flex: none; }
+.rail .r.update { color: #fff; background: var(--ok); }
 /* Saved rooms, Discord-style: online only in the open one. */
 .rail .r { position: relative; width: 48px; height: 48px; border-radius: 24px; border: 0; background: #313338; color: #dbdee1; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; transition: border-radius .15s; }
 .rail .r:hover { border-radius: 16px; background: var(--accent); color: #fff; }
@@ -170,3 +173,11 @@ dialog::backdrop { background: rgba(0, 0, 0, .7); }
 .dot { width: 8px; height: 8px; border-radius: 4px; display: inline-block; margin-right: 8px; }
 .state-ok { color: #6fd6a0; }
 .state-warn { color: var(--warn); }
+
+/* Settings */
+.set-body { flex-direction: row !important; gap: 24px !important; min-height: 320px; }
+.set-tabs { display: flex; flex-direction: column; gap: 2px; width: 160px; flex: none; }
+.set-tabs button { text-align: left; border: 0; background: transparent; color: var(--muted); padding: 8px 10px; border-radius: 4px; font-weight: 500; }
+.set-tabs button:hover { background: #35373c; color: var(--bright); }
+.set-tabs button[aria-pressed="true"] { background: #404249; color: var(--bright); }
+.set-page { flex: 1; display: flex; flex-direction: column; gap: 14px; min-width: 0; }

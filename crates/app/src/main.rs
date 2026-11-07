@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod sampler;
+mod update;
 
 use media::config::{Codec, HostConfig, IceConfig, Quality, Source, VideoMode, ViewerConfig};
 use media::session::{Event, Session};
@@ -20,6 +21,10 @@ struct App {
     /// later start; cleared when read.
     link: Mutex<Option<String>>,
     sampler: sampler::Sampler,
+    /// Closing the main window hides it in the tray (the default) instead of quitting.
+    close_to_tray: std::sync::atomic::AtomicBool,
+    /// The release found by the last check, for `install_update`.
+    release: Mutex<Option<update::Release>>,
 }
 
 impl App {
@@ -91,10 +96,115 @@ fn built_in() -> Option<&'static str> {
     BUILT_IN_SERVER.filter(|s| !s.is_empty())
 }
 
-/// The webview tells the language it shows, for text drawn natively (video window).
+/// The webview tells the language it shows, for text drawn natively (video window, tray).
 #[tauri::command]
 fn set_ui_language(lang: String) {
     *sampler::UI_LANG.lock().unwrap() = lang;
+    tray_labels();
+}
+
+/// Closing the window hides it in the tray (true) or quits (false).
+#[tauri::command]
+fn set_close_to_tray(app: tauri::State<'_, Arc<App>>, on: bool) {
+    let on = on && std::env::var_os("STREAMER_DEBUG_NO_TRAY").is_none();
+    app.close_to_tray.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test runs (STREAMER_APP_* variables) never look for updates, unless STREAMER_UPDATE_URL
+/// points them at a test release.
+#[tauri::command]
+fn updates_enabled() -> bool {
+    let on = std::env::var_os("STREAMER_UPDATE_URL").is_some() || !std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_"));
+    eprintln!("update: checks {}", if on { "on" } else { "off" });
+    on
+}
+
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The latest release and whether it is newer than this app.
+#[tauri::command]
+async fn check_update(app: tauri::State<'_, Arc<App>>) -> Result<update::Release, String> {
+    let r = tauri::async_runtime::spawn_blocking(update::check).await.map_err(|e| e.to_string())?;
+    match &r {
+        Ok(r) => eprintln!("update: this {} latest {} newer {}", r.current, r.latest, r.newer),
+        Err(e) => eprintln!("update: check failed: {e}"),
+    }
+    let r = r?;
+    *app.release.lock().unwrap() = Some(r.clone());
+    Ok(r)
+}
+
+/// Downloads the release found by `check_update`, checks it, starts the installer and quits.
+#[tauri::command]
+async fn install_update(app: tauri::State<'_, Arc<App>>) -> Result<(), String> {
+    let r = app.release.lock().unwrap().clone().filter(|r| r.newer).ok_or("no newer release")?;
+    let path = tauri::async_runtime::spawn_blocking(move || update::download(&r)).await.map_err(|e| e.to_string())?.inspect_err(|e| eprintln!("update: {e}"))?;
+    eprintln!("update: downloaded and checked {}", path.display());
+    update::run_installer(&path)?;
+    if std::env::var_os("STREAMER_UPDATE_DRY").is_none() {
+        if let Some(s) = app.session.lock().unwrap().take() {
+            s.leave();
+        }
+        if let Some(h) = APP_HANDLE.get() {
+            h.exit(0);
+        }
+    }
+    Ok(())
+}
+
+/// The tray menu's words in the UI language.
+fn tray_text() -> (&'static str, &'static str) {
+    match sampler::UI_LANG.lock().unwrap().as_str() {
+        "uk" => ("Відкрити Backseat", "Вийти"),
+        "ru" => ("Открыть Backseat", "Выйти"),
+        _ => ("Open Backseat", "Quit"),
+    }
+}
+
+static TRAY_ITEMS: std::sync::OnceLock<(tauri::menu::MenuItem<tauri::Wry>, tauri::menu::MenuItem<tauri::Wry>)> = std::sync::OnceLock::new();
+
+fn tray_labels() {
+    if let Some((show, quit)) = TRAY_ITEMS.get() {
+        let (s, q) = tray_text();
+        let _ = show.set_text(s);
+        let _ = quit.set_text(q);
+    }
+}
+
+/// The tray icon: a click opens the window; the menu opens it or quits.
+fn make_tray(a: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let (s, q) = tray_text();
+    let show = MenuItem::with_id(a, "show", s, true, None::<&str>)?;
+    let quit = MenuItem::with_id(a, "quit", q, true, None::<&str>)?;
+    let menu = Menu::with_items(a, &[&show, &quit])?;
+    let _ = TRAY_ITEMS.set((show, quit));
+    let mut tray = TrayIconBuilder::with_id("main").tooltip("Backseat").menu(&menu).show_menu_on_left_click(false);
+    if let Some(icon) = a.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.on_menu_event(|h, e| match e.id.as_ref() {
+        "show" => show_main_window(),
+        "quit" => {
+            use tauri::Manager;
+            if let Some(s) = h.state::<Arc<App>>().session.lock().unwrap().take() {
+                s.leave();
+            }
+            h.exit(0);
+        }
+        _ => {}
+    })
+    .on_tray_icon_event(|_, e| {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+            show_main_window();
+        }
+    })
+    .build(a)?;
+    Ok(())
 }
 
 /// Codecs this machine can stream (hardware encoders only), e.g. ["h265", "h264", "av1"].
@@ -631,6 +741,8 @@ fn main() {
     media::init();
     media::logfile::gst_warnings();
     let app = Arc::new(App::default());
+    // STREAMER_DEBUG_NO_TRAY: closing quits (the spoiled variant for the tray gate).
+    app.close_to_tray.store(std::env::var_os("STREAMER_DEBUG_NO_TRAY").is_none(), std::sync::atomic::Ordering::SeqCst);
     *app.link.lock().unwrap() = link_arg();
     if let Some(claim) = claim {
         let a = app.clone();
@@ -667,10 +779,23 @@ fn main() {
                     media::present::set_default_parent(h.0 as isize);
                 }
             }
+            if let Err(e) = make_tray(a) {
+                eprintln!("tray: {e}");
+            }
             Ok(())
         })
+        .on_window_event(|w, e| {
+            // Closing the main window hides it in the tray; the tray's Quit ends the app.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = e {
+                use tauri::Manager;
+                if w.label() == "main" && w.state::<Arc<App>>().close_to_tray.load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = w.hide();
+                }
+            }
+        })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .run(tauri::generate_context!())
         .expect("tauri app");
 }

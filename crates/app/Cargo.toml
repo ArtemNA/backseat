@@ -8,7 +8,10 @@ publish.workspace = true
 gst.workspace = true
 media.workspace = true
 protocol = { path = "../protocol" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
+ureq = "3"
+sha2 = "0.10"
+serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]

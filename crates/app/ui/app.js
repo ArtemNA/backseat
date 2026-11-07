@@ -148,7 +148,7 @@ async function handleLink(link) {
   const known = savedRooms().find((x) => x.room === code);
   if (known) { if (!sameRoom(known, state.current)) await switchRoom(known); return; }
   const fixed = await invoke('built_in_server');
-  const server = fixed || (state.current && state.current.server) || $('f-server').value.trim();
+  const server = fixed || settings().server || (state.current && state.current.server) || $('f-server').value.trim();
   let name = (state.current && state.current.name) || '';
   try { name = name || JSON.parse(localStorage.getItem('join') || '{}').name || ''; } catch {}
   if (name) { await switchRoom({ server, room: code, name }); return; }
@@ -204,7 +204,7 @@ function renderRail(s) {
   const list = savedRooms();
   const cur = state.current;
   if (cur && !list.some((x) => sameRoom(x, cur))) list.push(cur);
-  const key = JSON.stringify(list) + '|' + JSON.stringify(cur) + '|' + lang;
+  const key = JSON.stringify(list) + '|' + JSON.stringify(cur) + '|' + lang + '|' + (state.update ? state.update.latest : '');
   if ($('rail').dataset.key === key) return;
   $('rail').dataset.key = key;
   $('rail').replaceChildren(
@@ -214,7 +214,8 @@ function renderRail(s) {
       oncontextmenu: (e) => { e.preventDefault(); openRoomMenu(e, r); },
     })),
     el('div', { class: 'sep' }),
-    el('button', { class: 'r add', type: 'button', title: t('rooms.add'), text: '+', onclick: () => { state.joinOpen = true; tick(); } }));
+    el('button', { class: 'r add', type: 'button', title: t('rooms.add'), text: '+', onclick: () => { state.joinOpen = true; tick(); } }),
+    ...(state.update ? [el('button', { class: 'r update', type: 'button', title: t('set.available', { v: state.update.latest }), text: '↓', onclick: () => openSettings('updates') })] : []));
 }
 function closeRoomMenu() { $('room-menu').classList.add('hidden'); }
 function openRoomMenu(e, r) {
@@ -257,13 +258,81 @@ function loadForm() {
     const saved = JSON.parse(localStorage.getItem('join') || '{}');
     for (const k of ['server', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
   } catch {}
-  // A build made for one server has no server field: the address is fixed.
+  // The default server from the settings comes first.
+  if (settings().server) $('f-server').value = settings().server;
+  // A build made for one server has no server field: the address is fixed. It also becomes
+  // the default server, so a later build without one (an update) keeps using it.
   invoke('built_in_server').then((url) => {
     if (!url) return;
     $('f-server').value = url;
     $('f-server').closest('label').classList.add('hidden');
+    if (!settings().server) saveSettings({ ...settings(), server: url });
   });
 }
+
+// ---------- settings ----------
+function settings() {
+  const base = { tray: true, autoUpdate: true, server: '' };
+  try { return { ...base, ...JSON.parse(localStorage.getItem('settings') || '{}') }; } catch { return base; }
+}
+function saveSettings(s) {
+  try { localStorage.setItem('settings', JSON.stringify(s)); } catch {}
+}
+function setTab(tab) {
+  for (const b of document.querySelectorAll('.set-tabs button')) b.setAttribute('aria-pressed', String(b.dataset.tab === tab));
+  $('set-general').classList.toggle('hidden', tab !== 'general');
+  $('set-updates').classList.toggle('hidden', tab !== 'updates');
+}
+async function openSettings(tab) {
+  const s = settings();
+  const fixed = await invoke('built_in_server');
+  $('set-server').value = s.server || $('f-server').value.trim();
+  $('set-server').disabled = !!fixed;
+  $('set-server-hint').textContent = fixed ? t('set.server_fixed', { url: fixed }) : t('set.server_hint');
+  $('set-lang').replaceChildren(...LANGS.map((l) => el('option', { value: l.id, text: l.name, selected: l.id === lang })));
+  $('set-tray').checked = s.tray;
+  $('set-auto').checked = s.autoUpdate;
+  $('set-version').textContent = t('set.version', { v: await invoke('app_version') });
+  showUpdate();
+  setTab(tab || 'general');
+  if (!$('settings').open) $('settings').showModal();
+}
+function showUpdate() {
+  $('set-install').classList.toggle('hidden', !state.update);
+  if (state.update) $('set-status').textContent = t('set.available', { v: state.update.latest });
+}
+for (const b of document.querySelectorAll('.set-tabs button')) b.addEventListener('click', () => setTab(b.dataset.tab));
+$('settings-btn').addEventListener('click', () => openSettings());
+$('join-settings').addEventListener('click', () => openSettings());
+$('set-server').addEventListener('change', () => {
+  const v = $('set-server').value.trim();
+  saveSettings({ ...settings(), server: v });
+  if (v) $('f-server').value = v;
+});
+$('set-lang').addEventListener('change', () => { setLanguage($('set-lang').value); $('main-header').dataset.key = ''; applyStrings(); $('f-lang').value = lang; });
+$('set-tray').addEventListener('change', () => { saveSettings({ ...settings(), tray: $('set-tray').checked }); invoke('set_close_to_tray', { on: $('set-tray').checked }); });
+$('set-auto').addEventListener('change', () => saveSettings({ ...settings(), autoUpdate: $('set-auto').checked }));
+// Looks for a newer release; with `install` and one found, installs it (the app restarts).
+async function checkUpdate(manual, install) {
+  if (manual) $('set-status').textContent = t('set.checking');
+  try {
+    const r = await invoke('check_update');
+    state.update = r.newer ? r : null;
+    $('rail').dataset.key = '';
+    if (manual) $('set-status').textContent = r.newer ? t('set.available', { v: r.latest }) : t('set.uptodate');
+    showUpdate();
+    if (r.newer && install) await installUpdate();
+  } catch (e) {
+    if (manual) $('set-status').textContent = t('set.failed', { e: String(e) });
+  }
+}
+async function installUpdate() {
+  $('set-status').textContent = t('set.installing');
+  showToast(t('set.installing'));
+  try { await invoke('install_update'); } catch (e) { $('set-status').textContent = t('set.failed', { e: String(e) }); showToast(t('set.failed', { e: String(e) })); }
+}
+$('set-check').addEventListener('click', () => checkUpdate(true, false));
+$('set-install').addEventListener('click', () => installUpdate());
 // The form makes a new room or joins one by its invite.
 function renderJoinForm() {
   const mode = state.joinMode;
@@ -739,6 +808,14 @@ invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
 fillLanguages();
 loadForm();
+invoke('set_close_to_tray', { on: settings().tray });
+// At start: check for an update, and install it right away unless turned off (nothing is
+// watched or streamed yet). Then every 6 hours, only to show it.
+invoke('updates_enabled').then((on) => {
+  if (!on) return;
+  setTimeout(() => checkUpdate(false, settings().autoUpdate), 1500);
+  setInterval(() => checkUpdate(false, false), 6 * 3600 * 1000);
+});
 // With a saved room, start in the last one opened; the join form is only for new rooms.
 // Not when a test joins on its own (STREAMER_APP_AUTOJOIN).
 invoke('snapshot').then(async (s) => {
