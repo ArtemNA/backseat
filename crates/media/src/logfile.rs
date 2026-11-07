@@ -150,14 +150,58 @@ pub fn gst_warnings() {
     }
     gst::log::remove_default_log_function();
     gst::log::set_default_threshold(gst::DebugLevel::Warning);
-    gst::log::add_log_function(|cat, level, _file, _func, _line, obj, msg| {
+    let all = std::env::var_os("STREAMER_LOG_ALL").is_some();
+    gst::log::add_log_function(move |cat, level, _file, _func, _line, obj, msg| {
         if level > gst::DebugLevel::Warning {
             return;
         }
         let what = obj.map(|o| o.to_string()).unwrap_or_default();
         let text = msg.get().map(|m| m.to_string()).unwrap_or_default();
+        if !all && known_harmless(cat.name(), &text) {
+            let n = HIDDEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // A count now and then, so the log still says they happened.
+            if n == 1 || n % 100 == 0 {
+                eprintln!("gst: {n} known harmless warnings hidden so far (STREAMER_LOG_ALL=1 shows them)");
+            }
+            return;
+        }
         eprintln!("gst {level:?} {} {what}: {text}", cat.name());
     });
+}
+
+static HIDDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GStreamer warnings that come with normal operation and say nothing about a fault: start-up
+/// probes, a WebRTC session before its first packet, live sources settling. Seen in every
+/// healthy session's log (2026-11-07), hundreds of lines a day; hidden so real ones stand out.
+fn known_harmless(category: &str, text: &str) -> bool {
+    const KNOWN: &[(&str, &str)] = &[
+        // Device probes at start: no CUDA runtime compiler, no D3D11 video interface on a
+        // presentation-only device.
+        ("cudanvrtc", "Could not open nvrtc library"),
+        ("d3d11device", "No such interface supported"),
+        // A WebRTC session before media flows.
+        ("webrtctransportsendbin", "did not really configure latency"),
+        ("webrtcbin", "failed to match fec decoder"),
+        ("rtpsession", "without knowing configured latency"),
+        ("rtpsession", "can not generate RTCP"),
+        ("rtpsession", "generated empty RTCP messages"),
+        ("rtpsession", "Don't have a clock yet"),
+        ("rtpsource", "running time not set"),
+        ("GST_PADS", "could not send sticky events"),
+        // Live sources and sinks settling: the jitterbuffer's first clock fit, the audio
+        // device's first drift correction, a window that did not change for a while.
+        ("rtpjitterbuffer", "too big, reset skew"),
+        ("audiobasesink", "correct clock skew"),
+        ("audiobasesink", "Unexpected discontinuity in audio timestamps"),
+        ("d3d11screencapturesrc", "Got expected error, try again"),
+        ("d3d11screencapturesrc", "No frame available"),
+        // Loopback capture has no per-session volume control (it is not a microphone).
+        ("wasapi2ringbuffer", "ISimpleAudioVolume"),
+        ("wasapi2ringbuffer", "WASAPI call failed"),
+        ("wasapi2", "WASAPI call failed"),
+    ];
+    KNOWN.iter().any(|(c, t)| category == *c && text.contains(t))
 }
 
 #[cfg(test)]
@@ -171,6 +215,13 @@ mod tests {
         assert_eq!(redact("a ws://u:p@h/ws and turns://x:y@z:5349"), "a ws://***@h/ws and turns://***@z:5349");
         assert_eq!(redact("mail me@example.org"), "mail me@example.org");
         assert_eq!(redact("ws://h/path@x"), "ws://h/path@x");
+    }
+
+    #[test]
+    fn harmless_list_matches_category_and_text() {
+        assert!(known_harmless("rtpjitterbuffer", "delta - skew: 0:00:02.6 too big, reset skew"));
+        assert!(!known_harmless("rtpjitterbuffer", "something else"));
+        assert!(!known_harmless("rtpbasedepay2", "too big, reset skew"));
     }
 
     #[test]
