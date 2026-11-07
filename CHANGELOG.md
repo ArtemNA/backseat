@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.1.7
+
+- **Default settings for streaming and watching.** Settings → Streaming picks resolution, frame rate, bitrate, codec and sound in advance every time you go live. Settings → Watching sets the most you want to receive: a stream asks for that from the start, so a 50 Mbit/s stream comes to you at 12 if that is your limit.
+- **A window's own sound by default.** Streaming a window now picks that program's sound only; a screen picks the system sound. Change it in Settings → Streaming.
+- **No double name after a crash or an update.** Backseat remembers its place in the room and takes it back when it starts again, and it tells the server when it quits.
+
 ## 0.1.6
 
 - **A broken connection to the server no longer ends the stream.** If the connection to the signaling server drops (it happens with hosted servers now and then), Backseat reconnects in the background and takes its place back; streams go on, and nobody in the room sees you leave. Before, the streamer's app could close at that moment.
