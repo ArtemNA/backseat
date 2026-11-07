@@ -820,7 +820,7 @@ invoke('test_rooms').then((other) => {
 });
 invoke('test_open_settings').then((tab) => { if (tab) setTimeout(() => openSettings(tab), 2500); });
 invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
-invoke('test_open_golive').then((on) => { if (on) setTimeout(() => $('go-live').click(), 3000); });
+invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); }, 3000); });
 fillLanguages();
 loadForm();
 invoke('set_close_to_tray', { on: settings().tray });

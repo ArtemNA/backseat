@@ -257,7 +257,16 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 Event::Lost => {
                     a.notify("lost".into());
-                    *a.session.lock().unwrap() = None;
+                    // Stop the stream and the watches first: dropping them while their
+                    // pipelines played crashed the app (0xC0000005) when Render's TLS
+                    // connection broke during a stream. STREAMER_DEBUG_DROP_ON_LOST keeps
+                    // the old drop, the spoiled variant for the gate.
+                    let s = a.session.lock().unwrap().take();
+                    if let Some(s) = s {
+                        if std::env::var_os("STREAMER_DEBUG_DROP_ON_LOST").is_none() {
+                            s.leave();
+                        }
+                    }
                     break;
                 }
                 _ => {}
@@ -402,8 +411,9 @@ async fn thumbnails(kind: String, ids: Vec<u64>) -> Vec<Thumb> {
 }
 
 #[tauri::command]
-fn test_open_golive() -> bool {
-    std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some()
+fn test_open_golive() -> Option<String> {
+    // "start" also presses Go live once the dialog is open.
+    std::env::var("STREAMER_APP_OPEN_GOLIVE").ok()
 }
 
 /// Tests only: STREAMER_APP_TEST_ROOMS="room B" makes the page go to room B after a
