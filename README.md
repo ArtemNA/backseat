@@ -17,7 +17,7 @@
   <a href="../../releases/latest"><b>Download for Windows</b></a>
 </p>
 
-![Watching a friend's stream](docs/images/watching.png)
+![Watching a friend's stream](.github/readme/watching.png)
 
 ## What it is
 
@@ -76,7 +76,7 @@ streams go on.
 
 For two people, with no server at all. You swap two texts once, through any messenger:
 
-![Direct connection](docs/images/direct.png)
+![Direct connection](.github/readme/direct.png)
 
 1. You: *Direct (beta)* → **I invite** → *Make the invite*, and send the text to your
    friend.
