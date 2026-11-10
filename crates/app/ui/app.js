@@ -381,40 +381,84 @@ function renderJoinForm() {
   $('join-submit').textContent = mode === 'create' ? t('join.create') : t('join.enter');
   renderDirectSteps();
 }
-// The two texts of a direct connection, in the join form.
+// The two texts of a direct connection, in the join form. With "short code" on, each text
+// also goes to the short-code service for 5 minutes; the full text stays as the fallback.
+const shortCodesOn = () => settings().shortCode !== false;
+const looksLikeCode = (v) => /^[0-9A-Za-z]{8}$/.test(v.replace(/[\s-]/g, ''));
+const showCode = (c) => `${c.slice(0, 4)}-${c.slice(4)}`;
+const codeClock = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+// A short code for a text, or nothing when the service is off, slow or down.
+async function shortCodeFor(text) {
+  if (!shortCodesOn()) return null;
+  try {
+    const r = await invoke('shortcode_put', { text });
+    return { code: r.code, until: Date.now() + r.expires_in * 1000 };
+  } catch { return { failed: true }; }
+}
+// What the person pasted: a full text as is, or the text behind a short code.
+async function pastedText(value) {
+  const v = value.trim();
+  if (!looksLikeCode(v)) return v;
+  if (!shortCodesOn()) throw new Error(t('direct.codes_off'));
+  try { return await invoke('shortcode_get', { code: v }); }
+  catch (e) { throw new Error(String(e) === 'not_found' ? t('direct.code_not_found') : t('direct.code_failed', { e: String(e) })); }
+}
+setInterval(() => {
+  for (const e of document.querySelectorAll('#direct-steps [data-until]')) {
+    const left = Number(e.dataset.until) - Date.now();
+    if (left > 0) { e.textContent = t('direct.code_left', { time: codeClock(left) }); continue; }
+    const d = state.directStep || {};
+    for (const k of ['inviteCode', 'answerCode']) if (d[k] && d[k].until <= Date.now()) d[k] = { expired: true };
+    renderDirectSteps();
+    break;
+  }
+}, 1000);
 function renderDirectSteps() {
   const box = $('direct-steps');
   if (state.joinMode !== 'direct') { box.replaceChildren(); return; }
   const d = state.directStep || (state.directStep = {});
   const name = () => $('f-name').value.trim();
-  const copy = (text) => el('button', { class: 'btn', type: 'button', text: t('direct.copy'), onclick: async (e) => { try { await navigator.clipboard.writeText(text); e.currentTarget.textContent = t('direct.copied'); } catch {} } });
+  const copy = (text, label = 'direct.copy') => el('button', { class: 'btn', type: 'button', text: t(label), onclick: async (e) => { try { await navigator.clipboard.writeText(text); e.currentTarget.textContent = t('direct.copied'); } catch {} } });
   // A textarea shows its .value, not a value attribute.
   const area = (value, readOnly) => Object.assign(el('textarea', { spellcheck: 'false', readonly: !!readOnly }), { value: value || '' });
   const run = async (btn, f) => {
     if (!name()) { joinError(t('direct.need_name')); return; }
     $('join-error').classList.add('hidden');
     btn.disabled = true; btn.textContent = t('direct.making');
-    try { await f(); state.joinOpen = true; } catch (e) { joinError(String(e)); }
+    try { await f(); state.joinOpen = true; } catch (e) { joinError(e instanceof Error ? e.message : String(e)); }
     renderDirectSteps(); tick();
   };
+  // The text to send: the short code first when there is one, the full text below it.
+  const outgoing = (title, text, code) => {
+    const out = [el('b', { text: title })];
+    if (code && code.code) {
+      out.push(el('div', { class: 'row' }, el('span', { class: 'direct-code', text: showCode(code.code) }), copy(showCode(code.code), 'direct.copy_code'), el('span', { class: 'small', 'data-until': String(code.until), text: t('direct.code_left', { time: codeClock(code.until - Date.now()) }) })),
+        el('span', { class: 'small', text: t('direct.or_text') }));
+    } else if (code) {
+      out.push(el('span', { class: 'small', text: t(code.expired ? 'direct.code_expired' : 'direct.no_code') }));
+    }
+    out.push(area(text, true), el('div', { class: 'row' }, copy(text)));
+    return out;
+  };
+  const short = el('label', { class: 'opt' }, el('input', { type: 'checkbox', id: 'direct-short', checked: shortCodesOn(), onchange: (e) => saveSettings({ ...settings(), shortCode: e.currentTarget.checked }) }), el('span', { text: ' ' + t('direct.short') }));
   const parts = [];
   if (state.directRole === 'invite') {
     if (!d.invite) {
-      parts.push(el('button', { class: 'btn primary', type: 'button', text: t('direct.make_invite'), onclick: (e) => run(e.currentTarget, async () => { d.invite = await invoke('direct_invite', { name: name() }); }) }));
+      parts.push(short, el('button', { class: 'btn primary', type: 'button', text: t('direct.make_invite'), onclick: (e) => run(e.currentTarget, async () => { const text = await invoke('direct_invite', { name: name() }); d.inviteCode = await shortCodeFor(text); d.invite = text; }) }));
     } else {
       const ans = area(d.answerIn || '');
       ans.oninput = () => { d.answerIn = ans.value; };
-      parts.push(el('b', { text: t('direct.send_invite') }), area(d.invite, true), el('div', { class: 'row' }, copy(d.invite)),
+      parts.push(...outgoing(t('direct.send_invite'), d.invite, d.inviteCode),
         el('b', { text: t('direct.paste_answer') }), ans,
-        el('button', { class: 'btn primary', type: 'button', text: d.accepted ? t('direct.connecting') : t('direct.connect'), disabled: !!d.accepted, onclick: (e) => run(e.currentTarget, async () => { await invoke('direct_accept', { text: ans.value }); d.accepted = true; state.directOpen = true; }) }));
+        el('button', { class: 'btn primary', type: 'button', text: d.accepted ? t('direct.connecting') : t('direct.connect'), disabled: !!d.accepted, onclick: (e) => run(e.currentTarget, async () => { await invoke('direct_accept', { text: await pastedText(ans.value) }); d.accepted = true; state.directOpen = true; }) }));
     }
   } else if (!d.answer) {
     const inv = area(d.inviteIn || '');
     inv.oninput = () => { d.inviteIn = inv.value; };
-    parts.push(el('b', { text: t('direct.paste_invite') }), inv,
-      el('button', { class: 'btn primary', type: 'button', text: t('direct.make_answer'), onclick: (e) => run(e.currentTarget, async () => { d.answer = await invoke('direct_answer', { text: inv.value, name: name() }); state.directOpen = true; }) }));
+    parts.push(short, el('b', { text: t('direct.paste_invite') }), inv,
+      el('button', { class: 'btn primary', type: 'button', text: t('direct.make_answer'), onclick: (e) => run(e.currentTarget, async () => { const text = await invoke('direct_answer', { text: await pastedText(inv.value), name: name() }); state.directOpen = true; d.answerCode = await shortCodeFor(text); d.answer = text; }) }));
   } else {
-    parts.push(el('b', { text: t('direct.send_answer') }), area(d.answer, true), el('div', { class: 'row' }, copy(d.answer)), el('span', { class: 'small', text: t('direct.wait') }));
+    parts.push(...outgoing(t('direct.send_answer'), d.answer, d.answerCode), el('span', { class: 'small', text: t('direct.wait') }));
   }
   box.replaceChildren(...parts);
 }
@@ -706,7 +750,7 @@ function renderLive(l) {
       el('span', { text: ms(v.rtt_ms) }),
       stateCell);
   });
-  panel.replaceChildren(
+  panel.replaceChildren(...[
     el('div', { class: 'tiles' },
       el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.viewers') }), el('span', { class: 'num', text: String(l.viewers.length) })),
       el('div', { class: 'tile' }, el('span', { class: 'small', text: t('live.encoding') }), el('span', { class: 'num', text: `${fps} fps` }),
@@ -720,7 +764,7 @@ function renderLive(l) {
           el('div', { class: 'tr head' }, el('span', { text: t('live.th_viewer') }), el('span', { text: t('live.th_quality') }), el('span', { text: t('live.th_rtt') }), el('span', { text: t('live.th_state') })),
           ...rows)
       : el('div', { class: 'empty', text: t('live.no_viewers') }),
-    el('p', { class: 'small', style: 'margin:0', text: t('live.isolation') }));
+    el('p', { class: 'small', style: 'margin:0', text: t('live.isolation') })].filter(Boolean));
 }
 
 // ---------- go live ----------
@@ -847,6 +891,8 @@ function showNotice(n) {
 async function tick() {
   try {
     const s = await invoke('snapshot');
+    // A direct connection that ended leaves nothing to reuse: the form starts over.
+    if (state.snap && state.snap.direct === 'connected' && s.direct !== 'connected') { state.directStep = {}; renderDirectSteps(); }
     state.snap = s;
     showNotice(s.notice);
     render(s);
@@ -932,19 +978,30 @@ invoke('test_rooms').then((other) => {
 });
 invoke('test_open_settings').then((tab) => { if (tab) setTimeout(async () => { await openSettings(tab); if (tab === 'general' && document.body.dataset.clickLogs !== 'done') { document.body.dataset.clickLogs = 'done'; setTimeout(() => $('set-logs').click(), 800); } }, 2500); });
 // Tests only: drive the direct connection like a person, texts through files.
-// STREAMER_APP_TEST_DIRECT="invite|answer NAME DIR [live] [watch:NAME]".
+// STREAMER_APP_TEST_DIRECT="invite|answer NAME DIR [code|nocode] [live] [watch:NAME] [leave]".
 invoke('test_direct').then(async (spec) => {
   if (!spec) return;
   const [role, name, dir, ...rest] = spec.split(' ');
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const until = async (f, ms = 30000) => { const end = Date.now() + ms; while (Date.now() < end) { const v = await f(); if (v) return v; await wait(250); } return null; };
   const button = (label) => [...document.querySelectorAll('#direct-steps button')].find((b) => b.textContent === t(label));
+  // [code]: swap the short codes when the app shows them, else the full texts.
+  // [nocode]: short codes switched off.
+  const useCode = rest.includes('code');
+  saveSettings({ ...settings(), shortCode: !rest.includes('nocode') });
+  const outgoing = async () => {
+    const text = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; }, 20000);
+    if (!text || !useCode) return text;
+    const code = document.querySelector('#direct-steps .direct-code');
+    invoke('test_report', { msg: `direct code ${code ? code.textContent + ' ' + document.querySelector('#direct-steps [data-until]').textContent : 'none: ' + $('direct-steps').textContent.slice(0, 120)}` });
+    return code ? code.textContent : text;
+  };
   await wait(1500);
   state.joinMode = 'direct'; state.directRole = role; state.directStep = {}; state.joinOpen = true;
   $('f-name').value = name; renderJoinForm(); tick();
   if (role === 'invite') {
     button('direct.make_invite').click();
-    const invite = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; }, 20000);
+    const invite = await outgoing();
     if (!invite) { invoke('test_report', { msg: `direct invite failed: ${$('join-error').textContent} | mode ${state.joinMode} role ${state.directRole} step ${JSON.stringify(Object.keys(state.directStep || {}))} | steps: ${$('direct-steps').innerHTML.slice(0, 300)}` }); return; }
     await invoke('test_put', { dir, name: 'invite.txt', text: invite });
     invoke('test_report', { msg: `direct invite ${invite.length} chars` });
@@ -955,7 +1012,8 @@ invoke('test_direct').then(async (spec) => {
     const invite = await until(() => invoke('test_get', { dir, name: 'invite.txt' }), 60000);
     document.querySelector('#direct-steps textarea').value = invite;
     button('direct.make_answer').click();
-    const answer = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; });
+    const answer = await until(outgoing, 30000);
+    if (!answer) { invoke('test_report', { msg: `direct answer failed: ${$('join-error').textContent}` }); return; }
     await invoke('test_put', { dir, name: 'answer.txt', text: answer });
     invoke('test_report', { msg: `direct answer ${answer.length} chars` });
   }
@@ -970,7 +1028,11 @@ invoke('test_direct').then(async (spec) => {
     if (chip) chip.querySelector('button').click();
     invoke('test_report', { msg: `direct watch ${who}: ${chip ? 'pressed' : 'no stream to watch'}` });
   }
+  await wait(6000); { const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); let nulls = 0; while (w.nextNode()) if (w.currentNode.data.trim() === 'null') nulls++; const sc = (id) => { const e = $(id); return e ? `${e.scrollHeight}/${e.clientHeight}` : '-'; }; invoke('test_report', { msg: `direct page null text nodes ${nulls}; scroll content ${sc('content')} main ${(() => { const m = document.querySelector('.main'); return `${m.scrollHeight}/${m.clientHeight}`; })()} window ${innerHeight}` }); }
   if (rest.includes('leave')) { await wait(12000); $('leave').click(); invoke('test_report', { msg: 'direct left' }); }
+  await until(() => state.snap && state.snap.direct !== 'connected', 90000);
+  await wait(1500);
+  invoke('test_report', { msg: `direct form after the end: ${$('direct-steps').innerText.replace(/\s+/g, ' ').slice(0, 80)}` });
 });invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); if (on === 'audio') setTimeout(() => { const pick = () => document.querySelector('input[name=audio]:checked')?.value; const screen = pick(); $('gl-tab-window').click(); setTimeout(() => invoke('test_report', { msg: `audio screen ${screen} window ${pick()} prefs ${JSON.stringify(settings().stream)}` }), 800); }, 2500); }, 3000); });
 // Tests only: settings given by the test run, before anything reads them.

@@ -255,6 +255,62 @@ fn test_get(dir: String, name: String) -> Option<String> {
     std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()
 }
 
+/// Short codes for direct connection texts: a service keeps a text 5 minutes under an
+/// 8-character code (local-drop's /api/backseat/code). Optional: on any failure the app
+/// keeps showing the full text, and a pasted full text never needs the service.
+#[derive(Serialize)]
+struct ShortCode {
+    code: String,
+    expires_in: u64,
+}
+
+/// The short-code service; `STREAMER_SHORTCODE_URL` points tests elsewhere.
+fn shortcode_service() -> String {
+    std::env::var("STREAMER_SHORTCODE_URL").unwrap_or_else(|_| "https://local-drop.onrender.com".into()).trim_end_matches('/').to_string()
+}
+
+fn shortcode_agent(secs: u64) -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(secs))).http_status_as_error(false).build().into()
+}
+
+/// Puts a direct connection text on the service; gives up after 4 s.
+#[tauri::command]
+async fn shortcode_put(text: String) -> Result<ShortCode, String> {
+    let url = format!("{}/api/backseat/code", shortcode_service());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut r = shortcode_agent(4).post(&url).header("Content-Type", "application/json").send(serde_json::json!({ "text": text }).to_string()).map_err(|e| e.to_string())?;
+        let status = r.status().as_u16();
+        let body: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        if status != 201 {
+            return Err(body["error"].as_str().unwrap_or("error").to_string());
+        }
+        Ok(ShortCode { code: body["code"].as_str().unwrap_or_default().to_string(), expires_in: body["expires_in"].as_u64().unwrap_or(300) })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .inspect_err(|e| eprintln!("shortcode: put failed: {e}"))
+}
+
+/// The text behind a short code; gives up after 8 s.
+#[tauri::command]
+async fn shortcode_get(code: String) -> Result<String, String> {
+    let code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let url = format!("{}/api/backseat/code/{code}", shortcode_service());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut r = shortcode_agent(8).get(&url).call().map_err(|e| e.to_string())?;
+        let status = r.status().as_u16();
+        let body: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        match status {
+            200 => Ok(body["text"].as_str().unwrap_or_default().to_string()),
+            404 => Err("not_found".into()),
+            _ => Err(body["error"].as_str().unwrap_or("error").to_string()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .inspect_err(|e| eprintln!("shortcode: get failed: {e}"))
+}
+
 /// Opens the log folder in Explorer, for sending logs with a bug report.
 #[tauri::command]
 fn open_logs() -> Result<(), String> {
@@ -978,7 +1034,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![open_logs, test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![shortcode_put, shortcode_get, open_logs, test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .build(tauri::generate_context!())
         .expect("tauri app")
         .run(|h, e| {

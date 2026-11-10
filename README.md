@@ -85,6 +85,11 @@ For two people, with no server at all. You swap two texts once, through any mess
 3. You paste the answer and press *Connect*. Done: either of you can now go live and the
    other can watch, both at once too.
 
+Instead of each long text, Backseat also shows a **short code** like `K7Q2-9XMB` that
+works for 5 minutes; send whichever is easier, the other side pastes it the same way.
+For those 5 minutes the text is kept on a small server; untick *Make a short code* to
+use only the full texts. When that server does not answer, you just get the full text.
+
 Good to know before you use it:
 
 - **Only two people.** For more, use a room.

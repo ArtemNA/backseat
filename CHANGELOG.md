@@ -5,7 +5,10 @@ Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`
 ## 0.1.8
 
 - **Direct connection (beta).** Two people can connect with no server at all: one makes an invite, the other answers, and you swap these two texts once through any messenger. Then either of you can stream to the other, both at once too. Only for two people and with no reconnection: see the README for what to know before using it.
+- **Short codes for direct connections.** Instead of the long text you can send an 8-character code like `K7Q2-9XMB`, valid for 5 minutes, with a countdown next to it. The text stays on a small server for those 5 minutes; untick *Make a short code* to keep it off any server. If the server does not answer within a few seconds, the full text is shown as before, and pasting a full text always works.
 - **Open the log folder** from *Settings → General*, to send logs with a bug report.
+- The form of a direct connection starts over when the connection ends.
+- A stray "null" no longer shows under your stream's numbers, and the info under a watched stream no longer scrolls when it fits.
 - The join form no longer jumps to the invite-code tab when reopening the last room fails at start while you are on another tab.
 - The installer now includes what direct connections need, and the license notes list dav1d and the GStreamer Rust plugins.
 

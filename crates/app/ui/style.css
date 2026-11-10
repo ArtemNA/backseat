@@ -74,7 +74,7 @@ a { color: #8fb4ff; }
 .vbar .btn.icon { width: 30px; padding: 0; justify-content: center; font-size: 15px; }
 .vbar select { height: 28px; padding: 0 4px; font-size: 12px; max-width: 128px; }
 .below { flex: 1 1 40%; min-height: 0; }
-.stage:not(.hidden) + .below { flex: 0 1 auto; max-height: 45%; }
+.stage:not(.hidden) + .below { flex: 0 0 auto; max-height: 45%; }
 .chips { display: flex; gap: 10px; flex-wrap: wrap; }
 .chip { display: flex; align-items: center; gap: 10px; background: var(--card); border-radius: 8px; padding: 8px 10px 8px 8px; }
 .chip b { color: var(--bright); }
@@ -184,5 +184,6 @@ dialog::backdrop { background: rgba(0, 0, 0, .7); }
 /* Direct connection (beta) */
 .direct-steps { display: flex; flex-direction: column; gap: 8px; }
 .direct-steps textarea { width: 100%; min-height: 72px; resize: vertical; background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px Consolas, monospace; word-break: break-all; }
+.direct-steps .direct-code { font: 600 22px Consolas, monospace; letter-spacing: 2px; color: var(--bright); background: var(--sunk); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; user-select: all; }
 .direct-steps .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .beta { font-size: 10px; font-weight: 700; letter-spacing: .06em; color: #fff; background: #b5652a; border-radius: 4px; padding: 1px 5px; margin-left: 6px; vertical-align: middle; }
