@@ -923,6 +923,8 @@ invoke('test_form').then((spec) => {
   const [mode, value, name, server] = spec.split('|');
   setTimeout(() => {
     if (mode === 'show') { state.joinOpen = true; tick(); return; }
+    // "direct|<pasted>|<name>": the direct form, invited side, with that text pasted.
+    if (mode === 'direct') { state.joinOpen = true; state.joinMode = 'direct'; state.directRole = 'answer'; state.directStep = { inviteIn: value }; $('f-name').value = name; renderJoinForm(); tick(); return; }
     // "leave|<other room code>|": leave the room we are in, then go to the other one
     // through the rail.
     if (mode === 'leave') {
