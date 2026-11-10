@@ -255,6 +255,20 @@ fn test_get(dir: String, name: String) -> Option<String> {
     std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()
 }
 
+/// Opens the log folder in Explorer, for sending logs with a bug report.
+#[tauri::command]
+fn open_logs() -> Result<(), String> {
+    let dir = media::logfile::dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if std::env::var_os("STREAMER_APP_TEST_OPEN_LOGS").is_some() {
+        // Tests: say what would open instead of opening a window.
+        eprintln!("test: open logs {}", dir.display());
+        return Ok(());
+    }
+    std::process::Command::new("explorer").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Tests only: STREAMER_APP_TEST_PREFS, JSON merged into the saved settings at start.
 #[tauri::command]
 fn test_prefs() -> Option<String> {
@@ -964,7 +978,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![open_logs, test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .build(tauri::generate_context!())
         .expect("tauri app")
         .run(|h, e| {

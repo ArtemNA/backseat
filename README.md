@@ -116,7 +116,8 @@ Good to know before you use it:
   the mouse wheel for volume.
 - **Upload limit:** in the go-live dialog, enter your upload speed; Backseat warns when
   one more viewer would not fit.
-- **Logs** for bug reports are in `%LOCALAPPDATA%\Backseat\logs`.
+- **Logs** for bug reports: *Settings → General → Open the log folder*
+  (`%LOCALAPPDATA%\Backseat\logs`). Send the newest files with a description.
 
 ## Run a signaling server
 

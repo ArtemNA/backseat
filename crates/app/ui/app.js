@@ -363,6 +363,7 @@ async function installUpdate() {
   showToast(t('set.installing'));
   try { await invoke('install_update'); } catch (e) { $('set-status').textContent = t('set.failed', { e: String(e) }); showToast(t('set.failed', { e: String(e) })); }
 }
+$('set-logs').addEventListener('click', () => invoke('open_logs').catch((e) => { $('set-status').textContent = String(e); }));
 $('set-check').addEventListener('click', () => checkUpdate(true, false));
 $('set-install').addEventListener('click', () => installUpdate());
 // The form makes a new room or joins one by its invite.
@@ -929,7 +930,7 @@ invoke('test_rooms').then((other) => {
     }, 5000);
   }, 5000);
 });
-invoke('test_open_settings').then((tab) => { if (tab) setTimeout(() => openSettings(tab), 2500); });
+invoke('test_open_settings').then((tab) => { if (tab) setTimeout(async () => { await openSettings(tab); if (tab === 'general' && document.body.dataset.clickLogs !== 'done') { document.body.dataset.clickLogs = 'done'; setTimeout(() => $('set-logs').click(), 800); } }, 2500); });
 // Tests only: drive the direct connection like a person, texts through files.
 // STREAMER_APP_TEST_DIRECT="invite|answer NAME DIR [live] [watch:NAME]".
 invoke('test_direct').then(async (spec) => {
