@@ -365,10 +365,54 @@ $('set-install').addEventListener('click', () => installUpdate());
 // The form makes a new room or joins one by its invite.
 function renderJoinForm() {
   const mode = state.joinMode;
-  seg($('join-mode'), [['create', t('join.create_mode')], ['code', t('join.code_mode')]], mode, (v) => { state.joinMode = v; renderJoinForm(); });
+  seg($('join-mode'), [['create', t('join.create_mode')], ['code', t('join.code_mode')], ['direct', t('join.direct_mode')]], mode, (v) => { state.joinMode = v; renderJoinForm(); });
   $('row-title').classList.toggle('hidden', mode !== 'create');
   $('row-code').classList.toggle('hidden', mode !== 'code');
+  $('row-direct').classList.toggle('hidden', mode !== 'direct');
+  // No server in a direct connection.
+  invoke('built_in_server').then((fixed) => { if (!fixed) $('f-server').closest('label').classList.toggle('hidden', mode === 'direct'); });
+  state.directRole = state.directRole || 'invite';
+  seg($('direct-role'), [['invite', t('direct.role_invite')], ['answer', t('direct.role_answer')]], state.directRole, (v) => { state.directRole = v; state.directStep = {}; renderJoinForm(); });
+  $('join-submit').classList.toggle('hidden', mode === 'direct');
   $('join-submit').textContent = mode === 'create' ? t('join.create') : t('join.enter');
+  renderDirectSteps();
+}
+// The two texts of a direct connection, in the join form.
+function renderDirectSteps() {
+  const box = $('direct-steps');
+  if (state.joinMode !== 'direct') { box.replaceChildren(); return; }
+  const d = state.directStep || (state.directStep = {});
+  const name = () => $('f-name').value.trim();
+  const copy = (text) => el('button', { class: 'btn', type: 'button', text: t('direct.copy'), onclick: async (e) => { try { await navigator.clipboard.writeText(text); e.currentTarget.textContent = t('direct.copied'); } catch {} } });
+  // A textarea shows its .value, not a value attribute.
+  const area = (value, readOnly) => Object.assign(el('textarea', { spellcheck: 'false', readonly: !!readOnly }), { value: value || '' });
+  const run = async (btn, f) => {
+    if (!name()) { joinError(t('direct.need_name')); return; }
+    $('join-error').classList.add('hidden');
+    btn.disabled = true; btn.textContent = t('direct.making');
+    try { await f(); state.joinOpen = true; } catch (e) { joinError(String(e)); }
+    renderDirectSteps(); tick();
+  };
+  const parts = [];
+  if (state.directRole === 'invite') {
+    if (!d.invite) {
+      parts.push(el('button', { class: 'btn primary', type: 'button', text: t('direct.make_invite'), onclick: (e) => run(e.currentTarget, async () => { d.invite = await invoke('direct_invite', { name: name() }); }) }));
+    } else {
+      const ans = area(d.answerIn || '');
+      ans.oninput = () => { d.answerIn = ans.value; };
+      parts.push(el('b', { text: t('direct.send_invite') }), area(d.invite, true), el('div', { class: 'row' }, copy(d.invite)),
+        el('b', { text: t('direct.paste_answer') }), ans,
+        el('button', { class: 'btn primary', type: 'button', text: d.accepted ? t('direct.connecting') : t('direct.connect'), disabled: !!d.accepted, onclick: (e) => run(e.currentTarget, async () => { await invoke('direct_accept', { text: ans.value }); d.accepted = true; state.directOpen = true; }) }));
+    }
+  } else if (!d.answer) {
+    const inv = area(d.inviteIn || '');
+    inv.oninput = () => { d.inviteIn = inv.value; };
+    parts.push(el('b', { text: t('direct.paste_invite') }), inv,
+      el('button', { class: 'btn primary', type: 'button', text: t('direct.make_answer'), onclick: (e) => run(e.currentTarget, async () => { d.answer = await invoke('direct_answer', { text: inv.value, name: name() }); state.directOpen = true; }) }));
+  } else {
+    parts.push(el('b', { text: t('direct.send_answer') }), area(d.answer, true), el('div', { class: 'row' }, copy(d.answer)), el('span', { class: 'small', text: t('direct.wait') }));
+  }
+  box.replaceChildren(...parts);
 }
 function joinError(text) {
   $('join-error').textContent = text;
@@ -378,6 +422,7 @@ $('join-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   $('join-error').classList.add('hidden');
   const base = { server: $('f-server').value.trim(), name: $('f-name').value.trim() };
+  if (state.joinMode === 'direct') return;
   let r;
   if (state.joinMode === 'create') {
     const title = $('f-title').value.trim();
@@ -406,8 +451,22 @@ function render(s) {
   $('shell').classList.toggle('hidden', joinShown);
   $('invite').classList.toggle('hidden', !s.connected);
   $('leave').classList.toggle('hidden', !s.connected);
-  if (!s.connected) { renderLobby(s); syncVideos(); return; }
+  if (!s.connected) { state.direct = null; renderLobby(s); syncVideos(); return; }
   const me = s.peers.find((p) => p.me) || { name: '?' };
+  // A direct connection (beta): a room of two with no server; nothing to save or invite to.
+  if (s.direct) {
+    if (s.direct === 'connected' && state.directOpen) { state.directOpen = false; state.joinOpen = false; }
+    state.current = null;
+    $('room-name').replaceChildren(document.createTextNode(t('direct.title')), el('span', { class: 'beta', text: 'BETA' }));
+    $('room-name').title = '';
+    $('invite').classList.add('hidden');
+    $('me-avatar').replaceWith(Object.assign(avatar(me.name), { id: 'me-avatar' }));
+    $('me-state').textContent = s.live ? t('room.live_for', { t: clock(s.live.since_secs) }) : t('room.not_live');
+    $('me-state').style.color = s.live ? '#ff9aa0' : '';
+    $('go-live').classList.toggle('hidden', !!s.live);
+    renderRail(s); renderPeople(s); renderHeader(s); renderContent(s);
+    return;
+  }
   // Joined some other way (tests): remember what we are in.
   if (!state.current || state.current.room !== s.room || (s.title && state.current.title !== s.title)) {
     // The server's title wins: a room joined by code learns its name here.
@@ -776,7 +835,7 @@ $('gl-start').addEventListener('click', async () => {
 function showNotice(n) {
   if (!n) return;
   const [kind, rest] = [n.split(':')[0], n.slice(n.indexOf(':') + 1)];
-  const text = kind === 'lost' ? t('notice.lost') : kind === 'watch_ended' ? t('notice.watch_ended', { reason: rest }) : t('notice.error', { msg: rest });
+  const text = kind === 'direct_ended' ? t('notice.direct_ended') : kind === 'lost' ? t('notice.lost') : kind === 'watch_ended' ? t('notice.watch_ended', { reason: rest }) : t('notice.error', { msg: rest });
   const box = $('join-error');
   box.textContent = text;
   box.classList.remove('hidden');
@@ -868,7 +927,46 @@ invoke('test_rooms').then((other) => {
   }, 5000);
 });
 invoke('test_open_settings').then((tab) => { if (tab) setTimeout(() => openSettings(tab), 2500); });
-invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
+// Tests only: drive the direct connection like a person, texts through files.
+// STREAMER_APP_TEST_DIRECT="invite|answer NAME DIR [live] [watch:NAME]".
+invoke('test_direct').then(async (spec) => {
+  if (!spec) return;
+  const [role, name, dir, ...rest] = spec.split(' ');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (f, ms = 30000) => { const end = Date.now() + ms; while (Date.now() < end) { const v = await f(); if (v) return v; await wait(250); } return null; };
+  const button = (label) => [...document.querySelectorAll('#direct-steps button')].find((b) => b.textContent === t(label));
+  await wait(1500);
+  state.joinMode = 'direct'; state.directRole = role; state.directStep = {}; state.joinOpen = true;
+  $('f-name').value = name; renderJoinForm(); tick();
+  if (role === 'invite') {
+    button('direct.make_invite').click();
+    const invite = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; });
+    await invoke('test_put', { dir, name: 'invite.txt', text: invite });
+    invoke('test_report', { msg: `direct invite ${invite.length} chars` });
+    const answer = await until(() => invoke('test_get', { dir, name: 'answer.txt' }), 60000);
+    document.querySelectorAll('#direct-steps textarea')[1].value = answer;
+    button('direct.connect').click();
+  } else {
+    const invite = await until(() => invoke('test_get', { dir, name: 'invite.txt' }), 60000);
+    document.querySelector('#direct-steps textarea').value = invite;
+    button('direct.make_answer').click();
+    const answer = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; });
+    await invoke('test_put', { dir, name: 'answer.txt', text: answer });
+    invoke('test_report', { msg: `direct answer ${answer.length} chars` });
+  }
+  await until(() => state.snap && state.snap.direct === 'connected', 30000);
+  await wait(2000);
+  invoke('test_report', { msg: `direct connected; join form shown ${!$('join').classList.contains('hidden')}; peers ${state.snap.peers.map((p) => p.name).join(',')}` });
+  if (rest.includes('live')) { await wait(1000); $('go-live').click(); await wait(2500); $('gl-start').click(); }
+  const w = rest.find((x) => x.startsWith('watch:'));
+  if (w) {
+    const who = w.slice(6);
+    const chip = await until(() => [...document.querySelectorAll('.chip')].find((c) => c.querySelector('b')?.textContent === who), 30000);
+    if (chip) chip.querySelector('button').click();
+    invoke('test_report', { msg: `direct watch ${who}: ${chip ? 'pressed' : 'no stream to watch'}` });
+  }
+  if (rest.includes('leave')) { await wait(12000); $('leave').click(); invoke('test_report', { msg: 'direct left' }); }
+});invoke('test_upload_limit').then((v) => { if (v) setUploadLimit(v); });
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); if (on === 'audio') setTimeout(() => { const pick = () => document.querySelector('input[name=audio]:checked')?.value; const screen = pick(); $('gl-tab-window').click(); setTimeout(() => invoke('test_report', { msg: `audio screen ${screen} window ${pick()} prefs ${JSON.stringify(settings().stream)}` }), 800); }, 2500); }, 3000); });
 // Tests only: settings given by the test run, before anything reads them.
 invoke('test_prefs').then((p) => { if (p) saveSettings({ ...settings(), ...JSON.parse(p) }); });

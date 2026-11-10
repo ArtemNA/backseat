@@ -232,6 +232,13 @@ impl ServerClient {
         Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
     }
 
+    /// A client with no server, for a direct session: what it is asked to send comes out of
+    /// the returned receiver, for the direct link to carry.
+    pub fn local(id: PeerId, peers: Vec<PeerInfo>) -> (Arc<Self>, mpsc::Receiver<ClientMsg>) {
+        let (out, rx) = mpsc::channel();
+        (Arc::new(Self { out, id, peers, title: None, resume: None, resumed: false, thread: std::sync::Mutex::new(None) }), rx)
+    }
+
     pub fn send(&self, m: ClientMsg) {
         let _ = self.out.send(m);
     }

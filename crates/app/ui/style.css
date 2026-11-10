@@ -181,3 +181,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .7); }
 .set-tabs button:hover { background: #35373c; color: var(--bright); }
 .set-tabs button[aria-pressed="true"] { background: #404249; color: var(--bright); }
 .set-page { flex: 1; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+/* Direct connection (beta) */
+.direct-steps { display: flex; flex-direction: column; gap: 8px; }
+.direct-steps textarea { width: 100%; min-height: 72px; resize: vertical; background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px Consolas, monospace; word-break: break-all; }
+.direct-steps .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.beta { font-size: 10px; font-weight: 700; letter-spacing: .06em; color: #fff; background: #b5652a; border-radius: 4px; padding: 1px 5px; margin-left: 6px; vertical-align: middle; }

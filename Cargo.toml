@@ -11,7 +11,7 @@ publish = false
 [workspace.dependencies]
 gst = { package = "gstreamer", version = "0.25" }
 gst-app = { package = "gstreamer-app", version = "0.25" }
-gst-webrtc = { package = "gstreamer-webrtc", version = "0.25" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.25", features = ["v1_18"] }
 gst-sdp = { package = "gstreamer-sdp", version = "0.25" }
 gst-rtp = { package = "gstreamer-rtp", version = "0.25" }
 media = { path = "crates/media" }

@@ -27,6 +27,8 @@ struct App {
     release: Mutex<Option<update::Release>>,
     /// Key of the open room in the saved places (`resume_key`).
     joined: Mutex<Option<String>>,
+    /// The direct connection (beta) and our name in it, while there is one.
+    direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
 }
 
 /// Places this app holds on servers, saved so a new start after a crash, a forced close or
@@ -73,6 +75,15 @@ fn leave_for_good(app: &App, wait: std::time::Duration) {
     if let Some(k) = app.joined.lock().unwrap().take() {
         save_place(&k, None);
     }
+    // A direct connection ends with the session; the other side sees it close.
+    let direct = app.direct.lock().unwrap().take();
+    if let Some((c, _)) = direct {
+        // A moment for our Leave to reach them before the channel closes.
+        if c.is_open() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        c.close();
+    }
 }
 
 impl App {
@@ -104,6 +115,8 @@ struct Snapshot {
     live: Option<sampler::LiveStats>,
     notice: Option<String>,
     link: Option<String>,
+    /// A direct session (no server, beta): "stream" or "watch".
+    direct: Option<&'static str>,
 }
 
 #[tauri::command]
@@ -112,7 +125,7 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -130,7 +143,62 @@ fn snapshot(app: tauri::State<'_, Arc<App>>) -> Snapshot {
         live: app.sampler.live(),
         notice,
         link,
+        direct: s.direct.then(|| if app.direct.lock().unwrap().as_ref().is_some_and(|(c, _)| c.is_open()) { "connected" } else { "waiting" }),
     }
+}
+
+/// Makes a session of a direct connection the open one.
+fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &str, other: &str, inviter: bool) -> Result<(), String> {
+    let (s, events) = Session::direct(control, name, other, inviter)?;
+    *app.session.lock().unwrap() = Some(s.clone());
+    app.sampler.attach(s);
+    let a = app.clone();
+    std::thread::spawn(move || {
+        while let Ok(e) = events.recv() {
+            match e {
+                Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
+                Event::Error(m) => a.notify(format!("error:{m}")),
+                Event::Lost => {
+                    // The other person left or the connection broke: stop cleanly.
+                    a.notify("direct_ended".into());
+                    leave_for_good(&a, std::time::Duration::from_millis(100));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Direct connection (beta), the inviting side: our invite text.
+#[tauri::command]
+async fn direct_invite(app: tauri::State<'_, Arc<App>>, name: String) -> Result<String, String> {
+    leave_for_good(&app, std::time::Duration::from_millis(300));
+    let control = media::direct::Control::new(&IceConfig::default())?;
+    *app.direct.lock().unwrap() = Some((control.clone(), name.clone()));
+    tauri::async_runtime::spawn_blocking(move || control.invite(&name, std::time::Duration::from_secs(8))).await.map_err(|e| e.to_string())?
+}
+
+/// Direct connection, the inviting side: the friend's answer. Connects in a moment.
+#[tauri::command]
+async fn direct_accept(app: tauri::State<'_, Arc<App>>, text: String) -> Result<(), String> {
+    let (control, name) = app.direct.lock().unwrap().clone().ok_or("make an invite first")?;
+    let other = control.accept(&text)?;
+    install_direct(app.inner(), control, &name, &other, true)
+}
+
+/// Direct connection, the invited side: takes the invite, returns our answer text.
+#[tauri::command]
+async fn direct_answer(app: tauri::State<'_, Arc<App>>, text: String, name: String) -> Result<String, String> {
+    leave_for_good(&app, std::time::Duration::from_millis(300));
+    let control = media::direct::Control::new(&IceConfig::default())?;
+    *app.direct.lock().unwrap() = Some((control.clone(), name.clone()));
+    let c = control.clone();
+    let (answer, other) = tauri::async_runtime::spawn_blocking(move || c.answer(&text, &name, std::time::Duration::from_secs(8))).await.map_err(|e| e.to_string())??;
+    let name = app.direct.lock().unwrap().as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+    install_direct(app.inner(), control, &name, &other, false)?;
+    Ok(answer)
 }
 
 /// The signaling server fixed at build time (STREAMER_SERVER_URL when compiling), if any.
@@ -165,6 +233,26 @@ fn updates_enabled() -> bool {
     let on = std::env::var_os("STREAMER_UPDATE_URL").is_some() || !std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_"));
     eprintln!("update: checks {}", if on { "on" } else { "off" });
     on
+}
+
+/// Tests only: STREAMER_APP_TEST_DIRECT="stream|watch NAME DIR" drives the direct panel;
+/// the texts go through files in DIR instead of a messenger.
+#[tauri::command]
+fn test_direct() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_DIRECT").ok()
+}
+
+#[tauri::command]
+fn test_put(dir: String, name: String, text: String) {
+    if std::env::var_os("STREAMER_APP_TEST_DIRECT").is_some() {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), text);
+    }
+}
+
+#[tauri::command]
+fn test_get(dir: String, name: String) -> Option<String> {
+    std::env::var_os("STREAMER_APP_TEST_DIRECT")?;
+    std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()
 }
 
 /// Tests only: STREAMER_APP_TEST_PREFS, JSON merged into the saved settings at start.
@@ -486,7 +574,7 @@ fn test_form() -> Option<String> {
 
 #[tauri::command]
 fn test_report(msg: String) {
-    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() || std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some() {
+    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() || std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some() || std::env::var_os("STREAMER_APP_TEST_DIRECT").is_some() {
         eprintln!("test: {msg}");
     }
 }
@@ -876,7 +964,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .build(tauri::generate_context!())
         .expect("tauri app")
         .run(|h, e| {

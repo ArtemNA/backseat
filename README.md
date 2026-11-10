@@ -1,103 +1,165 @@
-# Backseat
+<p align="center">
+  <img src="crates/app/icons/icon.png" width="112" alt="Backseat icon">
+</p>
 
-Backseat is a Windows desktop app for streaming games to friends in rooms. The video goes
-straight from the streamer's computer to each viewer over a peer-to-peer WebRTC
-connection; there is no media server in between. The only server is a small signaling
-server that tells the people in a room about each other.
+<h1 align="center">Backseat</h1>
 
-The interface looks and works like a Discord server: rooms in a rail on the left, the
-people and streams of the open room in the middle, video inside the main window or in its
-own window.
+<p align="center">
+  Stream your game to friends, straight from your PC to theirs.<br>
+  Low latency, hardware encoding, no media server.
+</p>
+
+<p align="center">
+  <b>English</b> · <a href="README.uk.md">Українська</a> · <a href="README.ru.md">Русский</a>
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>Download for Windows</b></a>
+</p>
+
+![Watching a friend's stream](docs/images/watching.png)
+
+## What it is
+
+Backseat is a Windows app for watching each other play. It looks and feels like a small
+Discord server: rooms on the left, the people in the open room, and their streams in the
+middle. Anyone in a room can go live, and anyone can watch, several streams at once.
+
+The video goes **directly** from the streamer's computer to each viewer. Nothing in
+between stores or re-encodes it, which keeps the delay low (tens of milliseconds on a
+good connection) and the picture as sharp as your upload allows.
 
 ## Features
 
-- **Rooms by invite code.** Create a room and send the invite (a code or a link); only
-  people with the code get in. Invite links open the app directly.
-- **Several streams per room.** Anyone in the room can go live; anyone can watch any
-  stream, several at once.
-- **Hardware encoding** on NVIDIA (NVENC), AMD (AMF) and Intel (Quick Sync) graphics, in
-  H.264, H.265 or AV1. Only encoders that work on the computer are offered.
-- **Quality presets**: 720p, 1080p or 1440p at 30 or 60 fps, with bitrate presets from 2 to
-  50 Mbit/s. The streamer sets the maximum; each viewer may pick a
-  lower quality, never a higher one.
-- **One viewer's problems stay with that viewer.** Each viewer gets their own stream; a
-  viewer on a slow link catches up by skipping frames, and the others see nothing of it.
-  The streamer sees a mark next to that viewer.
-- **Upload planning**: the app shows how much upload the stream needs for the current
-  viewers and warns when the next viewer would not fit into your limit.
-- **Screen or window capture** with system sound, the sound of one program only, or no
-  sound.
-- **Low latency**: lost packets are repaired by retransmission, and the viewer shows the
-  measured latency in its stats.
-- **Change a stream while live**: switch the screen or window, resolution, frame rate or
-  bitrate without viewers reconnecting.
-- **Sound controls on the video**, also in fullscreen: mute, volume (mouse wheel too).
-- **Tray and updates**: closing the window keeps Backseat in the tray; new versions from
-  GitHub Releases are installed at start (can be turned off in Settings).
-- **English, Ukrainian and Russian** interface; it follows the system language.
+- **Rooms by invite.** Create a room, send the invite link or code. Only people with the
+  invite get in. Your rooms stay in the list on the left.
+- **Sharp and smooth.** 720p, 1080p or 1440p at 30 or 60 fps, 2 to 50 Mbit/s, encoded on
+  your graphics card (NVIDIA, AMD or Intel) in AV1, H.265 or H.264.
+- **Each viewer chooses.** Viewers can ask for less than you stream (for a slow
+  connection), never more. One viewer's slow internet never slows the others down.
+- **A screen or one window**, with all sound, only that program's sound, or none.
+- **Change the stream while live:** another window, resolution, frame rate or bitrate, and
+  nobody has to reconnect.
+- **Comfortable to watch:** video inside the app or in its own window, fullscreen,
+  volume and mute right on the video, stats with F3.
+- **Stays out of the way:** closing the window keeps Backseat in the tray. It updates
+  itself.
+- **Direct connection (beta):** two people can connect with no server at all (see below).
+- In **English, Ukrainian and Russian**.
+
+## Get started
+
+1. Download `backseat-setup-X.Y.Z.exe` from [Releases](../../releases/latest) and run it.
+   It installs for your Windows user only, no administrator rights needed.
+   Windows SmartScreen may warn that the installer is not signed: choose
+   *More info → Run anyway*.
+2. Start Backseat and pick how to connect:
+   - **A room on a signaling server** (the usual way, any number of people), or
+   - **Direct (beta)**, for two people without any server.
+
+### Rooms
+
+A room needs a **signaling server**: a tiny service that tells the people in a room about
+each other. No video goes through it. You can [run your own](#run-a-signaling-server) in a
+few minutes, for free, or use one a friend runs.
+
+1. Enter the server address (like `wss://your-server.example.com/ws`) in
+   *Settings → General*, or on the join form.
+2. *Create a room*, give it a name, and press the invite button next to the room name to
+   copy the invite. Send it to your friends; the link opens Backseat right in that room.
+3. Press **Stream**, pick a screen or a window, and go live. Friends press **Watch**.
+
+If the connection to the server drops for a moment, Backseat reconnects on its own and
+streams go on.
+
+### Direct connection (beta)
+
+For two people, with no server at all. You swap two texts once, through any messenger:
+
+![Direct connection](docs/images/direct.png)
+
+1. You: *Direct (beta)* → **I invite** → *Make the invite*, and send the text to your
+   friend.
+2. Your friend: *Direct (beta)* → **I have an invite**, pastes it, presses
+   *Make the answer* and sends that text back.
+3. You paste the answer and press *Connect*. Done: either of you can now go live and the
+   other can watch, both at once too.
+
+Good to know before you use it:
+
+- **Only two people.** For more, use a room.
+- **No reconnection.** If the connection drops (Wi-Fi hiccup, sleep, a network change),
+  it ends, and you swap the texts again.
+- **One use.** An invite works only once, and only while the app that made it stays open.
+- **The texts contain your network addresses.** Send them only to the person you want to
+  connect with.
+- **Some networks will not work**, mostly mobile internet and some providers' shared
+  addresses (CGNAT). The same goes for rooms, since the video always goes directly
+  between the two computers.
+- **Nothing is saved:** a direct connection does not appear in the rooms list.
 
 ## Requirements
 
-- Windows 10 or Windows 11, 64-bit.
-- To stream: a graphics card with a hardware video encoder (NVIDIA NVENC, AMD AMF or
-  Intel Quick Sync). Watching works on any reasonably recent computer; AV1 streams are
-  decoded on the CPU when the graphics card cannot decode AV1.
-- Microsoft Edge WebView2 Runtime. It is part of Windows 11; the installer installs it
-  when it is missing (this needs internet access).
-- A signaling server that everyone in the room can reach (see below).
+- Windows 10 or 11, 64-bit.
+- To **stream**: a graphics card with a hardware video encoder (most NVIDIA, AMD and Intel
+  cards from the last several years).
+- To **watch**: any reasonably recent PC. AV1 streams are decoded on the processor when
+  the graphics card cannot decode AV1.
+- Microsoft Edge WebView2, which Windows 11 has. The installer adds it when missing.
 
-## Install
+## Tips
 
-Download `backseat-setup-X.Y.Z.exe` from the
-[Releases](../../releases) page and run it. It installs for the current user only, so it
-needs no administrator rights. `SHA256SUMS.txt` next to it has the checksum:
+- **Default settings:** *Settings → Streaming* sets what the go-live dialog picks each
+  time; *Settings → Watching* sets the most you want to receive (handy on slow internet:
+  a 50 Mbit/s stream then comes to you at your limit right away).
+- **Keys on the video:** double click or F11 for fullscreen, Esc to leave it, F3 for stats,
+  the mouse wheel for volume.
+- **Upload limit:** in the go-live dialog, enter your upload speed; Backseat warns when
+  one more viewer would not fit.
+- **Logs** for bug reports are in `%LOCALAPPDATA%\Backseat\logs`.
 
-```powershell
-Get-FileHash .\backseat-setup-X.Y.Z.exe -Algorithm SHA256
-```
+## Run a signaling server
 
-The installer is not code-signed, so Windows SmartScreen may warn about it.
+The server is small (`crates/server` in this repository) and needs no special hardware:
+it passes a few short messages per connection and no video. The same server works for
+any number of rooms.
 
-On the first start the app asks for the signaling server address, for example
-`wss://signaling.example.com/ws`, a room and your name.
+### On Render (free, no own computer needed)
 
-## Run your own signaling server
+1. Sign in at [render.com](https://render.com) and choose *New → Web Service*.
+2. Connect this repository (or your fork of it).
+3. Settings:
+   - *Runtime*: Rust
+   - *Build command*: `cargo build --release -p server`
+   - *Start command*: `./target/release/server`
+   - *Health check path*: `/live`
+4. After the first deploy, add the environment variable `STREAMER_KEEP_ALIVE_URL` with
+   your service address plus `/live` (for example
+   `https://my-backseat.onrender.com/live`): free services sleep when idle, and this keeps
+   it awake.
+5. In Backseat, the server address is `wss://my-backseat.onrender.com/ws`.
 
-The signaling server is the `server` crate in `crates/server`. It only passes small
-messages between the people in a room (who is here, who is live, connection offers); no
-video or sound goes through it, so it runs fine on a small free instance.
+### On your own computer or server
+
+With [Rust](https://rustup.rs) installed:
 
 ```sh
-cargo run --release -p server                 # listens on 127.0.0.1:7800
-cargo run --release -p server -- 0.0.0.0:7800 # listens on all interfaces
-PORT=10000 cargo run --release -p server      # what hosting platforms set: 0.0.0.0:$PORT
+cargo run --release -p server -- 0.0.0.0:7800
 ```
 
-- WebSocket endpoint: `/ws`. In the app the address is `ws://HOST:PORT/ws`, or
-  `wss://HOST/ws` behind a TLS proxy (most hosting platforms provide one).
-- Health check: `GET /live` answers `ok`.
-- Invite links: `GET /j/CODE` is a small page that opens the room in the app.
-- `STREAMER_KEEP_ALIVE_URL`: optional. The server requests this URL every few minutes,
-  which keeps free hosts that sleep when idle awake. Set it to the server's own public
-  `https://.../live`.
+The address is then `ws://YOUR-IP:7800/ws`. To reach it from the internet, open that port
+on your router, or put it behind a reverse proxy with HTTPS and use `wss://`. Hosting
+platforms that set `PORT` are supported as well (the server then listens on
+`0.0.0.0:$PORT`).
 
-The server needs no GStreamer and builds on Linux, macOS and Windows.
-
-A build of the app can also have one server built in, with no server field in the
-interface: set `STREAMER_SERVER_URL` at build time, or pass `-Server wss://HOST/ws` to
-`tools\installer.ps1`.
+What the server offers: `/ws` for the app, `/live` as a health check, and `/j/CODE` for
+invite links that open the app.
 
 ## Build from source
 
-You need:
-
-- Rust (stable, MSVC toolchain) and Visual Studio 2022 or its Build Tools with the C++
-  workload.
-- GStreamer 1.28.8, the official MSVC x86_64 installer from
-  <https://gstreamer.freedesktop.org/download/> (runtime and development files).
-- NSIS 3, to build the installer.
-
-Then, in PowerShell:
+You need Rust (stable, MSVC), Visual Studio 2022 or its Build Tools with the C++
+workload, GStreamer 1.28.8 (the official MSVC x86_64 installer from
+<https://gstreamer.freedesktop.org/download/>, runtime and development files) and NSIS 3.
 
 ```powershell
 $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = 'C:\path\to\gstreamer\1.0\msvc_x86_64\'
@@ -106,20 +168,20 @@ $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = 'C:\path\to\gstreamer\1.0\msvc_x86_64\'
                                        # dist\backseat-setup-X.Y.Z.exe
 ```
 
-`bundle.ps1` builds `backseat.exe`, copies the GStreamer libraries and plugins the app
-uses, the Visual C++ runtime and the license texts, and fails if any DLL import does not
-resolve. The WebView2 bootstrapper is
-<https://go.microsoft.com/fwlink/p/?LinkId=2124703>.
+`bundle.ps1` copies the GStreamer libraries and plugins the app uses, the Visual C++
+runtime and the license texts, and fails if any DLL import does not resolve. The
+WebView2 bootstrapper is at <https://go.microsoft.com/fwlink/p/?LinkId=2124703>.
+A build can have one server built in, with no server field in the app: pass
+`-Server wss://HOST/ws` to `tools\installer.ps1`.
 
-Releases are built by the `release` workflow in `.github/workflows`: pushing a tag
-`vX.Y.Z` builds the installer and publishes it with the notes from `CHANGELOG.md`.
+Releases are built by the `release` workflow in `.github/workflows` when a tag `vX.Y.Z`
+is pushed, with the notes from `CHANGELOG.md`.
 
 ## License
 
 Backseat is released under the [MIT License](LICENSE).
 
-The Windows build ships third-party software next to `backseat.exe`, most notably
-GStreamer and GLib under the GNU LGPL 2.1 or later (used unmodified, as separate DLLs that
-can be replaced), plus OpenSSL, libsrtp, Opus and other libraries under their own
-licenses. See [THIRD-PARTY.md](THIRD-PARTY.md); the license texts are installed in the
-`licenses` folder.
+The Windows build ships third-party libraries next to `backseat.exe`, most notably
+GStreamer and GLib under the GNU LGPL 2.1 or later (unmodified, as separate DLLs that can
+be replaced). See [THIRD-PARTY.md](THIRD-PARTY.md); the license texts are installed in
+the `licenses` folder.

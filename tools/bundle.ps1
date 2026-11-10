@@ -31,12 +31,14 @@ $plugins = @(
   'rtp', 'rtpmanager', 'webrtc', 'nice', 'dtls', 'srtp', 'opus', 'wasapi2',
   'videotestsrc', 'audiotestsrc', 'volume',
   # AV1: RTP (de)payloader and the software decoder
-  'rsrtp', 'dav1d'
+  'rsrtp', 'dav1d',
+  # Data channels of a direct connection (no server).
+  'sctp'
 )
 # License folders under share\licenses for the libraries that end up in the folder.
 $licenses = @(
   'gstreamer-1.0', 'gst-plugins-base-1.0', 'gst-plugins-bad-1.0', 'glib', 'libffi',
-  'proxy-libintl', 'pcre2', 'zlib', 'orc', 'opus', 'libnice', 'libsrtp', 'openssl'
+  'proxy-libintl', 'pcre2', 'zlib', 'orc', 'opus', 'libnice', 'libsrtp', 'openssl', 'dav1d', 'gst-plugins-rs'
 )
 $vcRuntime = '^(vcruntime140(_1)?|msvcp140(_\d)?|concrt140)\.dll$'
 

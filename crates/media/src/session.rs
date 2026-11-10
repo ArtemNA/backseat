@@ -80,8 +80,15 @@ struct State {
     watches: HashMap<PeerId, Arc<Watch>>,
 }
 
+/// Peer ids in a direct session (no server, beta): the one who invited and the invited.
+pub const DIRECT_INVITER: PeerId = 1;
+pub const DIRECT_INVITED: PeerId = 2;
+
 pub struct Session {
     client: Arc<ServerClient>,
+    /// A direct session: the server's part is played by a control connection to the one
+    /// other person (`crate::direct`).
+    pub direct: bool,
     pub id: PeerId,
     pub room: String,
     /// The room's display name from the server.
@@ -113,6 +120,11 @@ impl Session {
                 client.send(ClientMsg::Unsubscribe { streamer: p.id });
             }
         }
+        Self::run(client, rx, room, name, false)
+    }
+
+    /// A session over `client`, with server messages arriving on `rx`.
+    fn run(client: Arc<ServerClient>, rx: mpsc::Receiver<ServerMsg>, room: &str, name: &str, direct: bool) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
         let (tx, events) = mpsc::channel();
         let me = PeerInfo { id: client.id, name: name.into(), streaming: false };
         let mut peers = client.peers.clone();
@@ -121,6 +133,7 @@ impl Session {
             id: client.id,
             room: room.into(),
             title: client.title.clone(),
+            direct,
             client,
             state: Mutex::new(State { peers: peers.clone(), ..Default::default() }),
             events: tx,
@@ -140,6 +153,54 @@ impl Session {
             })
             .map_err(|e| e.to_string())?;
         Ok((s, events))
+    }
+
+    /// A direct session (no server, beta) with the person at the other end of `control`:
+    /// a room of two. What we would send the server goes to them, and what they send comes
+    /// back as the server would put it, so streaming and watching work as in a room, both
+    /// ways. Ends (Event::Lost) when the control connection closes.
+    pub fn direct(control: Arc<crate::direct::Control>, name: &str, other_name: &str, inviter: bool) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
+        let (me, other) = if inviter { (DIRECT_INVITER, DIRECT_INVITED) } else { (DIRECT_INVITED, DIRECT_INVITER) };
+        let (client, out) = ServerClient::local(me, vec![PeerInfo { id: other, name: other_name.into(), streaming: false }]);
+        let (tx, rx) = mpsc::channel::<ServerMsg>();
+        // Ours to them, as the server's protocol.
+        let c = control.clone();
+        std::thread::Builder::new()
+            .name("direct-out".into())
+            .spawn(move || {
+                while let Ok(m) = out.recv() {
+                    c.send(&m.to_json());
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        // Theirs to us, as the server would deliver it.
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let (t, other_name) = (tx.clone(), other_name.to_string());
+        control.on_message(move |text| {
+            let Ok(m) = protocol::parse_client(&text) else { return };
+            let msg = match m {
+                ClientMsg::SetStreaming { streaming } => ServerMsg::PeerUpdated { peer: PeerInfo { id: other, name: other_name.clone(), streaming } },
+                ClientMsg::Subscribe { streamer, quality } if streamer == me => ServerMsg::SubscribeRequest { viewer: other, quality },
+                ClientMsg::Unsubscribe { streamer } if streamer == me => ServerMsg::UnsubscribeRequest { viewer: other },
+                ClientMsg::Signal { to, kind, payload } if to == me => ServerMsg::Signal { from: other, kind, payload },
+                ClientMsg::Leave => ServerMsg::PeerLeft { id: other },
+                _ => return,
+            };
+            let left = matches!(msg, ServerMsg::PeerLeft { .. });
+            let mut guard = t.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(msg);
+            }
+            // The other person left: a room of two is over.
+            if left {
+                guard.take();
+            }
+        });
+        // The connection gone: the session ends as when a server is lost.
+        control.on_close(move || {
+            tx.lock().unwrap().take();
+        });
+        Self::run(client, rx, "direct", name, true)
     }
 
     /// What a later start of the app needs to take this place back.

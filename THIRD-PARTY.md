@@ -20,6 +20,13 @@ well, libnice under LGPL 2.1 or MPL 1.1.
   the installation folder (plugins in `gstreamer-1.0`) and can be replaced with a
   compatible build of your own.
 
+## GStreamer Rust plugins
+
+The plugins `gstrsrtp.dll` (RTP for AV1) and `gstdav1d.dll` (AV1 decoding with dav1d) come
+from gst-plugins-rs, whose plugins are under the MIT, Apache 2.0 or LGPL 2.1-or-later
+license (texts in `licenses/gst-plugins-rs`). They are used unmodified, from the same
+GStreamer 1.28.8 build; source: <https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs>.
+
 ## Other native libraries
 
 | Library | DLL | License |
@@ -32,6 +39,7 @@ well, libnice under LGPL 2.1 or MPL 1.1.
 | libffi | `ffi-7.dll` | MIT |
 | zlib | `z-1.dll` | zlib |
 | usrsctp (inside `gstsctp-1.0-0.dll`) | | BSD 3-clause |
+| dav1d (AV1 decoding on the CPU) | `dav1d.dll` | BSD 2-clause |
 | Microsoft Visual C++ runtime | `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` | Microsoft Visual Studio redistributable |
 
 ## Rust crates
