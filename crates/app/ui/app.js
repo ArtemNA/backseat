@@ -193,9 +193,12 @@ async function switchRoom(r) {
   try {
     await joinRoom(r);
   } catch {
-    // Show the join screen with this room filled in and the error.
-    $('f-name').value = r.name;
-    if (isCode(r.room)) { state.joinMode = 'code'; $('f-code').value = fmtCode(r.room); }
+    // Show the join screen with this room filled in and the error, unless a direct
+    // connection is being set up meanwhile (the start-up join can fail seconds later).
+    if (state.joinMode !== 'direct') {
+      $('f-name').value = r.name;
+      if (isCode(r.room)) { state.joinMode = 'code'; $('f-code').value = fmtCode(r.room); }
+    }
     state.joinOpen = true;
     tick();
   }
@@ -940,7 +943,8 @@ invoke('test_direct').then(async (spec) => {
   $('f-name').value = name; renderJoinForm(); tick();
   if (role === 'invite') {
     button('direct.make_invite').click();
-    const invite = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; });
+    const invite = await until(() => { const a = document.querySelector('#direct-steps textarea[readonly]'); return a && a.value; }, 20000);
+    if (!invite) { invoke('test_report', { msg: `direct invite failed: ${$('join-error').textContent} | mode ${state.joinMode} role ${state.directRole} step ${JSON.stringify(Object.keys(state.directStep || {}))} | steps: ${$('direct-steps').innerHTML.slice(0, 300)}` }); return; }
     await invoke('test_put', { dir, name: 'invite.txt', text: invite });
     invoke('test_report', { msg: `direct invite ${invite.length} chars` });
     const answer = await until(() => invoke('test_get', { dir, name: 'answer.txt' }), 60000);

@@ -177,7 +177,8 @@ impl Control {
             std::thread::sleep(Duration::from_millis(50));
         }
         let mut msgs = vec![("name".to_string(), name.to_string())];
-        msgs.extend(self.opening.lock().unwrap().iter().cloned());
+        let skip = crate::platform::virtual_adapter_addresses();
+        msgs.extend(self.opening.lock().unwrap().iter().filter(|(k, v)| k != "ice" || useful(v, &skip)).cloned());
         Ok(pack(&msgs))
     }
 
@@ -243,6 +244,19 @@ impl Drop for Control {
     }
 }
 
+/// Whether an ICE candidate ("MLINE candidate:F C PROTO PRIO ADDR PORT typ TYPE ...") is
+/// worth a place in the text. Left out: IPv6 link-local addresses (one cable or Wi-Fi only;
+/// the home IPv4 address covers that case) and addresses of virtual machine adapters
+/// (`skip`), which the other person cannot reach. Everything else stays, TCP included.
+fn useful(candidate: &str, skip: &[std::net::IpAddr]) -> bool {
+    let Some(addr) = candidate.split_whitespace().nth(5) else { return true };
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else { return true };
+    match ip {
+        std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => false,
+        _ => !skip.contains(&ip),
+    }
+}
+
 fn name_of(msgs: &[(String, String)]) -> String {
     msgs.iter().find(|(k, _)| k == "name").map(|(_, v)| v.chars().take(protocol::MAX_NAME_LEN).collect()).unwrap_or_else(|| "?".into())
 }
@@ -276,5 +290,16 @@ mod tests {
         let broken = format!("{}\n{}", &t[..20], &t[20..]);
         assert_eq!(unpack(&broken).unwrap(), m);
         assert!(unpack("hello").is_err());
+    }
+
+    #[test]
+    fn useful_candidates() {
+        let vm: Vec<std::net::IpAddr> = vec!["172.30.1.1".parse().unwrap()];
+        assert!(useful("0 candidate:1 1 UDP 2015363327 192.168.1.5 57451 typ host", &vm));
+        assert!(useful("0 candidate:13 1 UDP 1679819007 203.0.113.7 57451 typ srflx raddr 192.168.1.5 rport 57451", &vm));
+        assert!(useful("0 candidate:2 1 TCP 1015021823 192.168.1.5 9 typ host tcptype active", &vm));
+        assert!(useful("0 candidate:4 1 UDP 2015363583 2001:db8::5 57452 typ host", &vm));
+        assert!(!useful("0 candidate:4 1 UDP 2015363583 fe80::1234:5678 57452 typ host", &vm));
+        assert!(!useful("0 candidate:10 1 UDP 2015364607 172.30.1.1 57454 typ host", &vm));
     }
 }

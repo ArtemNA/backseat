@@ -284,3 +284,67 @@ pub fn monitors() -> Vec<MonitorInfo> {
 pub fn windows() -> Vec<WindowInfo> {
     Vec::new()
 }
+
+/// Addresses of virtual machine and container adapters (Hyper-V and WSL, VirtualBox,
+/// VMware, Docker): a direct connection's text leaves them out, as the other person can
+/// never reach them. VPN adapters (Radmin, Hamachi, ZeroTier, Tailscale) stay: two friends
+/// on the same VPN connect through it.
+#[cfg(windows)]
+pub fn virtual_adapter_addresses() -> Vec<std::net::IpAddr> {
+    use windows::Win32::NetworkManagement::IpHelper::*;
+    use windows::Win32::Networking::WinSock::*;
+    const KEYS: &[&str] = &["hyper-v", "vethernet", "virtualbox", "vmware", "docker", "wsl"];
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 64 * 1024u32;
+    // u64 words: the structures Windows writes here need 8-byte alignment.
+    let mut buf = vec![0u64; size as usize / 8];
+    let mut r = unsafe { GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH), &mut size) };
+    if r == 111 {
+        // ERROR_BUFFER_OVERFLOW: `size` now says how much is needed.
+        buf.resize(size as usize / 8 + 1, 0);
+        r = unsafe { GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH), &mut size) };
+    }
+    let mut out = Vec::new();
+    if r != 0 {
+        return out;
+    }
+    let mut p = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !p.is_null() {
+        let a = unsafe { &*p };
+        let text = unsafe { format!("{} {}", a.Description.to_string().unwrap_or_default(), a.FriendlyName.to_string().unwrap_or_default()) }.to_lowercase();
+        if KEYS.iter().any(|k| text.contains(k)) {
+            let mut u = a.FirstUnicastAddress;
+            while !u.is_null() {
+                let ua = unsafe { &*u };
+                let sa = ua.Address.lpSockaddr;
+                if !sa.is_null() {
+                    unsafe {
+                        match (*sa).sa_family {
+                            AF_INET => out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be((*(sa as *const SOCKADDR_IN)).sin_addr.S_un.S_addr)))),
+                            AF_INET6 => out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from((*(sa as *const SOCKADDR_IN6)).sin6_addr.u.Byte))),
+                            _ => {}
+                        }
+                    }
+                }
+                u = ua.Next;
+            }
+        }
+        p = a.Next;
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn virtual_adapter_addresses() -> Vec<std::net::IpAddr> {
+    Vec::new()
+}
+
+#[cfg(all(test, windows))]
+mod adapter_tests {
+    #[test]
+    fn lists_virtual_adapters_without_crashing() {
+        let t = std::time::Instant::now();
+        let a = super::virtual_adapter_addresses();
+        eprintln!("virtual adapter addresses: {a:?} in {:?}", t.elapsed());
+    }
+}
