@@ -28,6 +28,8 @@ pub struct App {
     joined: Mutex<Option<String>>,
     /// The direct connection (beta) and our name in it, while there is one.
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
+    /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
+    voice_prefs: Mutex<(bool, bool)>,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -124,6 +126,106 @@ pub struct Snapshot {
     pub link: Option<String>,
     /// A direct session (no server, beta): "connected" or "waiting".
     pub direct: Option<&'static str>,
+    pub voice: VoiceView,
+}
+
+/// The room's voice chat as the UI shows it.
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct VoiceView {
+    /// We are in voice.
+    pub joined: bool,
+    /// Everyone in voice, us included when joined.
+    pub members: Vec<u64>,
+    /// Those whose sound is above the speaking threshold right now.
+    pub speaking: Vec<u64>,
+    pub mic_muted: bool,
+    pub deafened: bool,
+}
+
+/// Sound above this (dBFS over 100 ms) counts as speaking.
+const SPEAKING_DB: f64 = -50.0;
+
+/// The voice part of the snapshot; cheap, for the fast "who is speaking" refresh.
+pub fn voice_view(app: &App) -> VoiceView {
+    let (mic_muted, deafened) = *app.voice_prefs.lock().unwrap();
+    let s = app.session.lock().unwrap().clone();
+    let Some(s) = s else { return VoiceView { mic_muted, deafened, ..Default::default() } };
+    let mut members = s.voice_members();
+    let mut speaking = vec![];
+    let voice = s.voice();
+    if let Some(v) = &voice {
+        members.push(s.id);
+        if !mic_muted && v.mic_db() > SPEAKING_DB {
+            speaking.push(s.id);
+        }
+        for (id, db) in v.peer_db() {
+            if db > SPEAKING_DB {
+                speaking.push(id);
+            }
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    speaking.sort_unstable();
+    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened }
+}
+
+/// Joins the open room's voice chat. Opens the microphone: run it off the UI thread.
+pub fn join_voice(app: &App) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    let mut cfg = media::voice::VoiceConfig::default();
+    // Tests only: STREAMER_APP_TEST_VOICE=<Hz> sends a tone instead of the microphone and
+    // plays nothing.
+    if let Some(hz) = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok()) {
+        cfg.test_tone = Some(hz);
+        cfg.silent = true;
+    }
+    let v = s.join_voice(cfg).inspect_err(|e| eprintln!("voice failed: {e}"))?;
+    let (mic, deaf) = *app.voice_prefs.lock().unwrap();
+    v.set_mic_muted(mic || deaf);
+    v.set_deafened(deaf);
+    eprintln!("voice: joined");
+    Ok(())
+}
+
+pub fn leave_voice(app: &App) {
+    let s = app.session.lock().unwrap().clone();
+    if let Some(s) = s {
+        s.leave_voice();
+        eprintln!("voice: left");
+    }
+}
+
+/// Microphone off or on. Turning it on also brings the sound back (as Discord does).
+pub fn set_mic_muted(app: &App, on: bool) {
+    let (mic, deaf) = {
+        let mut p = app.voice_prefs.lock().unwrap();
+        p.0 = on;
+        if !on {
+            p.1 = false;
+        }
+        *p
+    };
+    apply_voice_prefs(app, mic, deaf);
+}
+
+/// Sound off (the microphone goes off with it) or on.
+pub fn set_deafened(app: &App, on: bool) {
+    let (mic, deaf) = {
+        let mut p = app.voice_prefs.lock().unwrap();
+        p.1 = on;
+        *p
+    };
+    apply_voice_prefs(app, mic, deaf);
+}
+
+fn apply_voice_prefs(app: &App, mic: bool, deaf: bool) {
+    let v = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+    if let Some(v) = v {
+        v.set_mic_muted(mic || deaf);
+        v.set_deafened(deaf);
+    }
+    eprintln!("voice: microphone {}, sound {}", if mic || deaf { "off" } else { "on" }, if deaf { "off" } else { "on" });
 }
 
 pub fn snapshot(app: &App) -> Snapshot {
@@ -131,7 +233,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app) };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -150,6 +252,7 @@ pub fn snapshot(app: &App) -> Snapshot {
         notice,
         link,
         direct: s.direct.then(|| if app.direct.lock().unwrap().as_ref().is_some_and(|(c, _)| c.is_open()) { "connected" } else { "waiting" }),
+        voice: voice_view(app),
     }
 }
 

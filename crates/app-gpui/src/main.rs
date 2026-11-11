@@ -161,7 +161,27 @@ impl Shell {
             }
         })
         .detach();
+        // "Who is speaking" needs more than the 1 s refresh: the voice part alone, 6 times a
+        // second, redrawing only on a change.
+        cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| loop {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let alive = this.update_in(cx, |s, _, cx| {
+                if !s.snap.connected {
+                    return;
+                }
+                let v = core::voice_view(&s.core);
+                if v != s.snap.voice {
+                    s.snap.voice = v;
+                    cx.notify();
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        })
+        .detach();
         test_actions(cx);
+        testing::test_voice(window, cx);
         join::test_direct(window, cx);
         join::test_form(window, cx);
         room::test_click_watch(window, cx);
@@ -581,12 +601,44 @@ impl Shell {
                 let section = |t: String| div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(t);
                 let live: Vec<_> = self.snap.peers.iter().filter(|p| p.streaming).collect();
                 let rest: Vec<_> = self.snap.peers.iter().filter(|p| !p.streaming).collect();
+                let v = &self.snap.voice;
+                let in_voice: Vec<_> = self.snap.peers.iter().filter(|p| v.members.contains(&p.id)).collect();
+                let voice_person = |p: &backseat_core::PeerView| {
+                    use gpui_kit::component::{Icon, Sizable as _};
+                    row()
+                        .py_1()
+                        .child(voice_avatar(&p.name, v.speaking.contains(&p.id)))
+                        .child(div().flex_1().min_w_0().truncate().text_color(rgb(if v.speaking.contains(&p.id) { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
+                        .when(p.me && (v.mic_muted || v.deafened), |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/mic-off.svg").small())))
+                        .when(p.me && v.deafened, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/headphone-off.svg").small())))
+                };
                 div()
                     .id("people")
                     .flex_1()
                     .overflow_y_scroll()
+                    .when(self.snap.connected && self.snap.direct.is_none(), |d| {
+                        use gpui_kit::component::{Icon, Sizable as _};
+                        d.child(section(tf("voice.section", &[("n", &in_voice.len())]).to_string()))
+                            .children(in_voice.iter().map(|p| voice_person(p)))
+                            .when(!v.joined, |d| {
+                                d.child(
+                                    row()
+                                        .id("join-voice")
+                                        .mx_2()
+                                        .px_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(color::MUTED))
+                                        .hover(|s| s.bg(rgb(0x35373c)).text_color(rgb(color::BRIGHT)))
+                                        .child(Icon::default().path("icons/headphones.svg").small())
+                                        .child(t("voice.join"))
+                                        .on_click(cx.listener(|s, _, _, cx| s.join_voice(cx))),
+                                )
+                            })
+                    })
                     .when(self.snap.connected, |d| d.child(section(tf("room.live", &[("n", &live.len())]).to_string())).children(live.iter().map(|p| person(p))).child(section(tf("room.here", &[("n", &rest.len())]).to_string())).children(rest.iter().map(|p| person(p))))
             })
+            .when(self.snap.connected && self.snap.voice.joined, |d| d.child(self.voice_bar(cx)))
             .child(
                 row()
                     .h(px(56.))
@@ -607,6 +659,65 @@ impl Shell {
                         )
                     }),
             )
+    }
+
+    /// "Voice connected" with the microphone, sound and hang-up buttons, above the name.
+    fn voice_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let v = &self.snap.voice;
+        let (mic_off, deaf) = (v.mic_muted || v.deafened, v.deafened);
+        // Tighter than the other rows: three buttons and the words share 240 px.
+        div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .pl_4()
+            .pr_2()
+            .h(px(44.))
+            .bg(rgb(color::BAR))
+            .border_b_1()
+            .border_color(rgb(color::LINE))
+            .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::GREEN)).child(t("voice.connected")))
+            .child(
+                icon_button("voice-mic", if mic_off { "icons/mic-off.svg" } else { "icons/mic.svg" }, t(if mic_off { "voice.unmute" } else { "voice.mute" }), color::BRIGHT)
+                    .when(mic_off, |d| d.text_color(rgb(color::LIVE)))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        core::set_mic_muted(&s.core, !mic_off);
+                        s.snap.voice = core::voice_view(&s.core);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                icon_button("voice-deaf", if deaf { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, t(if deaf { "voice.undeafen" } else { "voice.deafen" }), color::BRIGHT)
+                    .when(deaf, |d| d.text_color(rgb(color::LIVE)))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        core::set_deafened(&s.core, !deaf);
+                        s.snap.voice = core::voice_view(&s.core);
+                        cx.notify();
+                    })),
+            )
+            .child(icon_button("voice-leave", "icons/phone-off.svg", t("voice.leave"), color::LIVE).on_click(cx.listener(|s, _, _, cx| {
+                core::leave_voice(&s.core);
+                s.snap.voice = core::voice_view(&s.core);
+                cx.notify();
+            })))
+    }
+
+    /// Joins the room's voice. Opening the microphone may take a moment: off the UI thread.
+    pub(crate) fn join_voice(&mut self, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        let task = cx.background_executor().spawn(async move { core::join_voice(&core) });
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = this.update(cx, |s, cx| {
+                if let Err(e) = result {
+                    s.error = Some(tf("voice.failed", &[("e", &e)]).to_string());
+                    s.error_since = Some(std::time::Instant::now());
+                }
+                s.snap.voice = core::voice_view(&s.core);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn main(&self) -> impl IntoElement {
@@ -657,6 +768,12 @@ fn row() -> Div {
     div().flex().items_center().gap_2p5().px_4().py_1p5()
 }
 
+/// An avatar with a green ring while its person speaks (the ring's room is always kept, so
+/// nothing moves when it shows).
+fn voice_avatar(name: &str, speaking: bool) -> Div {
+    div().p(px(2.)).flex_none().rounded_full().border_2().border_color(rgb(if speaking { color::GREEN } else { color::SIDE })).child(avatar(name).size_6().text_xs())
+}
+
 fn avatar(name: &str) -> Div {
     const COLORS: [u32; 7] = [0xc2622d, 0x3a8a5c, 0x5d5fa8, 0x7a4e9a, 0x2f7f95, 0x9a4e6b, 0x7a6a2e];
     let h = name.chars().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
@@ -694,7 +811,7 @@ impl Render for Shell {
 
 // Icons (lucide): gpui-kit's default set for its components, plus the few this app uses that
 // the default set leaves out. Only these are in the exe, not the whole catalog.
-gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus, Settings, Monitor]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus, Settings, Monitor, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff]);
 
 struct AppAssets;
 

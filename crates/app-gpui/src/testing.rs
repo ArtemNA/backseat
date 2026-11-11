@@ -175,3 +175,50 @@ pub fn test_ui_stress(window: &mut Window, cx: &mut Context<Shell>) {
     })
     .detach();
 }
+
+/// STREAMER_APP_TEST_VOICE=<Hz> (with STREAMER_APP_AUTOJOIN): once in the room, presses
+/// "Join voice" (a tone instead of the microphone, nothing played; see core::join_voice),
+/// turns the microphone off at +8 s and on at +12 s as its button does, and prints once a
+/// second who is in voice and who is speaking, by name.
+pub fn test_voice(window: &mut Window, cx: &mut Context<Shell>) {
+    if std::env::var_os("STREAMER_APP_TEST_VOICE").is_none() {
+        return;
+    }
+    cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| {
+        let mut joined_at = None::<u32>;
+        for tick in 0..60u32 {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let alive = this.update_in(cx, |s, _, cx| {
+                if !s.snap.connected {
+                    return;
+                }
+                let Some(at) = joined_at else {
+                    joined_at = Some(tick);
+                    eprintln!("test voice: pressing join");
+                    s.join_voice(cx);
+                    return;
+                };
+                let since = tick - at;
+                if since == 8 || since == 12 {
+                    let off = since == 8;
+                    core::set_mic_muted(&s.core, off);
+                    s.snap.voice = core::voice_view(&s.core);
+                    cx.notify();
+                    eprintln!("test voice: microphone {}", if off { "off" } else { "on" });
+                }
+                let v = &s.snap.voice;
+                let name = |id: &u64| s.snap.peers.iter().find(|p| p.id == *id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
+                eprintln!(
+                    "test voice: t {since} joined {} members [{}] speaking [{}]",
+                    v.joined,
+                    v.members.iter().map(name).collect::<Vec<_>>().join(","),
+                    v.speaking.iter().map(name).collect::<Vec<_>>().join(",")
+                );
+            });
+            if alive.is_err() {
+                return;
+            }
+        }
+    })
+    .detach();
+}

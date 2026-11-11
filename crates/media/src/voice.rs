@@ -212,7 +212,10 @@ impl Voice {
 
     /// Opens a connection to `id`. The side with the lower id offers.
     pub fn add_peer(&self, id: PeerId, link: Arc<dyn Outbox>, offerer: bool) -> Result<(), String> {
-        if self.stopped.load(Ordering::SeqCst) || self.has(id) {
+        // Held while the connection is made: the session may ask for the same peer from two
+        // threads at once (our join meeting their "hi"), and the second one must find it.
+        let mut peers = self.peers.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) || peers.contains_key(&id) {
             return Ok(());
         }
         let webrtc = gst::ElementFactory::make("webrtcbin").name(format!("voice-{id}")).build().map_err(|e| e.to_string())?;
@@ -279,7 +282,7 @@ impl Voice {
         if std::env::var_os("STREAMER_DEBUG_VOICE_NO_SEND").is_none() {
             tee_pad.link(&queue.static_pad("sink").unwrap()).map_err(|e| format!("voice {id}: {e:?}"))?;
         }
-        self.peers.lock().unwrap().insert(id, Peer { webrtc, send: vec![queue, pay], tee_pad, recv, level, link });
+        peers.insert(id, Peer { webrtc, send: vec![queue, pay], tee_pad, recv, level, link });
         eprintln!("voice: connecting with {id} ({})", if offerer { "offering" } else { "answering" });
         Ok(())
     }
