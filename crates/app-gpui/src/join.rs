@@ -478,11 +478,11 @@ impl Shell {
                 .when(mode == Mode::Code, |d| d.child(label(tu("join.code"))).child(sunk(Input::new(&j.code))))
                 .when(mode == Mode::Direct, |d| d.child(self.render_direct(cx)))
                 .child(label(tu("connect.language")))
-                .child(sunk(Select::new(&j.lang)))
+                .child(sunk(Select::new(&j.lang)).cursor_pointer())
                 .when_some(j.error.clone(), |d, e| d.child(div().p_2().rounded_md().bg(rgb(0x3b2326)).text_color(rgb(0xffb4b4)).child(e)))
                 .when(mode != Mode::Direct, |d| {
                     d.child(
-                        Button::new("join-submit")
+                        Button::new("join-submit").cursor_pointer()
                             .primary()
                             .disabled(self.join.busy)
                             .label(t(if self.join.busy { "direct.connecting" } else if mode == Mode::Create { "join.create" } else { "join.enter" }))
@@ -490,12 +490,12 @@ impl Shell {
                     )
                 })
                 .when(back, |d| {
-                    d.child(Button::new("join-back").label(t("join.back")).on_click(cx.listener(|s, _, _, cx| {
+                    d.child(Button::new("join-back").cursor_pointer().label(t("join.back")).on_click(cx.listener(|s, _, _, cx| {
                         s.join.open = false;
                         cx.notify();
                     })))
                 })
-                .child(Button::new("join-settings").ghost().label(t("set.open")).on_click(cx.listener(|s, _, w, cx| s.open_settings(crate::dialogs::SetTab::General, w, cx)))),
+                .child(Button::new("join-settings").cursor_pointer().ghost().label(t("set.open")).on_click(cx.listener(|s, _, w, cx| s.open_settings(crate::dialogs::SetTab::General, w, cx)))),
                 ),
         ))
         .vertical_scrollbar(&self.join.scroll)
@@ -507,7 +507,7 @@ impl Shell {
         let making = st.making;
         let bold = |text: SharedString| div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(text);
         let small = |text: SharedString| div().text_xs().text_color(rgb(color::MUTED)).child(text);
-        let short = Checkbox::new("direct-short").label(t("direct.short")).checked(short_codes_on()).on_click(cx.listener(|_, v: &bool, _, cx| {
+        let short = Checkbox::new("direct-short").cursor_pointer().label(t("direct.short")).checked(short_codes_on()).on_click(cx.listener(|_, v: &bool, _, cx| {
             set_setting("shortCode", serde_json::Value::Bool(*v));
             cx.notify();
         }));
@@ -525,7 +525,7 @@ impl Shell {
                                 .items_center()
                                 .gap_3()
                                 .child(div().px_3().py_1().rounded_md().bg(rgb(color::RAIL)).border_1().border_color(rgb(color::LINE)).text_size(px(22.)).font_family("Consolas").font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(shown))
-                                .child(Button::new("copy-code").label(t(if j.copied == Some("code") { "direct.copied" } else { "direct.copy_code" })).on_click(cx.listener(move |s, _, _, cx| {
+                                .child(Button::new("copy-code").cursor_pointer().label(t(if j.copied == Some("code") { "direct.copied" } else { "direct.copy_code" })).on_click(cx.listener(move |s, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                                     s.join.copied = Some("code");
                                     cx.notify();
@@ -539,7 +539,7 @@ impl Shell {
                 None => {}
             }
             let text = j.outgoing.read(cx).value().to_string();
-            col.child(sunk(Textarea::new(&j.outgoing).h(px(90.)).readonly(true))).child(div().flex().child(Button::new("copy-text").label(t(if j.copied == Some("text") { "direct.copied" } else { "direct.copy" })).on_click(cx.listener(move |s, _, _, cx| {
+            col.child(sunk(Textarea::new(&j.outgoing).h(px(90.)).readonly(true))).child(div().flex().child(Button::new("copy-text").cursor_pointer().label(t(if j.copied == Some("text") { "direct.copied" } else { "direct.copy" })).on_click(cx.listener(move |s, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 s.join.copied = Some("text");
                 cx.notify();
@@ -559,7 +559,7 @@ impl Shell {
         let busy_label = |idle: &str| t(if making { "direct.making" } else { idle });
         match (role, st.invite.is_some(), st.answer.is_some()) {
             (Role::Invite, false, _) => {
-                col = col.child(short).child(Button::new("make-invite").primary().disabled(making).label(busy_label("direct.make_invite")).on_click(cx.listener(|s, _, w, cx| s.make_invite(w, cx))));
+                col = col.child(short).child(Button::new("make-invite").cursor_pointer().primary().disabled(making).label(busy_label("direct.make_invite")).on_click(cx.listener(|s, _, w, cx| s.make_invite(w, cx))));
             }
             (Role::Invite, true, _) => {
                 col = col
@@ -567,7 +567,7 @@ impl Shell {
                     .child(bold(t("direct.paste_answer")))
                     .child(sunk(Textarea::new(&j.incoming).h(px(90.))))
                     .child(
-                        Button::new("connect")
+                        Button::new("connect").cursor_pointer()
                             .primary()
                             .disabled(making || st.accepted)
                             .label(if st.accepted { t("direct.connecting") } else { busy_label("direct.connect") })
@@ -579,7 +579,7 @@ impl Shell {
                     .child(short)
                     .child(bold(t("direct.paste_invite")))
                     .child(sunk(Textarea::new(&j.incoming).h(px(90.))))
-                    .child(Button::new("make-answer").primary().disabled(making).label(busy_label("direct.make_answer")).on_click(cx.listener(|s, _, w, cx| s.make_answer(w, cx))));
+                    .child(Button::new("make-answer").cursor_pointer().primary().disabled(making).label(busy_label("direct.make_answer")).on_click(cx.listener(|s, _, w, cx| s.make_answer(w, cx))));
             }
             (Role::Answer, _, true) => {
                 col = col.child(outgoing(t("direct.send_answer"), &st.answer_code, cx)).child(small(t("direct.wait")));

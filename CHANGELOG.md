@@ -2,6 +2,11 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## Unreleased
+
+- The window list for going live no longer shows hidden windows of suspended Windows apps (Settings, Windows Input Experience, ApplicationFrameHost).
+- Buttons, checkboxes and lists show the hand cursor.
+
 ## 0.2.1
 
 - The go-live dialog keeps the codec from *Settings → Streaming*: AV1 chosen there was replaced with H.265 when the dialog opened right after start.

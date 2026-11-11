@@ -599,8 +599,8 @@ impl Shell {
                     .justify_end()
                     .gap_2()
                     .bg(rgb(color::SIDE))
-                    .child(Button::new("gl-cancel").ghost().label(t("golive.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
-                    .child(Button::new("gl-start").primary().disabled(g.busy).label(t(if g.busy { "direct.making" } else if g.editing { "live.apply" } else { "golive.start" })).on_click(cx.listener(|s, _, _, cx| s.golive_start(cx)))),
+                    .child(Button::new("gl-cancel").cursor_pointer().ghost().label(t("golive.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
+                    .child(Button::new("gl-start").cursor_pointer().primary().disabled(g.busy).label(t(if g.busy { "direct.making" } else if g.editing { "live.apply" } else { "golive.start" })).on_click(cx.listener(|s, _, _, cx| s.golive_start(cx)))),
             );
         card.into_any_element()
     }
@@ -630,8 +630,8 @@ impl Shell {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(Button::new("rn-cancel").label(t("common.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
-                    .child(Button::new("rn-save").primary().label(t("common.save")).on_click(cx.listener(move |s, _, _, cx| {
+                    .child(Button::new("rn-cancel").cursor_pointer().label(t("common.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
+                    .child(Button::new("rn-save").cursor_pointer().primary().label(t("common.save")).on_click(cx.listener(move |s, _, _, cx| {
                         let v = name.read(cx).value().to_string();
                         s.dialogs.open = None;
                         s.rename_room(&r, &v, cx);
@@ -762,7 +762,7 @@ impl Shell {
         let field = |label: SharedString, el: AnyElement| div().flex().flex_col().gap_1p5().child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(label)).child(el);
         let pick = |section: Option<&'static str>, key: &'static str| -> AnyElement {
             match st.prefs.iter().find(|p| p.section == section && p.key == key) {
-                Some(p) => div().rounded_md().bg(rgb(color::RAIL)).child(Select::new(&p.picker)).into_any_element(),
+                Some(p) => div().rounded_md().bg(rgb(color::RAIL)).cursor_pointer().child(Select::new(&p.picker)).into_any_element(),
                 None => div().into_any_element(),
             }
         };
@@ -795,11 +795,11 @@ impl Shell {
                     None => t("set.server_hint"),
                 }))
                 .child(field(tu("connect.language"), pick(None, "lang")))
-                .child(Checkbox::new("set-tray").label(t("set.tray")).checked(tray).on_click(cx.listener(|s, v: &bool, _, cx| {
+                .child(Checkbox::new("set-tray").cursor_pointer().label(t("set.tray")).checked(tray).on_click(cx.listener(|s, v: &bool, _, cx| {
                     s.set_tray(*v);
                     cx.notify();
                 })))
-                .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
+                .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").cursor_pointer().label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
                     if let Err(e) = core::open_logs() {
                         s.error = Some(e);
                     }
@@ -831,7 +831,7 @@ impl Shell {
                 .flex_col()
                 .gap_3()
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(tf("set.version", &[("v", &core::app_version())])))
-                .child(Checkbox::new("set-auto").label(t("set.auto_update")).checked(auto).on_click(cx.listener(|_, v: &bool, _, cx| {
+                .child(Checkbox::new("set-auto").cursor_pointer().label(t("set.auto_update")).checked(auto).on_click(cx.listener(|_, v: &bool, _, cx| {
                     set_setting("autoUpdate", serde_json::Value::Bool(*v));
                     cx.notify();
                 })))
@@ -839,8 +839,8 @@ impl Shell {
                     div()
                         .flex()
                         .gap_2()
-                        .child(Button::new("set-check").label(t("set.check")).on_click(cx.listener(|s, _, _, cx| s.check_update(cx))))
-                        .when(st.update.is_some(), |d| d.child(Button::new("set-install").primary().label(t("set.install")).on_click(cx.listener(|s, _, _, cx| s.install_update(cx))))),
+                        .child(Button::new("set-check").cursor_pointer().label(t("set.check")).on_click(cx.listener(|s, _, _, cx| s.check_update(cx))))
+                        .when(st.update.is_some(), |d| d.child(Button::new("set-install").cursor_pointer().primary().label(t("set.install")).on_click(cx.listener(|s, _, _, cx| s.install_update(cx))))),
                 )
                 .child(small(st.status.clone()))
                 .into_any_element(),
@@ -866,7 +866,7 @@ impl Shell {
                     .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)))
                     .child(div().id("set-page").flex_1().min_w_0().overflow_y_scroll().track_scroll(&st.scroll).child(div().pb_2().pr_3().child(page)).vertical_scrollbar(&st.scroll)),
             )
-            .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").primary().label(t("set.close")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
+            .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").cursor_pointer().primary().label(t("set.close")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
             .into_any_element()
     }
 

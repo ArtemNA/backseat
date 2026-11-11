@@ -235,6 +235,18 @@ pub fn windows() -> Vec<WindowInfo> {
         if GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
             return true.into();
         }
+        // "Visible" but not on screen: Windows cloaks the windows of suspended store apps
+        // (Settings, the text input host, ApplicationFrameHost) and of other virtual desktops.
+        let mut cloaked = 0u32;
+        let got = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            h,
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if got.is_ok() && cloaked != 0 {
+            return true.into();
+        }
         let mut buf = [0u16; 256];
         let n = GetWindowTextW(h, &mut buf);
         if n <= 0 {

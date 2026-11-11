@@ -597,7 +597,7 @@ impl Shell {
                     .child(icon_button("settings-btn", "icons/settings.svg", t("set.open"), color::BRIGHT).on_click(cx.listener(|s, _, w, cx| s.open_settings(dialogs::SetTab::General, w, cx))))
                     .when(self.snap.connected && !live, |d| {
                         d.child(
-                            gpui_kit::component::button::Button::new("go-live")
+                            gpui_kit::component::button::Button::new("go-live").cursor_pointer()
                                 .primary()
                                 .small()
                                 .icon(gpui_kit::component::Icon::default().path("icons/monitor.svg"))

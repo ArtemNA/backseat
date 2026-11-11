@@ -230,7 +230,7 @@ impl Shell {
             .when(!others.is_empty(), |d| {
                 d.child(div().flex().flex_col().gap_2().child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(tu("room.also_live"))).child(div().flex().flex_wrap().gap_2p5().children(others.iter().map(|p| {
                     let id = p.id;
-                    card().flex().items_center().gap_2p5().pl_2().pr_2p5().py_2().child(crate::avatar(&p.name)).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone())).child(Button::new(SharedString::from(format!("watch-{id}"))).primary().small().label(t("card.watch")).on_click(cx.listener(move |s, _, _, cx| s.watch_stream(id, cx))))
+                    card().flex().items_center().gap_2p5().pl_2().pr_2p5().py_2().child(crate::avatar(&p.name)).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone())).child(Button::new(SharedString::from(format!("watch-{id}"))).cursor_pointer().primary().small().label(t("card.watch")).on_click(cx.listener(move |s, _, _, cx| s.watch_stream(id, cx))))
                 }))))
             })
             .when_some(live.clone(), |d, l| d.child(self.live_panel(&l)))
@@ -265,8 +265,8 @@ impl Shell {
                 .child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE"))
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t("live.title")))
                 .child(div().flex_1().text_xs().text_color(rgb(color::MUTED)).child(format!("{} {} · {}", short_quality(&l.ceiling), t("unit.mbit"), l.encoder)))
-                .child(Button::new("change-live").small().label(t("live.change")).on_click(cx.listener(|s, _, w, cx| s.open_golive(true, w, cx))))
-                .child(Button::new("end-live").danger().small().label(t("live.end")).on_click(cx.listener(|s, _, _, cx| {
+                .child(Button::new("change-live").cursor_pointer().small().label(t("live.change")).on_click(cx.listener(|s, _, w, cx| s.open_golive(true, w, cx))))
+                .child(Button::new("end-live").cursor_pointer().danger().small().label(t("live.end")).on_click(cx.listener(|s, _, _, cx| {
                     core::end_live(&s.core);
                     s.tick(cx);
                 }))),
@@ -352,16 +352,16 @@ impl Shell {
                     .py_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone()))
                     .child(div().flex_1().text_xs().whitespace_nowrap().text_color(rgb(if throttled { 0xf0b232 } else { color::MUTED })).child(stat))
-                    .when_some(tile, |d, t| d.child(div().w(px(150.)).child(Select::new(&t.mode).small())).child(div().w(px(110.)).child(Select::new(&t.kbit).small())))
-                    .child(Button::new(SharedString::from(format!("apply-{id}"))).small().label(t("card.apply")).on_click(cx.listener(move |s, _, _, cx| s.apply_quality(id, cx))))
-                    .child(Button::new(SharedString::from(format!("mute-{id}"))).small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(t(if w.muted { "tile.unmute" } else { "tile.mute" })).on_click(cx.listener(move |s, _, _, cx| {
+                    .when_some(tile, |d, t| d.child(div().w(px(150.)).cursor_pointer().child(Select::new(&t.mode).small())).child(div().w(px(110.)).cursor_pointer().child(Select::new(&t.kbit).small())))
+                    .child(Button::new(SharedString::from(format!("apply-{id}"))).cursor_pointer().small().label(t("card.apply")).on_click(cx.listener(move |s, _, _, cx| s.apply_quality(id, cx))))
+                    .child(Button::new(SharedString::from(format!("mute-{id}"))).cursor_pointer().small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(t(if w.muted { "tile.unmute" } else { "tile.mute" })).on_click(cx.listener(move |s, _, _, cx| {
                         let _ = core::set_muted(&s.core, id, !w.muted);
                         s.tick(cx);
                     })))
-                    .child(Button::new(SharedString::from(format!("stats-{id}"))).small().label(t("tile.stats")).when(w.overlay, |b| b.primary()).on_click(act(if w.overlay { "no_overlay" } else { "overlay" })))
-                    .child(Button::new(SharedString::from(format!("pop-{id}"))).small().icon(Icon::default().path(if w.embedded { "icons/square-arrow-out-up-right.svg" } else { "icons/picture-in-picture.svg" })).tooltip(t(if w.embedded { "tile.popout" } else { "tile.popin" })).on_click(act(if w.embedded { "pop_out" } else { "pop_in" })))
-                    .child(Button::new(SharedString::from(format!("fs-{id}"))).small().icon(Icon::default().path("icons/maximize.svg")).tooltip(t("tile.fullscreen")).on_click(act("toggle_fullscreen")))
-                    .child(Button::new(SharedString::from(format!("stop-{id}"))).danger().small().label(t("card.stop")).on_click(cx.listener(move |s, _, _, cx| s.stop_watch(id, cx)))),
+                    .child(Button::new(SharedString::from(format!("stats-{id}"))).cursor_pointer().small().label(t("tile.stats")).when(w.overlay, |b| b.primary()).on_click(act(if w.overlay { "no_overlay" } else { "overlay" })))
+                    .child(Button::new(SharedString::from(format!("pop-{id}"))).cursor_pointer().small().icon(Icon::default().path(if w.embedded { "icons/square-arrow-out-up-right.svg" } else { "icons/picture-in-picture.svg" })).tooltip(t(if w.embedded { "tile.popout" } else { "tile.popin" })).on_click(act(if w.embedded { "pop_out" } else { "pop_in" })))
+                    .child(Button::new(SharedString::from(format!("fs-{id}"))).cursor_pointer().small().icon(Icon::default().path("icons/maximize.svg")).tooltip(t("tile.fullscreen")).on_click(act("toggle_fullscreen")))
+                    .child(Button::new(SharedString::from(format!("stop-{id}"))).cursor_pointer().danger().small().label(t("card.stop")).on_click(cx.listener(move |s, _, _, cx| s.stop_watch(id, cx)))),
             )
     }
 
