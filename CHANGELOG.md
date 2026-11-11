@@ -2,7 +2,7 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
-## Unreleased
+## 0.2.2
 
 - The window list for going live no longer shows hidden windows of suspended Windows apps (Settings, Windows Input Experience, ApplicationFrameHost).
 - Buttons, checkboxes and lists show the hand cursor.
