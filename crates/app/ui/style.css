@@ -27,8 +27,10 @@ a { color: #8fb4ff; }
 .hidden { display: none !important; }
 
 /* Join screen */
-.join { height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--rail); }
-.join form { width: 380px; background: var(--main); border-radius: 12px; padding: 28px; display: flex; flex-direction: column; gap: 14px; }
+/* The page scrolls when the form is taller than the window (a direct connection's texts);
+   margin: auto centres the form when it fits and never cuts its top off when it does not. */
+.join { height: 100vh; overflow-y: auto; display: flex; padding: 24px 0; background: var(--rail); }
+.join form { margin: auto; flex: none; width: 380px; background: var(--main); border-radius: 12px; padding: 28px; display: flex; flex-direction: column; gap: 14px; }
 .join h1 { margin: 0 0 4px; font-size: 20px; color: var(--bright); }
 .field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 600; letter-spacing: .04em; color: var(--muted); text-transform: uppercase; }
 .field input, .field select { background: var(--sunk); color: var(--bright); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font-size: 14px; letter-spacing: normal; text-transform: none; font-weight: 400; }

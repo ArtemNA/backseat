@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## Unreleased
+
+- The join form scrolls when it is taller than the window (a direct connection's texts in a small window) instead of being cut off at the top and bottom.
+
 ## 0.1.9
 
 - Your rooms and settings are now also kept in `%LOCALAPPDATA%\Backseat\state.json`, so later versions can carry them over.
