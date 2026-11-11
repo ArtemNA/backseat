@@ -12,6 +12,7 @@ use crate::host::Host;
 use crate::server_client::ServerClient;
 use crate::signal::Outbox;
 use crate::viewer::Viewer;
+use crate::voice::{Voice, VoiceConfig};
 use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const TO_STREAMER: &str = "v/";
 const TO_VIEWER: &str = "s/";
+/// Voice chat between two members, both ways ("hi": I am in voice, "bye": I left it).
+const VOICE: &str = "c/";
 
 /// What changed, for the UI or a command-line report.
 #[derive(Debug, Clone)]
@@ -35,6 +38,8 @@ pub enum Event {
     Lost,
     /// A recoverable problem worth showing.
     Error(String),
+    /// The other members who are in voice, after any change.
+    VoiceMembers(Vec<PeerId>),
 }
 
 /// Prefixes every kind it sends with the sender's role.
@@ -78,6 +83,10 @@ struct State {
     /// Our viewers and the outboxes our host answers them through.
     viewers: HashMap<PeerId, Arc<dyn Outbox>>,
     watches: HashMap<PeerId, Arc<Watch>>,
+    /// Our voice chat, while we are in it.
+    voice: Option<Arc<Voice>>,
+    /// Other members who said they are in voice.
+    voice_members: std::collections::BTreeSet<PeerId>,
 }
 
 /// Peer ids in a direct session (no server, beta): the one who invited and the invited.
@@ -345,13 +354,108 @@ impl Session {
         if self.host().is_some() {
             self.stop_streaming();
         }
+        self.leave_voice();
         // On purpose: the server drops us now instead of keeping our place for a reconnect.
         self.client.send(ClientMsg::Leave);
     }
 
+    /// Joins the room's voice chat: everyone else in it connects with us.
+    pub fn join_voice(&self, cfg: VoiceConfig) -> Result<Arc<Voice>, String> {
+        if let Some(v) = self.voice() {
+            return Ok(v);
+        }
+        let voice = Voice::new(cfg)?;
+        let (others, members) = {
+            let mut st = self.state.lock().unwrap();
+            st.voice = Some(voice.clone());
+            (st.peers.iter().map(|p| p.id).filter(|id| *id != self.id).collect::<Vec<_>>(), st.voice_members.clone())
+        };
+        for id in others {
+            self.voice_link(id).send("hi", "");
+        }
+        // Those already known to be in voice: the lower id offers (the higher one waits).
+        for id in members {
+            self.voice_connect(&voice, id);
+        }
+        Ok(voice)
+    }
+
+    pub fn leave_voice(&self) {
+        let Some(v) = self.state.lock().unwrap().voice.take() else { return };
+        for id in self.peers().iter().map(|p| p.id).filter(|id| *id != self.id) {
+            self.voice_link(id).send("bye", "");
+        }
+        v.stop();
+    }
+
+    pub fn voice(&self) -> Option<Arc<Voice>> {
+        self.state.lock().unwrap().voice.clone()
+    }
+
+    pub fn voice_members(&self) -> Vec<PeerId> {
+        self.state.lock().unwrap().voice_members.iter().copied().collect()
+    }
+
+    fn voice_link(&self, id: PeerId) -> Arc<dyn Outbox> {
+        Arc::new(Tagged { inner: self.client.to_peer(id), tag: VOICE })
+    }
+
+    fn voice_connect(&self, voice: &Voice, id: PeerId) {
+        if let Err(e) = voice.add_peer(id, self.voice_link(id), self.id < id) {
+            let _ = self.events.send(Event::Error(format!("voice with {id}: {e}")));
+        }
+    }
+
+    fn on_voice(&self, from: PeerId, kind: &str, payload: &str) {
+        match kind {
+            "hi" => {
+                let (new, voice) = {
+                    let mut st = self.state.lock().unwrap();
+                    (st.voice_members.insert(from), st.voice.clone())
+                };
+                if new {
+                    let _ = self.events.send(Event::VoiceMembers(self.voice_members()));
+                }
+                if let Some(v) = voice {
+                    if !v.has(from) {
+                        // Our answer first, so it reaches them before our offer does.
+                        self.voice_link(from).send("hi", "");
+                        self.voice_connect(&v, from);
+                    }
+                }
+            }
+            "bye" => self.voice_gone(from),
+            _ => {
+                if let Some(v) = self.voice() {
+                    v.on_message(from, kind, payload);
+                }
+            }
+        }
+    }
+
+    fn voice_gone(&self, id: PeerId) {
+        let (was, voice) = {
+            let mut st = self.state.lock().unwrap();
+            (st.voice_members.remove(&id), st.voice.clone())
+        };
+        if let Some(v) = voice {
+            v.remove_peer(id);
+        }
+        if was {
+            let _ = self.events.send(Event::VoiceMembers(self.voice_members()));
+        }
+    }
+
     fn dispatch(&self, m: ServerMsg) {
         match m {
-            ServerMsg::PeerJoined { peer } => self.update_peer(peer),
+            ServerMsg::PeerJoined { peer } => {
+                let id = peer.id;
+                self.update_peer(peer);
+                // Newcomers learn who is in voice from those in it.
+                if self.voice().is_some() {
+                    self.voice_link(id).send("hi", "");
+                }
+            }
             ServerMsg::PeerUpdated { peer } => {
                 let stopped = !peer.streaming;
                 let id = peer.id;
@@ -369,6 +473,7 @@ impl Session {
                 let _ = self.events.send(Event::Peers(peers));
                 self.end_watch(id, "the streamer left", false);
                 self.drop_viewer(id);
+                self.voice_gone(id);
             }
             ServerMsg::SubscribeRequest { viewer, quality } => self.add_viewer(viewer, quality),
             ServerMsg::UnsubscribeRequest { viewer } => self.drop_viewer(viewer),
@@ -390,6 +495,8 @@ impl Session {
                         drop(st);
                         host.on_message(from, out.as_ref(), k, &payload);
                     }
+                } else if let Some(k) = kind.strip_prefix(VOICE) {
+                    self.on_voice(from, k, &payload);
                 } else if let Some(k) = kind.strip_prefix(TO_VIEWER) {
                     let w = self.state.lock().unwrap().watches.get(&from).cloned();
                     if let Some(w) = w {

@@ -18,6 +18,7 @@ pub mod signal;
 pub mod stats;
 pub mod thumbs;
 pub mod viewer;
+pub mod voice;
 
 #[cfg(windows)]
 mod controls;
