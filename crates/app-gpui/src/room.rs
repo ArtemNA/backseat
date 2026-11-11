@@ -195,7 +195,7 @@ impl Shell {
 
     /// Hides the video windows while the join form covers the room.
     pub fn sync_videos_hidden(&mut self) {
-        let hide = self.join_shown();
+        let hide = self.join_shown() || self.dialog_open();
         if hide != self.room.videos_hidden {
             self.room.videos_hidden = hide;
             core::videos_hidden(&self.core, hide);
@@ -265,6 +265,7 @@ impl Shell {
                 .child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE"))
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("Your stream"))
                 .child(div().flex_1().text_xs().text_color(rgb(color::MUTED)).child(format!("{} Mbit/s · {}", short_quality(&l.ceiling), l.encoder)))
+                .child(Button::new("change-live").small().label("Change").on_click(cx.listener(|s, _, w, cx| s.open_golive(true, w, cx))))
                 .child(Button::new("end-live").danger().small().label("End stream").on_click(cx.listener(|s, _, _, cx| {
                     core::end_live(&s.core);
                     s.tick(cx);
@@ -428,7 +429,7 @@ impl Shell {
         let max = f32::from(self.room.below.max_offset().y);
         let view = f32::from(self.room.below.bounds().size.height);
         let placed: Vec<String> = self.room.placed.borrow().iter().map(|(id, r)| format!("{id}:{}", r.map(|(x, y, w, h)| format!("{x},{y},{w}x{h}")).unwrap_or("none".into()))).collect();
-        let live = self.snap.live.as_ref().map(|l| format!("viewers {} [{}] layers {}", l.viewers.len(), l.viewers.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(","), l.layers.iter().filter(|x| !x.parked).count())).unwrap_or("-".into());
+        let live = self.snap.live.as_ref().map(|l| format!("viewers {} [{}] layers {} [{}] ceiling {}", l.viewers.len(), l.viewers.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(","), l.layers.iter().filter(|x| !x.parked).count(), l.layers.iter().filter(|x| !x.parked).map(|x| x.quality.as_str()).collect::<Vec<_>>().join(","), l.ceiling)).unwrap_or("-".into());
         let asked: Vec<String> = self.snap.watches.iter().map(|w| format!("{}:{}", w.streamer, w.quality.clone().unwrap_or("source".into()))).collect();
         let line = format!("tiles {tiles}; below scroll max {max:.0} view {view:.0}; placed [{}]; asked [{}]; live {live}", placed.join(" "), asked.join(" "));
         if line != self.room.reported {

@@ -217,6 +217,7 @@ name = "app-gpui"
 version = "0.1.9"
 dependencies = [
  "backseat-core",
+ "base64 0.22.1",
  "gpui-kit",
  "image",
  "media",

@@ -4,12 +4,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dialogs;
 mod join;
 mod room;
 mod tray;
 
 use backseat_core::{self as core, App as Core, Snapshot};
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::component::button::ButtonVariants as _;
+use gpui_kit::component::{Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -88,6 +90,10 @@ struct Shell {
     room: room::Room,
     /// When the message in `error` came, so a notice in a room goes away after a while.
     error_since: Option<std::time::Instant>,
+    dialogs: dialogs::Dialogs,
+    subs: Vec<Subscription>,
+    /// Refreshes so far, for things done every other second.
+    ticks: u64,
 }
 
 /// One value of the state file.
@@ -120,7 +126,7 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0 };
         // With a saved room, start in the last one opened. Not when a test joins by itself.
         if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none()) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
@@ -132,6 +138,11 @@ impl Shell {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update_in(cx, |s, window, cx| {
                 s.tick(cx);
+                s.ticks += 1;
+                // Pictures in the go-live dialog every 2 s.
+                if s.ticks % 2 == 0 {
+                    s.refresh_thumbs(cx);
+                }
                 s.sync_tiles(window, cx);
                 if s.reset_pending {
                     s.reset_pending = false;
@@ -148,6 +159,7 @@ impl Shell {
         join::test_form(window, cx);
         room::test_click_watch(window, cx);
         room::test_quality(window, cx);
+        dialogs::test_dialogs(window, cx);
         shell
     }
 
@@ -390,7 +402,18 @@ impl Shell {
                     .h(px(56.))
                     .bg(rgb(color::BAR))
                     .child(avatar(&me))
-                    .child(div().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => "not live".into() }))),
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => "not live".into() })))
+                    .child(icon_button("settings-btn", "icons/settings.svg", "Settings", color::BRIGHT).on_click(cx.listener(|s, _, w, cx| s.open_settings(dialogs::SetTab::General, w, cx))))
+                    .when(self.snap.connected && !live, |d| {
+                        d.child(
+                            gpui_kit::component::button::Button::new("go-live")
+                                .primary()
+                                .small()
+                                .icon(gpui_kit::component::Icon::default().path("icons/monitor.svg"))
+                                .label("Stream")
+                                .on_click(cx.listener(|s, _, w, cx| s.open_golive(false, w, cx))),
+                        )
+                    }),
             )
     }
 
@@ -443,7 +466,9 @@ fn row() -> Div {
 }
 
 fn avatar(name: &str) -> Div {
-    div().size_8().flex_none().rounded_full().bg(rgb(color::GREEN)).flex().items_center().justify_center().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::BOLD).child(name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default())
+    const COLORS: [u32; 7] = [0xc2622d, 0x3a8a5c, 0x5d5fa8, 0x7a4e9a, 0x2f7f95, 0x9a4e6b, 0x7a6a2e];
+    let h = name.chars().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
+    div().size_8().flex_none().rounded_full().bg(rgb(COLORS[(h % COLORS.len() as u32) as usize])).flex().items_center().justify_center().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::BOLD).child(name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default())
 }
 
 impl Render for Shell {
@@ -453,10 +478,12 @@ impl Render for Shell {
         }
         self.sync_videos_hidden();
         self.sync_tiles(window, cx);
+        let dialog = self.render_dialog(cx);
         if self.join_shown() {
-            return div().size_full().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).into_any_element();
+            return div().size_full().relative().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).children(dialog).into_any_element();
         }
         div()
+            .relative()
             .flex()
             .size_full()
             .font_family("Segoe UI")
@@ -466,13 +493,14 @@ impl Render for Shell {
             .child(self.rail(cx))
             .child(self.side(cx))
             .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() })
+            .children(dialog)
             .into_any_element()
     }
 }
 
 // Icons (lucide): gpui-kit's default set for its components, plus the few this app uses that
 // the default set leaves out. Only these are in the exe, not the whole catalog.
-gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus, Settings, Monitor]);
 
 struct AppAssets;
 
@@ -542,6 +570,9 @@ fn test_actions(cx: &mut Context<Shell>) {
 
 fn main() {
     let Some(core) = core::start(|_, _| show_main_window()) else { return };
+    if settings().get("tray").and_then(|v| v.as_bool()) == Some(false) {
+        core.close_to_tray.store(false, Ordering::SeqCst);
+    }
     gpui_kit::application().with_assets(AppAssets).run(move |cx: &mut App| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);

@@ -456,7 +456,8 @@ impl Shell {
                         s.join.open = false;
                         cx.notify();
                     })))
-                }),
+                })
+                .child(Button::new("join-settings").ghost().label("Settings").on_click(cx.listener(|s, _, w, cx| s.open_settings(crate::dialogs::SetTab::General, w, cx)))),
                 ),
         ))
         .vertical_scrollbar(&self.join.scroll)
