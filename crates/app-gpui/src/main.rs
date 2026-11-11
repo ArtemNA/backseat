@@ -4,10 +4,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod join;
 mod tray;
 
 use backseat_core::{self as core, App as Core, Snapshot};
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -17,13 +18,13 @@ use std::time::Duration;
 /// The main window's HWND, for showing and hiding it from the tray and other threads.
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
-mod color {
+pub(crate) mod color {
     pub const RAIL: u32 = 0x1e1f22;
     pub const SIDE: u32 = 0x2b2d31;
     pub const MAIN: u32 = 0x313338;
     pub const LINE: u32 = 0x1f2023;
     pub const TEXT: u32 = 0xdbdee1;
-    pub const MUTED: u32 = 0x949ba4;
+    pub const MUTED: u32 = 0xb5bac1;
     pub const BRIGHT: u32 = 0xf2f3f5;
     pub const ACCENT: u32 = 0x5865f2;
     pub const GREEN: u32 = 0x23a55a;
@@ -78,30 +79,63 @@ struct Shell {
     error: Option<String>,
     /// The last line written for tests, so only changes are written.
     reported: String,
+    join: join::Join,
+    /// The direct connection's state at the last refresh, to see it end.
+    prev_direct: Option<&'static str>,
+    /// The direct form starts over at the next refresh (it needs the window).
+    reset_pending: bool,
+}
+
+/// The saved settings (the state file's "settings" object).
+pub(crate) fn settings() -> serde_json::Map<String, serde_json::Value> {
+    match core::state_load().remove("settings") {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => Default::default(),
+    }
+}
+
+pub(crate) fn set_setting(key: &str, value: serde_json::Value) {
+    let mut state = core::state_load();
+    let mut s = settings();
+    s.insert(key.into(), value);
+    state.insert("settings".into(), serde_json::Value::Object(s));
+    if let Err(e) = core::state_save(&serde_json::Value::Object(state).to_string()) {
+        eprintln!("state: {e}");
+    }
 }
 
 impl Shell {
-    fn new(core: Arc<Core>, cx: &mut Context<Self>) -> Self {
+    fn new(core: Arc<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = core::state_load();
         let rooms: Vec<Room> = state.get("rooms").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(Room::from_json).collect()).unwrap_or_default();
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new() };
+        let join = join::Join::new(window, cx);
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false };
         // With a saved room, start in the last one opened. Not when a test joins by itself.
-        if std::env::var_os("STREAMER_APP_AUTOJOIN").is_none() {
+        if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none()) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
             if let Some(r) = start {
                 shell.open_room(r, cx);
             }
         }
-        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| loop {
+        cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
-            if this.update(cx, |s, cx| s.tick(cx)).is_err() {
+            let alive = this.update_in(cx, |s, window, cx| {
+                s.tick(cx);
+                if s.reset_pending {
+                    s.reset_pending = false;
+                    s.reset_direct(window, cx);
+                }
+            });
+            if alive.is_err() {
                 break;
             }
         })
         .detach();
         test_actions(cx);
+        join::test_direct(window, cx);
+        join::test_form(window, cx);
         shell
     }
 
@@ -110,8 +144,28 @@ impl Shell {
         if let Some(n) = self.snap.notice.clone() {
             self.error = Some(n);
         }
+        if let Some(link) = self.snap.link.clone() {
+            self.handle_link(&link, cx);
+        }
+        self.expire_codes();
+        // A direct connection that ended: its form starts over. One that connected: the
+        // form closes.
+        if self.prev_direct == Some("connected") && self.snap.direct != Some("connected") {
+            self.reset_pending = true;
+        }
+        if self.snap.direct == Some("connected") && self.join.direct_open {
+            self.join.direct_open = false;
+            self.join.open = false;
+        }
+        self.prev_direct = self.snap.direct;
+        if self.snap.direct.is_some() {
+            self.current = None;
+            self.report();
+            cx.notify();
+            return;
+        }
         // Joined some other way (tests): remember what we are in.
-        if self.snap.connected && !self.joining && self.current.as_ref().is_none_or(|c| c.room != self.snap.room) {
+        if self.snap.connected && !self.joining && !self.join.busy && self.current.as_ref().is_none_or(|c| c.room != self.snap.room) {
             let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).unwrap_or_default();
             let server = std::env::var("STREAMER_APP_AUTOJOIN").ok().and_then(|j| j.split(';').next().map(String::from)).unwrap_or_default();
             let r = Room { server, room: self.snap.room.clone(), name: me, title: self.snap.title.clone() };
@@ -147,6 +201,38 @@ impl Shell {
         cx.notify();
     }
 
+    /// An invite link from a click (backseat://join/CODE): go there, or ask for a name.
+    fn handle_link(&mut self, link: &str, cx: &mut Context<Self>) {
+        let Some(code) = join::parse_code(link) else { return };
+        if self.current.as_ref().is_some_and(|c| c.room == code) {
+            return;
+        }
+        if let Some(known) = self.rooms.iter().find(|r| r.room == code).cloned() {
+            self.open_room(known, cx);
+            return;
+        }
+        let server = core::built_in()
+            .map(String::from)
+            .or_else(|| settings().get("server").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(String::from))
+            .or_else(|| self.current.as_ref().map(|c| c.server.clone()))
+            .unwrap_or_else(|| self.join.server.read(cx).value().to_string());
+        let name = self.current.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| self.join.name.read(cx).value().trim().to_string());
+        if !name.is_empty() {
+            self.open_room(Room { server, room: code, name, title: None }, cx);
+            return;
+        }
+        // First time: ask for a name; the code goes into the form.
+        self.join.mode = join::Mode::Code;
+        self.join.pending_code = Some(join::fmt_code(&code));
+        self.open_join(cx);
+    }
+
+    fn leave(&mut self, cx: &mut Context<Self>) {
+        core::leave(&self.core);
+        self.current = None;
+        self.tick(cx);
+    }
+
     /// Puts the room in the saved list (or updates it) and makes it the last one opened.
     fn remember(&mut self, r: &Room) {
         match self.rooms.iter_mut().find(|x| x.same(r)) {
@@ -169,13 +255,14 @@ impl Shell {
         let rail: Vec<String> = self.rooms.iter().map(|r| format!("{}={}", r.initials(), r.room)).collect();
         let peers: Vec<String> = self.snap.peers.iter().map(|p| format!("{}{}{}", p.name, if p.streaming { "(live)" } else { "" }, if p.me { "(me)" } else { "" })).collect();
         let line = format!(
-            "rail [{}]; current {}; connected {}; room {}; peers {}; visible {}; error {}",
+            "rail [{}]; current {}; connected {}; room {}; peers {}; visible {}; join {}; error {}",
             rail.join(", "),
             self.current.as_ref().map(|c| c.room.as_str()).unwrap_or("-"),
             self.snap.connected,
             self.snap.room,
             peers.join(","),
             window_visible(),
+            self.join_shown(),
             self.error.as_deref().unwrap_or("-")
         );
         if line != self.reported {
@@ -204,10 +291,27 @@ impl Shell {
                 .child(r.initials())
                 .on_click(cx.listener(move |this, _, _, cx| this.open_room(room.clone(), cx)))
         }))
+        .child(
+            div()
+                .id("add-room")
+                .size_12()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(24.))
+                .bg(rgb(color::MAIN))
+                .text_color(rgb(color::GREEN))
+                .text_size(px(24.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(color::GREEN)).text_color(rgb(color::BRIGHT)).rounded(px(16.)))
+                .child("+")
+                .on_click(cx.listener(|this, _, _, cx| this.open_join(cx))),
+        )
     }
 
-    fn side(&self) -> impl IntoElement {
-        let title = self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into());
+    fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = if self.snap.direct.is_some() { "Direct connection (beta)".to_string() } else { self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into()) };
+        let invite = self.current.clone().filter(|_| self.snap.connected && self.snap.direct.is_none());
         let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).or_else(|| self.current.as_ref().map(|c| c.name.clone())).unwrap_or_default();
         let live = self.snap.live.is_some();
         div()
@@ -217,7 +321,29 @@ impl Shell {
             .bg(rgb(color::SIDE))
             .flex()
             .flex_col()
-            .child(div().h_12().px_4().flex().items_center().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).border_b_1().border_color(rgb(color::LINE)).child(title))
+            .child(
+                div()
+                    .h_12()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(color::LINE))
+                    .child(div().flex_1().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(title))
+                    .when_some(invite, |d, r| {
+                        d.child(div().id("invite").px_1p5().rounded_sm().cursor_pointer().text_color(rgb(color::MUTED)).hover(|s| s.text_color(rgb(color::BRIGHT))).child("Invite").on_click(cx.listener(move |this, _, _, cx| {
+                            let code = if join::is_code(&r.room) { join::fmt_code(&r.room) } else { r.room.clone() };
+                            let text = if join::is_code(&r.room) { format!("Join me in Backseat: {}, invite code {}", r.label(), code) } else { code.clone() };
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            this.error = Some(format!("Invite copied: {code}"));
+                            cx.notify();
+                        })))
+                    })
+                    .when(self.snap.connected, |d| {
+                        d.child(div().id("leave").px_1p5().rounded_sm().cursor_pointer().text_color(rgb(color::MUTED)).hover(|s| s.text_color(rgb(color::LIVE))).child("Leave").on_click(cx.listener(|this, _, _, cx| this.leave(cx))))
+                    }),
+            )
             .child(div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(format!("IN THE ROOM — {}", self.snap.peers.len())))
             .child(
                 div().id("people").flex_1().overflow_y_scroll().children(self.snap.peers.iter().map(|p| {
@@ -270,17 +396,24 @@ fn avatar(name: &str) -> Div {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(code) = self.join.pending_code.take() {
+            self.join.code.update(cx, |i, cx| i.set_value(code, window, cx));
+        }
+        if self.join_shown() {
+            return div().size_full().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).into_any_element();
+        }
         div()
             .flex()
             .size_full()
             .font_family("Segoe UI")
             .text_size(px(14.))
             .text_color(rgb(color::TEXT))
-            .bg(cx.theme().background)
+            .bg(rgb(color::MAIN))
             .child(self.rail(cx))
-            .child(self.side())
+            .child(self.side(cx))
             .child(self.main())
+            .into_any_element()
     }
 }
 
@@ -337,6 +470,36 @@ fn main() {
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        // The webview's colours for fields and buttons: fields darker than the card with a
+        // visible border, blue primary buttons, grey ones.
+        {
+            let t = Theme::global_mut(cx);
+            t.background = rgb(color::RAIL).into();
+            t.input = rgb(0x3f4147).into();
+            t.border = rgb(0x3f4147).into();
+            t.foreground = rgb(color::BRIGHT).into();
+            t.muted_foreground = rgb(color::MUTED).into();
+            t.primary = rgb(0x3b6fd8).into();
+            t.primary_hover = rgb(0x4a7ee6).into();
+            t.primary_foreground = rgb(0xffffff).into();
+            t.secondary = rgb(0x4e5058).into();
+            t.secondary_hover = rgb(0x5c5e66).into();
+            t.secondary_foreground = rgb(0xffffff).into();
+            t.ring = rgb(0x3b6fd8).into();
+            // Buttons read their colours from the theme's tokens.
+            let h = |c: u32| -> Hsla { rgb(c).into() };
+            t.tokens.button_primary = h(0x3b6fd8).into();
+            t.tokens.button_primary_hover = h(0x4a7ee6).into();
+            t.tokens.button_primary_active = h(0x335fba).into();
+            t.tokens.button_primary_foreground = h(0xffffff).into();
+            t.tokens.button = h(0x4e5058).into();
+            t.tokens.button_hover = h(0x5c5e66).into();
+            t.tokens.button_active = h(0x45474e).into();
+            t.tokens.button_foreground = h(0xffffff).into();
+            // ...and their text colour from the plain colours.
+            t.button_primary_foreground = h(0xffffff);
+            t.button_foreground = h(0xffffff);
+        }
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(800.)), cx)),
             titlebar: Some(TitlebarOptions { title: Some("Backseat".into()), ..Default::default() }),
@@ -363,7 +526,7 @@ fn main() {
                 true
             });
             let c = c.clone();
-            cx.new(|cx| Shell::new(c, cx))
+            cx.new(|cx| Shell::new(c, window, cx))
         });
         if let Err(e) = opened {
             eprintln!("window: {e}");
