@@ -1,0 +1,20 @@
+[package]
+name = "app-gpui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The app with a native UI (GPUI and gpui-component) instead of the webview.
+[[bin]]
+name = "backseat-gpui"
+path = "src/main.rs"
+
+[dependencies]
+backseat-core = { path = "../backseat-core" }
+media.workspace = true
+gpui-kit = "=0.9.1"
+raw-window-handle = "0.6"
+serde_json = "1"
+tray-icon = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

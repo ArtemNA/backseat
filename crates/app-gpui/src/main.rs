@@ -1,0 +1,379 @@
+//! Backseat with a native UI: GPUI and gpui-component instead of the webview. Everything
+//! apart from the window is `backseat-core`. Stage 1: the window, rooms in the rail (from
+//! the state file), people in the open room, a 1 s refresh, the tray.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod tray;
+
+use backseat_core::{self as core, App as Core, Snapshot};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// The main window's HWND, for showing and hiding it from the tray and other threads.
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+mod color {
+    pub const RAIL: u32 = 0x1e1f22;
+    pub const SIDE: u32 = 0x2b2d31;
+    pub const MAIN: u32 = 0x313338;
+    pub const LINE: u32 = 0x1f2023;
+    pub const TEXT: u32 = 0xdbdee1;
+    pub const MUTED: u32 = 0x949ba4;
+    pub const BRIGHT: u32 = 0xf2f3f5;
+    pub const ACCENT: u32 = 0x5865f2;
+    pub const GREEN: u32 = 0x23a55a;
+    pub const LIVE: u32 = 0xed4245;
+    pub const BAR: u32 = 0x232428;
+}
+
+/// A saved room, as the Tauri UI keeps it in the state file.
+#[derive(Clone, Debug, PartialEq)]
+struct Room {
+    server: String,
+    room: String,
+    name: String,
+    title: Option<String>,
+}
+
+impl Room {
+    fn from_json(v: &serde_json::Value) -> Option<Room> {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+        Some(Room { server: s("server")?, room: s("room")?, name: s("name")?, title: s("title").filter(|t| !t.is_empty()) })
+    }
+    fn to_json(&self) -> serde_json::Value {
+        let mut m = serde_json::json!({ "server": self.server, "room": self.room, "name": self.name });
+        if let Some(t) = &self.title {
+            m["title"] = t.clone().into();
+        }
+        m
+    }
+    fn same(&self, other: &Room) -> bool {
+        self.room == other.room && self.server == other.server
+    }
+    fn label(&self) -> String {
+        self.title.clone().unwrap_or_else(|| self.room.clone())
+    }
+    /// Two letters for the rail, like the webview UI: first letters of two words, else the
+    /// first two characters.
+    fn initials(&self) -> String {
+        let label = self.label();
+        let words: Vec<&str> = label.split(|c: char| c.is_whitespace() || "-_.".contains(c)).filter(|w| !w.is_empty()).collect();
+        let two: String = if words.len() > 1 { words[0].chars().take(1).chain(words[1].chars().take(1)).collect() } else { label.chars().take(2).collect() };
+        two.to_uppercase()
+    }
+}
+
+struct Shell {
+    core: Arc<Core>,
+    snap: Snapshot,
+    rooms: Vec<Room>,
+    current: Option<Room>,
+    /// A join running in the background.
+    joining: bool,
+    error: Option<String>,
+    /// The last line written for tests, so only changes are written.
+    reported: String,
+}
+
+impl Shell {
+    fn new(core: Arc<Core>, cx: &mut Context<Self>) -> Self {
+        let state = core::state_load();
+        let rooms: Vec<Room> = state.get("rooms").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(Room::from_json).collect()).unwrap_or_default();
+        let last = state.get("lastRoom").and_then(Room::from_json);
+        let snap = core::snapshot(&core);
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new() };
+        // With a saved room, start in the last one opened. Not when a test joins by itself.
+        if std::env::var_os("STREAMER_APP_AUTOJOIN").is_none() {
+            let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
+            if let Some(r) = start {
+                shell.open_room(r, cx);
+            }
+        }
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            if this.update(cx, |s, cx| s.tick(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
+        test_actions(cx);
+        shell
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        self.snap = core::snapshot(&self.core);
+        if let Some(n) = self.snap.notice.clone() {
+            self.error = Some(n);
+        }
+        // Joined some other way (tests): remember what we are in.
+        if self.snap.connected && !self.joining && self.current.as_ref().is_none_or(|c| c.room != self.snap.room) {
+            let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).unwrap_or_default();
+            let server = std::env::var("STREAMER_APP_AUTOJOIN").ok().and_then(|j| j.split(';').next().map(String::from)).unwrap_or_default();
+            let r = Room { server, room: self.snap.room.clone(), name: me, title: self.snap.title.clone() };
+            self.remember(&r);
+            self.current = Some(r);
+        }
+        self.report();
+        cx.notify();
+    }
+
+    /// Joins a room in the background (joining blocks; video windows wait for this thread).
+    fn open_room(&mut self, r: Room, cx: &mut Context<Self>) {
+        if self.joining || (self.snap.connected && self.current.as_ref().is_some_and(|c| c.same(&r))) {
+            return;
+        }
+        self.current = Some(r.clone());
+        self.joining = true;
+        self.error = None;
+        self.remember(&r);
+        let core = self.core.clone();
+        let task = cx.background_executor().spawn(async move { core::connect(&core, &r.server, &r.room, &r.name, r.title.as_deref()) });
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = this.update(cx, |s, cx| {
+                s.joining = false;
+                if let Err(e) = result {
+                    s.error = Some(e);
+                }
+                s.tick(cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Puts the room in the saved list (or updates it) and makes it the last one opened.
+    fn remember(&mut self, r: &Room) {
+        match self.rooms.iter_mut().find(|x| x.same(r)) {
+            Some(x) => *x = r.clone(),
+            None => self.rooms.push(r.clone()),
+        }
+        let mut state = core::state_load();
+        state.insert("rooms".into(), serde_json::Value::Array(self.rooms.iter().map(Room::to_json).collect()));
+        state.insert("lastRoom".into(), r.to_json());
+        if let Err(e) = core::state_save(&serde_json::Value::Object(state).to_string()) {
+            eprintln!("state: {e}");
+        }
+    }
+
+    /// Tests only (STREAMER_APP_TEST_GPUI): what the window shows, when it changes.
+    fn report(&mut self) {
+        if std::env::var_os("STREAMER_APP_TEST_GPUI").is_none() {
+            return;
+        }
+        let rail: Vec<String> = self.rooms.iter().map(|r| format!("{}={}", r.initials(), r.room)).collect();
+        let peers: Vec<String> = self.snap.peers.iter().map(|p| format!("{}{}{}", p.name, if p.streaming { "(live)" } else { "" }, if p.me { "(me)" } else { "" })).collect();
+        let line = format!(
+            "rail [{}]; current {}; connected {}; room {}; peers {}; visible {}; error {}",
+            rail.join(", "),
+            self.current.as_ref().map(|c| c.room.as_str()).unwrap_or("-"),
+            self.snap.connected,
+            self.snap.room,
+            peers.join(","),
+            window_visible(),
+            self.error.as_deref().unwrap_or("-")
+        );
+        if line != self.reported {
+            eprintln!("test: {line}");
+            self.reported = line;
+        }
+    }
+
+    fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.current.clone();
+        div().w(px(72.)).h_full().flex_none().bg(rgb(color::RAIL)).flex().flex_col().items_center().gap_2().pt_3().children(self.rooms.iter().enumerate().map(|(i, r)| {
+            let on = current.as_ref().is_some_and(|c| c.same(r));
+            let room = r.clone();
+            div()
+                .id(("room", i))
+                .size_12()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(if on { 16. } else { 24. }))
+                .bg(rgb(if on { color::ACCENT } else { color::MAIN }))
+                .text_color(rgb(color::BRIGHT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(color::ACCENT)).rounded(px(16.)))
+                .child(r.initials())
+                .on_click(cx.listener(move |this, _, _, cx| this.open_room(room.clone(), cx)))
+        }))
+    }
+
+    fn side(&self) -> impl IntoElement {
+        let title = self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into());
+        let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).or_else(|| self.current.as_ref().map(|c| c.name.clone())).unwrap_or_default();
+        let live = self.snap.live.is_some();
+        div()
+            .w(px(240.))
+            .h_full()
+            .flex_none()
+            .bg(rgb(color::SIDE))
+            .flex()
+            .flex_col()
+            .child(div().h_12().px_4().flex().items_center().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).border_b_1().border_color(rgb(color::LINE)).child(title))
+            .child(div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(format!("IN THE ROOM — {}", self.snap.peers.len())))
+            .child(
+                div().id("people").flex_1().overflow_y_scroll().children(self.snap.peers.iter().map(|p| {
+                    row()
+                        .child(avatar(&p.name))
+                        .child(div().flex_1().text_color(rgb(if p.me { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
+                        .when(p.streaming, |d| d.child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE")))
+                })),
+            )
+            .child(
+                row()
+                    .h(px(56.))
+                    .bg(rgb(color::BAR))
+                    .child(avatar(&me))
+                    .child(div().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(color::MUTED)).child(if live { "Live" } else { "Not live" }))),
+            )
+    }
+
+    fn main(&self) -> impl IntoElement {
+        let status = if self.joining {
+            "Connecting…".to_string()
+        } else if let Some(e) = &self.error {
+            format!("Could not join: {e}")
+        } else if self.snap.connected {
+            let streams = self.snap.peers.iter().filter(|p| p.streaming && !p.me).count();
+            format!("{streams} streaming. Watching comes in stage 3.")
+        } else if self.rooms.is_empty() {
+            "No rooms yet. Joining and making rooms comes in stage 2.".into()
+        } else {
+            "Not in a room. Pick one on the left.".into()
+        };
+        let header = self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_default();
+        div()
+            .flex_1()
+            .h_full()
+            .bg(rgb(color::MAIN))
+            .flex()
+            .flex_col()
+            .child(div().h_12().px_4().flex().items_center().gap_3().border_b_1().border_color(rgb(color::LINE)).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(header)))
+            .child(div().flex_1().flex().items_center().justify_center().text_color(rgb(color::MUTED)).child(status))
+    }
+}
+
+fn row() -> Div {
+    div().flex().items_center().gap_2p5().px_4().py_1p5()
+}
+
+fn avatar(name: &str) -> Div {
+    div().size_8().flex_none().rounded_full().bg(rgb(color::GREEN)).flex().items_center().justify_center().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::BOLD).child(name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default())
+}
+
+impl Render for Shell {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .size_full()
+            .font_family("Segoe UI")
+            .text_size(px(14.))
+            .text_color(rgb(color::TEXT))
+            .bg(cx.theme().background)
+            .child(self.rail(cx))
+            .child(self.side())
+            .child(self.main())
+    }
+}
+
+fn hwnd() -> windows::Win32::Foundation::HWND {
+    windows::Win32::Foundation::HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _)
+}
+
+fn window_visible() -> bool {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd()).as_bool() }
+}
+
+/// Brings the main window back (the tray, a later start).
+pub fn show_main_window() {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    if MAIN_HWND.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    unsafe {
+        let h = hwnd();
+        let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+fn hide_main_window() {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let _ = ShowWindow(hwnd(), SW_HIDE);
+    }
+}
+
+/// Tests only: STREAMER_APP_TEST_GPUI=close asks the window to close at +8 s (as its X
+/// button does) and shows it again at +12 s (as the tray does).
+fn test_actions(cx: &mut Context<Shell>) {
+    if std::env::var("STREAMER_APP_TEST_GPUI").as_deref() != Ok("close") {
+        return;
+    }
+    cx.spawn(async move |_, cx: &mut AsyncApp| {
+        cx.background_executor().timer(Duration::from_secs(8)).await;
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            let _ = PostMessageW(Some(hwnd()), WM_CLOSE, Default::default(), Default::default());
+        }
+        eprintln!("test: close asked");
+        cx.background_executor().timer(Duration::from_secs(4)).await;
+        show_main_window();
+        eprintln!("test: show asked");
+    })
+    .detach();
+}
+
+fn main() {
+    let Some(core) = core::start(|_, _| show_main_window()) else { return };
+    gpui_kit::application().run(move |cx: &mut App| {
+        gpui_kit::init(cx);
+        Theme::change(ThemeMode::Dark, None, cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(1280.), px(800.)), cx)),
+            titlebar: Some(TitlebarOptions { title: Some("Backseat".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        let c = core.clone();
+        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(RawWindowHandle::Win32(h)) = window.window_handle().map(|h| h.as_raw()) {
+                MAIN_HWND.store(h.hwnd.get(), Ordering::SeqCst);
+                // Video windows go inside the main window (the UI gives each a place).
+                media::present::set_default_parent(h.hwnd.get());
+            }
+            // Closing hides the window in the tray (the default); the tray's Quit ends the app.
+            let close = c.clone();
+            window.on_window_should_close(cx, move |_, cx| {
+                if close.close_to_tray.load(Ordering::SeqCst) {
+                    hide_main_window();
+                    eprintln!("window: hidden in the tray");
+                    return false;
+                }
+                core::leave_for_good(&close, Duration::from_millis(500));
+                cx.quit();
+                true
+            });
+            let c = c.clone();
+            cx.new(|cx| Shell::new(c, cx))
+        });
+        if let Err(e) = opened {
+            eprintln!("window: {e}");
+            cx.quit();
+            return;
+        }
+        match tray::start(core.clone()) {
+            Ok(()) => eprintln!("tray: ready"),
+            Err(e) => eprintln!("tray: {e}"),
+        }
+        cx.activate(true);
+    });
+}
