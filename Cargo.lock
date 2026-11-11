@@ -49,7 +49,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gstreamer",
  "media",
@@ -1628,7 +1628,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "host"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gstreamer",
  "media",
@@ -2217,7 +2217,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "media"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -2316,7 +2316,7 @@ checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 
 [[package]]
 name = "nat"
-version = "0.1.8"
+version = "0.1.9"
 
 [[package]]
 name = "native-tls"
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "futures-util",
@@ -4619,7 +4619,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "viewer"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gstreamer",
  "media",
