@@ -272,10 +272,13 @@ pub fn shortcode_get(code: &str) -> Result<String, String> {
 /// The UI's saved rooms and settings (%LOCALAPPDATA%\Backseat\state.json). The Tauri UI
 /// mirrors its localStorage here; the GPUI UI keeps them only here.
 pub fn state_file() -> Option<std::path::PathBuf> {
-    // Test runs keep their own data; only the state gate may write the file.
+    // Test runs keep their data apart from the real one, next to their own WebView2 profile
+    // (the webview UI's saved data in a test run): runs that share a profile share the file.
+    // The state gate (STREAMER_APP_TEST_STATE) uses the real place under its own LOCALAPPDATA.
     let testing = std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_") && k != "STREAMER_APP_TEST_STATE");
     if testing && std::env::var_os("STREAMER_APP_TEST_STATE").is_none() {
-        return None;
+        let dir = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("backseat-test-webview"));
+        return Some(dir.join("state.json"));
     }
     Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Backseat").join("state.json"))
 }

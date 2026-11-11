@@ -23,6 +23,7 @@ use std::time::Duration;
 pub enum Open {
     GoLive,
     Settings,
+    Rename,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -109,6 +110,8 @@ pub struct Dialogs {
     pub open: Option<Open>,
     pub golive: Option<GoLiveState>,
     pub settings: Option<SettingsState>,
+    /// The room whose name in it is being changed, and the field.
+    pub rename: Option<(crate::Room, Entity<InputState>)>,
 }
 
 fn decode_data_url(url: &str) -> Option<Arc<Image>> {
@@ -596,6 +599,41 @@ impl Shell {
         card.into_any_element()
     }
 
+    pub fn open_rename(&mut self, r: crate::Room, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| InputState::new(window, cx).default_value(r.name.clone()));
+        name.focus_handle(cx).focus(window, cx);
+        self.dialogs.rename = Some((r, name));
+        self.dialogs.open = Some(Open::Rename);
+        cx.notify();
+    }
+
+    fn render_rename(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some((r, name)) = self.dialogs.rename.clone() else { return div().into_any_element() };
+        div()
+            .w(px(380.))
+            .p_6()
+            .bg(rgb(color::MAIN))
+            .rounded(px(12.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(tf("rename.title", &[("room", &r.label())])))
+            .child(div().rounded_md().bg(rgb(color::RAIL)).child(Input::new(&name)))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("rn-cancel").label(t("common.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
+                    .child(Button::new("rn-save").primary().label(t("common.save")).on_click(cx.listener(move |s, _, _, cx| {
+                        let v = name.read(cx).value().to_string();
+                        s.dialogs.open = None;
+                        s.rename_room(&r, &v, cx);
+                    }))),
+            )
+            .into_any_element()
+    }
+
     pub fn open_settings(&mut self, tab: SetTab, window: &mut Window, cx: &mut Context<Self>) {
         let server_now = settings().get("server").and_then(|v| v.as_str()).map(String::from).filter(|v| !v.is_empty()).unwrap_or_else(|| self.join.server.read(cx).value().to_string());
         let server = cx.new(|cx| InputState::new(window, cx).placeholder("wss://example.com/ws").default_value(core::built_in().map(String::from).unwrap_or(server_now)));
@@ -638,7 +676,7 @@ impl Shell {
             }));
             prefs.push(Pref { section, key, values, picker });
         }
-        let update = self.dialogs.settings.as_ref().and_then(|s| s.update.clone());
+        let update = self.update.clone().or_else(|| self.dialogs.settings.as_ref().and_then(|s| s.update.clone()));
         self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs });
         self.dialogs.open = Some(Open::Settings);
         cx.notify();
@@ -830,6 +868,7 @@ impl Shell {
     pub fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let card = match self.dialogs.open? {
             Open::GoLive => self.render_golive(cx),
+            Open::Rename => self.render_rename(cx),
             Open::Settings => self.render_settings(cx),
         };
         Some(
@@ -897,14 +936,15 @@ pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
             let _ = this.update_in(cx, |s, window, cx| s.open_settings(tab, window, cx));
         }
         if let Some(g) = golive {
-            // In a room first.
+            // 3 s after start, as the webview's driver (gates take pictures by that clock);
+            // later only if the app is not in a room yet.
+            ex.timer(Duration::from_secs(1)).await;
             for _ in 0..40 {
                 if this.update(cx, |s, _| s.snap.connected).unwrap_or(false) {
                     break;
                 }
                 ex.timer(Duration::from_millis(250)).await;
             }
-            ex.timer(Duration::from_secs(2)).await;
             let _ = this.update_in(cx, |s, window, cx| s.open_golive(false, window, cx));
             ex.timer(Duration::from_millis(2500)).await;
             let _ = this.update(cx, |s, _| {

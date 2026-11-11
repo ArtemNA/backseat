@@ -1,8 +1,13 @@
 [package]
-name = "app"
+name = "app-webview"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+# The former webview UI, kept to check that both read the same state file.
+[[bin]]
+name = "app-webview"
+path = "src/main.rs"
 
 [dependencies]
 backseat-core = { path = "../backseat-core" }

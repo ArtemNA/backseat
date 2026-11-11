@@ -8,6 +8,7 @@ mod dialogs;
 mod i18n;
 mod join;
 mod room;
+mod testing;
 mod tray;
 
 use backseat_core::{self as core, App as Core, Snapshot};
@@ -96,6 +97,10 @@ struct Shell {
     subs: Vec<Subscription>,
     /// Refreshes so far, for things done every other second.
     ticks: u64,
+    /// A room's menu (right click in the rail) and where it opened.
+    room_menu: Option<(Room, Point<Pixels>)>,
+    /// A newer release found by the update check.
+    update: Option<core::update::Release>,
 }
 
 /// One value of the state file.
@@ -128,9 +133,9 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0 };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None };
         // With a saved room, start in the last one opened. Not when a test joins by itself.
-        if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none()) {
+        if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none() || (*k == "STREAMER_APP_TEST_FORM" && std::env::var(k).is_ok_and(|v| v.starts_with("show")))) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
             if let Some(r) = start {
                 shell.open_room(r, cx);
@@ -162,6 +167,11 @@ impl Shell {
         room::test_click_watch(window, cx);
         room::test_quality(window, cx);
         dialogs::test_dialogs(window, cx);
+        testing::test_form_more(window, cx);
+        testing::test_rooms(window, cx);
+        testing::test_ui_stress(window, cx);
+        testing::on_main(window, cx);
+        shell.start_updates(cx);
         shell
     }
 
@@ -265,7 +275,154 @@ impl Shell {
         self.open_join(cx);
     }
 
-    fn leave(&mut self, cx: &mut Context<Self>) {
+    /// The rail's menu for a room: open it, copy its invite, change my name in it, remove it.
+    fn render_room_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (r, at) = self.room_menu.clone()?;
+        let is_current = self.current.as_ref().is_some_and(|c| c.same(&r)) && self.snap.connected;
+        let item = |id: &'static str, label: SharedString, danger: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(if danger { 0xff8a8f } else { color::TEXT }))
+                .hover(move |s| s.bg(rgb(if danger { 0xa1282f } else { 0x3b6fd8 })).text_color(rgb(color::BRIGHT)))
+                .child(label)
+        };
+        let (r1, r2, r3, r4) = (r.clone(), r.clone(), r.clone(), r.clone());
+        Some(
+            div()
+                .id("room-menu-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.room_menu = None;
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                    this.room_menu = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("room-menu")
+                        .absolute()
+                        .left(at.x)
+                        .top(at.y)
+                        .w(px(220.))
+                        .p_1p5()
+                        .rounded_lg()
+                        .bg(rgb(0x111214))
+                        .border_1()
+                        .border_color(rgb(color::LINE))
+                        .flex()
+                        .flex_col()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .when(!is_current, |d| {
+                            d.child(item("rm-open", t("rooms.open"), false).on_click(cx.listener(move |this, _, _, cx| {
+                                this.room_menu = None;
+                                this.open_room(r1.clone(), cx);
+                            })))
+                        })
+                        .child(item("rm-invite", t("rooms.copy_invite"), false).on_click(cx.listener(move |this, _, _, cx| {
+                            this.room_menu = None;
+                            this.copy_invite(&r2, cx);
+                        })))
+                        .child(item("rm-rename", t("rooms.rename"), false).on_click(cx.listener(move |this, _, w, cx| {
+                            this.room_menu = None;
+                            this.open_rename(r3.clone(), w, cx);
+                        })))
+                        .child(item("rm-remove", t("rooms.remove"), true).on_click(cx.listener(move |this, _, _, cx| {
+                            this.room_menu = None;
+                            this.forget_room(&r4);
+                            cx.notify();
+                        }))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Copies a room's invite (a code room: text with the link and code; an older room: its name).
+    fn copy_invite(&mut self, r: &Room, cx: &mut Context<Self>) {
+        let code = if join::is_code(&r.room) { join::fmt_code(&r.room) } else { r.room.clone() };
+        let text = if join::is_code(&r.room) { tf("invite.text", &[("title", &r.label()), ("code", &code), ("link", &join::invite_link(r))]).to_string() } else { code.clone() };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.error = Some(tf(if join::is_code(&r.room) { "room.copied" } else { "room.copied_plain" }, &[("code", &code)]).to_string());
+        self.error_since = Some(std::time::Instant::now());
+        cx.notify();
+    }
+
+    /// Takes a room off the saved list (the open one stays open).
+    fn forget_room(&mut self, r: &Room) {
+        self.rooms.retain(|x| !x.same(r));
+        let mut state = core::state_load();
+        state.insert("rooms".into(), serde_json::Value::Array(self.rooms.iter().map(Room::to_json).collect()));
+        let _ = core::state_save(&serde_json::Value::Object(state).to_string());
+    }
+
+    /// The new name for a room; in the open room it takes effect by joining again.
+    pub fn rename_room(&mut self, r: &Room, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() || name == r.name {
+            return;
+        }
+        let next = Room { name: name.to_string(), ..r.clone() };
+        for x in self.rooms.iter_mut().filter(|x| x.same(r)) {
+            *x = next.clone();
+        }
+        let mut state = core::state_load();
+        state.insert("rooms".into(), serde_json::Value::Array(self.rooms.iter().map(Room::to_json).collect()));
+        let _ = core::state_save(&serde_json::Value::Object(state).to_string());
+        if self.current.as_ref().is_some_and(|c| c.same(r)) && self.snap.connected {
+            self.current = None;
+            core::leave(&self.core);
+            self.snap = core::snapshot(&self.core);
+            self.open_room(next, cx);
+        }
+        cx.notify();
+    }
+
+    /// Looks for a newer release 1.5 s after start (and installs it unless that is off: nothing
+    /// is watched or streamed yet), then every 6 hours only to show it.
+    fn start_updates(&mut self, cx: &mut Context<Self>) {
+        if !core::updates_enabled() {
+            return;
+        }
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            let ex = cx.background_executor().clone();
+            ex.timer(Duration::from_millis(1500)).await;
+            let mut first = true;
+            loop {
+                let Ok(core) = this.update(cx, |s, _| s.core.clone()) else { return };
+                let r = ex.spawn(async move { core::check_update(&core) }).await;
+                let install = first && settings().get("autoUpdate").and_then(|v| v.as_bool()) != Some(false);
+                let newer = r.as_ref().is_ok_and(|r| r.newer);
+                let _ = this.update(cx, |s, cx| {
+                    s.update = r.ok().filter(|r| r.newer);
+                    cx.notify();
+                });
+                if newer && install {
+                    let Ok(core) = this.update(cx, |s, _| s.core.clone()) else { return };
+                    let quit = ex.spawn(async move { core::install_update(&core) }).await;
+                    match quit {
+                        Ok(true) => {
+                            let _ = cx.update(|cx| cx.quit());
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(e) => eprintln!("update: {e}"),
+                    }
+                }
+                first = false;
+                ex.timer(Duration::from_secs(6 * 3600)).await;
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn leave(&mut self, cx: &mut Context<Self>) {
         core::leave(&self.core);
         self.current = None;
         self.tick(cx);
@@ -311,12 +468,14 @@ impl Shell {
 
     fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.current.clone();
-        div().w(px(72.)).h_full().flex_none().bg(rgb(color::RAIL)).flex().flex_col().items_center().gap_2().pt_3().children(self.rooms.iter().enumerate().map(|(i, r)| {
+        // Many rooms scroll; their buttons keep their size (flex_none) instead of squeezing.
+        div().id("rail").w(px(72.)).h_full().flex_none().bg(rgb(color::RAIL)).overflow_y_scroll().flex().flex_col().items_center().gap_2().py_3().children(self.rooms.iter().enumerate().map(|(i, r)| {
             let on = current.as_ref().is_some_and(|c| c.same(r));
             let room = r.clone();
             div()
                 .id(("room", i))
                 .size_12()
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -328,11 +487,19 @@ impl Shell {
                 .hover(|s| s.bg(rgb(color::ACCENT)).rounded(px(16.)))
                 .child(r.initials())
                 .on_click(cx.listener(move |this, _, _, cx| this.open_room(room.clone(), cx)))
+                .on_mouse_down(MouseButton::Right, {
+                    let room = r.clone();
+                    cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                        this.room_menu = Some((room.clone(), e.position));
+                        cx.notify();
+                    })
+                })
         }))
         .child(
             div()
                 .id("add-room")
                 .size_12()
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -345,6 +512,26 @@ impl Shell {
                 .child(gpui_kit::component::Icon::default().path("icons/plus.svg").size_6())
                 .on_click(cx.listener(|this, _, _, cx| this.open_join(cx))),
         )
+        .when_some(self.update.clone(), |d, u| {
+            d.child(
+                div()
+                    .id("update")
+                    .size_12()
+                .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(24.))
+                    .bg(rgb(color::MAIN))
+                    .text_color(rgb(color::GREEN))
+                    .text_size(px(22.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(color::GREEN)).text_color(rgb(color::BRIGHT)).rounded(px(16.)))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tf("set.available", &[("v", &u.latest)])).build(window, cx))
+                    .child("↓")
+                    .on_click(cx.listener(|this, _, w, cx| this.open_settings(dialogs::SetTab::Updates, w, cx))),
+            )
+        })
     }
 
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -482,6 +669,7 @@ impl Render for Shell {
         self.sync_videos_hidden();
         self.sync_tiles(window, cx);
         let dialog = self.render_dialog(cx);
+        let menu = self.render_room_menu(cx);
         if self.join_shown() {
             return div().size_full().relative().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).children(dialog).into_any_element();
         }
@@ -496,6 +684,7 @@ impl Render for Shell {
             .child(self.rail(cx))
             .child(self.side(cx))
             .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() })
+            .children(menu)
             .children(dialog)
             .into_any_element()
     }
@@ -573,6 +762,7 @@ fn test_actions(cx: &mut Context<Shell>) {
 
 fn main() {
     let Some(core) = core::start(|_, _| show_main_window()) else { return };
+    testing::apply_test_prefs();
     i18n::init();
     if settings().get("tray").and_then(|v| v.as_bool()) == Some(false) {
         core.close_to_tray.store(false, Ordering::SeqCst);

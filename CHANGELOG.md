@@ -4,6 +4,8 @@ Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`
 
 ## Unreleased
 
+- **A native window instead of the webview.** Backseat draws its own window (GPUI); Microsoft Edge WebView2 is no longer needed. Rooms, settings and the language carry over from 0.1.9 (`state.json`); updating straight from 0.1.8 or older starts with an empty room list.
+- Uninstalling keeps your rooms and settings, as before.
 - The join form scrolls when it is taller than the window (a direct connection's texts in a small window) instead of being cut off at the top and bottom.
 
 ## 0.1.9

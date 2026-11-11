@@ -114,7 +114,6 @@ Backseat — приложение для Windows, чтобы смотреть, �
   NVIDIA, AMD и Intel за последние несколько лет).
 - Чтобы **смотреть**: любой не слишком старый ПК. Если видеокарта не умеет декодировать
   AV1, это делает процессор.
-- Microsoft Edge WebView2, который есть в Windows 11. Если его нет, установщик доставит.
 
 ## Советы
 
@@ -175,13 +174,12 @@ GStreamer 1.28.8 (официальный установщик MSVC x86_64 с
 ```powershell
 $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = 'C:\path\to\gstreamer\1.0\msvc_x86_64\'
 .\tools\bundle.ps1                     # dist\backseat: приложение с нужными DLL
-.\tools\installer.ps1 -WebView2 .\MicrosoftEdgeWebview2Setup.exe
-                                       # dist\backseat-setup-X.Y.Z.exe
+.\tools\installer.ps1                  # dist\backseat-setup-X.Y.Z.exe
 ```
 
 `bundle.ps1` копирует библиотеки и плагины GStreamer, которые использует приложение,
 среду Visual C++ и тексты лицензий, и останавливается, если какой-то импорт DLL не найден.
-Загрузчик WebView2: <https://go.microsoft.com/fwlink/p/?LinkId=2124703>. Сборку можно
+Сборку можно
 сделать со встроенным сервером, без поля сервера в приложении: передай
 `-Server wss://HOST/ws` в `tools\installer.ps1`.
 

@@ -74,23 +74,13 @@ jobs:
             if ($LASTEXITCODE) { throw 'choco install nsis failed' }
           }
 
-      - name: Download the WebView2 bootstrapper
-        run: |
-          New-Item -ItemType Directory C:\wv2 -Force | Out-Null
-          curl.exe -fsSL --retry 3 -o C:\wv2\MicrosoftEdgeWebview2Setup.exe 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
-          if ($LASTEXITCODE) { throw 'WebView2 bootstrapper download failed' }
-          $sig = Get-AuthenticodeSignature C:\wv2\MicrosoftEdgeWebview2Setup.exe
-          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
-            throw "WebView2 bootstrapper signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
-          }
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the installer
         run: |
           # No fixed signaling server: users type theirs in the app.
           Remove-Item Env:STREAMER_SERVER_URL -ErrorAction SilentlyContinue
-          ./tools/installer.ps1 -WebView2 C:\wv2\MicrosoftEdgeWebview2Setup.exe
+          ./tools/installer.ps1
           $name = "backseat-setup-${{ steps.version.outputs.version }}.exe"
           if (-not (Test-Path "dist\$name")) { throw "dist\$name was not built" }
           $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()

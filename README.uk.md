@@ -115,7 +115,6 @@ Backseat — застосунок для Windows, щоб дивитися, як 
   та Intel за останні кілька років).
 - Щоб **дивитися**: будь-який не надто старий ПК. Якщо відеокарта не вміє декодувати AV1,
   це робить процесор.
-- Microsoft Edge WebView2, який є у Windows 11. Якщо його немає, інсталятор доставить.
 
 ## Поради
 
@@ -175,13 +174,12 @@ GStreamer 1.28.8 (офіційний інсталятор MSVC x86_64 з
 ```powershell
 $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = 'C:\path\to\gstreamer\1.0\msvc_x86_64\'
 .\tools\bundle.ps1                     # dist\backseat: застосунок із потрібними DLL
-.\tools\installer.ps1 -WebView2 .\MicrosoftEdgeWebview2Setup.exe
-                                       # dist\backseat-setup-X.Y.Z.exe
+.\tools\installer.ps1                  # dist\backseat-setup-X.Y.Z.exe
 ```
 
 `bundle.ps1` копіює бібліотеки й плагіни GStreamer, які використовує застосунок,
 середовище Visual C++ і тексти ліцензій, і зупиняється, якщо якийсь імпорт DLL не
-знайдено. Завантажувач WebView2: <https://go.microsoft.com/fwlink/p/?LinkId=2124703>.
+знайдено.
 Збірку можна зробити з вбудованим сервером, без поля сервера в застосунку: передай
 `-Server wss://HOST/ws` до `tools\installer.ps1`.
 
