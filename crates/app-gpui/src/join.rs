@@ -7,6 +7,7 @@ use backseat_core as core;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -67,6 +68,8 @@ pub struct Join {
     pub copied: Option<&'static str>,
     /// An invite code to put in the code field at the next draw (it needs the window).
     pub pending_code: Option<String>,
+    /// The page's scroll, so a tall form (the direct texts) scrolls inside the window.
+    pub scroll: ScrollHandle,
 }
 
 // Rooms made here are named by a random invite code (Crockford base32, 12 symbols, about
@@ -183,6 +186,7 @@ impl Join {
             direct_open: false,
             copied: None,
             pending_code: None,
+            scroll: ScrollHandle::new(),
         }
     }
 }
@@ -410,7 +414,7 @@ impl Shell {
         let label = |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(text);
         let server_row = core::built_in().is_none() && mode != Mode::Direct;
         // Like the webview: the darkest page, the form a card on it, fields darker than the card.
-        div().id("join-page").size_full().bg(rgb(color::RAIL)).overflow_y_scroll().flex().flex_col().items_center().child(
+        div().id("join-page").size_full().bg(rgb(color::RAIL)).overflow_y_scroll().track_scroll(&self.join.scroll).vertical_scrollbar(&self.join.scroll).flex().flex_col().items_center().child(
             div()
                 .my_auto()
                 .py_8()
@@ -693,7 +697,11 @@ pub fn test_direct(window: &mut Window, cx: &mut Context<Shell>) {
 pub fn test_form(window: &mut Window, cx: &mut Context<Shell>) {
     let Ok(spec) = std::env::var("STREAMER_APP_TEST_FORM") else { return };
     let p: Vec<String> = spec.split('|').map(String::from).collect();
-    if p.len() < 3 || (p[0] != "create" && p[0] != "code") {
+    if p.len() < 3 || !["create", "code", "filled"].contains(&p[0].as_str()) {
+        return;
+    }
+    if p[0] == "filled" {
+        test_filled(window, cx, p[1].parse().unwrap_or(720), p[2].clone());
         return;
     }
     cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| {
@@ -729,6 +737,46 @@ pub fn test_form(window: &mut Window, cx: &mut Context<Shell>) {
             executor.timer(Duration::from_millis(300)).await;
         }
         eprintln!("test: form failed: nothing within 20 s");
+    })
+    .detach();
+}
+
+/// Tests only (STREAMER_APP_TEST_FORM="filled|LEN|Name"): the direct form at its tallest, the
+/// inviting side after "Make the invite" with a short code, made-up texts of LEN characters
+/// (no addresses) in both boxes. Reports how far the page scrolls and the window's height.
+fn test_filled(window: &mut Window, cx: &mut Context<Shell>, len: usize, name: String) {
+    let text: String = "BACKSEAT1.".chars().chain((0..len.saturating_sub(10)).map(|i| (b'A' + (i * 7 % 26) as u8) as char)).collect();
+    cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| {
+        let executor = cx.background_executor().clone();
+        executor.timer(Duration::from_millis(1500)).await;
+        let _ = this.update_in(cx, |s, window, cx| {
+            s.join.open = true;
+            s.join.mode = Mode::Direct;
+            s.join.role = Role::Invite;
+            s.join.name.update(cx, |i, cx| i.set_value(name.clone(), window, cx));
+            s.join.outgoing.update(cx, |o, cx| o.set_value(text.clone(), window, cx));
+            s.join.incoming.update(cx, |o, cx| o.set_value(text.clone(), window, cx));
+            s.join.step.invite = Some(text.clone());
+            s.join.step.invite_code = Some(Code::Valid { code: "K7Q29XMB".into(), until: Instant::now() + Duration::from_secs(300) });
+            s.join.error = Some("Could not get the text behind the code (timeout). Ask for the full text.".into());
+            cx.notify();
+        });
+        // Where the page is scrolled to, each time it changes, for 10 s (a test turns the wheel).
+        let mut last = String::new();
+        for _ in 0..40 {
+            executor.timer(Duration::from_millis(250)).await;
+            let line = this
+                .update_in(cx, |s, window, _| {
+                    let max = s.join.scroll.max_offset();
+                    let b = s.join.scroll.bounds();
+                    format!("join page scroll max {:.0} at {:.0} view {:.0} window {:.0}", f32::from(max.y), -f32::from(s.join.scroll.offset().y), f32::from(b.size.height), f32::from(window.viewport_size().height))
+                })
+                .unwrap_or_default();
+            if line != last {
+                eprintln!("test: {line}");
+                last = line;
+            }
+        }
     })
     .detach();
 }

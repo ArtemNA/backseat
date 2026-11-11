@@ -486,6 +486,8 @@ fn main() {
             t.secondary_hover = rgb(0x5c5e66).into();
             t.secondary_foreground = rgb(0xffffff).into();
             t.ring = rgb(0x3b6fd8).into();
+            // Scrollbars stay visible, like the webview's, so a tall page shows it scrolls.
+            t.scrollbar_mode = gpui_kit::component::scroll::ScrollbarMode::Always;
             // Buttons read their colours from the theme's tokens.
             let h = |c: u32| -> Hsla { rgb(c).into() };
             t.tokens.button_primary = h(0x3b6fd8).into();
