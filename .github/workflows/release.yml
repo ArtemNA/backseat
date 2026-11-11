@@ -53,7 +53,14 @@ jobs:
           if (-not (Test-Path $exe)) {
             New-Item -ItemType Directory C:\gst-download -Force | Out-Null
             $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
-            curl.exe -fsSL --retry 3 -o $exe $url
+            # The server sometimes drops this 540 MB download midway ("end of response with
+            # N bytes missing"): try again, going on from where it stopped.
+            for ($try = 1; $try -le 8; $try++) {
+              curl.exe -fsSL --retry 3 --retry-all-errors -C - -o $exe $url
+              if (-not $LASTEXITCODE) { break }
+              "download attempt $try stopped (curl $LASTEXITCODE) at $((Get-Item $exe -ErrorAction SilentlyContinue).Length) bytes"
+              Start-Sleep -Seconds 5
+            }
             if ($LASTEXITCODE) { throw "download failed: $url" }
           }
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
