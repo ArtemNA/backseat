@@ -2,6 +2,7 @@
 //! its tile), others live with a Watch button, and our own stream's panel. Same rules as the
 //! webview UI (app.js: renderContent, tile, chip, syncVideos, renderLive).
 
+use crate::i18n::{num, t, tf, tu};
 use crate::{color, settings, Shell};
 use backseat_core::{self as core, sampler::{LiveStats, WatchStats}, PeerView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -44,15 +45,14 @@ pub struct Room {
 }
 
 fn mbit(kbit: u32) -> String {
-    let v = kbit as f64 / 1000.0;
-    if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v}") }
+    num(kbit as f64 / 1000.0)
 }
 
 fn ms(v: f64) -> String {
     if v >= 1.0 {
-        format!("{} ms", v.round())
+        format!("{} {}", v.round(), t("unit.ms"))
     } else if v > 0.0 {
-        "<1 ms".into()
+        format!("<1 {}", t("unit.ms"))
     } else {
         "—".into()
     }
@@ -61,9 +61,9 @@ fn ms(v: f64) -> String {
 /// "720p30 2000" -> "720p30 · 2 Mbit/s"
 fn request_label(q: &Option<String>) -> String {
     match q.as_deref().map(|q| q.split_once(' ').unwrap_or((q, ""))) {
-        None => "As streamed".into(),
+        None => t("card.source_quality").to_string(),
         Some((m, "")) => m.into(),
-        Some((m, k)) => format!("{m} · {} Mbit/s", mbit(k.parse().unwrap_or(0))),
+        Some((m, k)) => format!("{m} · {} {}", mbit(k.parse().unwrap_or(0)), t("unit.mbit")),
     }
 }
 
@@ -97,8 +97,8 @@ fn clock(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
-pub fn live_for(secs: u64) -> String {
-    format!("live {}", clock(secs))
+pub fn live_for(secs: u64) -> SharedString {
+    tf("room.live_for", &[("t", &clock(secs))])
 }
 
 fn small_text(t: impl Into<SharedString>) -> Div {
@@ -119,7 +119,7 @@ impl Shell {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 if let Err(e) = result {
-                    s.error = Some(format!("Error: {e}"));
+                    s.error = Some(tf("notice.error", &[("msg", &e)]).to_string());
                 }
                 s.tick(cx);
             });
@@ -170,8 +170,8 @@ impl Shell {
                 Some((m, k)) => (VIEW_MODES.iter().position(|x| *x == m).map_or(0, |i| i + 1), PRESETS.iter().position(|x| x.to_string() == k).map_or(0, |i| i + 1)),
             };
             if !self.room.tiles.contains_key(&w.streamer) {
-                let modes: Vec<SharedString> = std::iter::once("As streamed".into()).chain(VIEW_MODES.iter().map(|m| SharedString::from(*m))).collect();
-                let kbits: Vec<SharedString> = std::iter::once("—".into()).chain(PRESETS.iter().map(|k| SharedString::from(format!("{} Mbit/s", mbit(*k))))).collect();
+                let modes: Vec<SharedString> = std::iter::once(t("card.source_quality")).chain(VIEW_MODES.iter().map(|m| SharedString::from(*m))).collect();
+                let kbits: Vec<SharedString> = std::iter::once("—".into()).chain(PRESETS.iter().map(|k| SharedString::from(format!("{} {}", mbit(*k), t("unit.mbit"))))).collect();
                 let mode = cx.new(|cx| SelectState::new(modes, Some(IndexPath::new(m)), window, cx));
                 let kbit = cx.new(|cx| SelectState::new(kbits, Some(IndexPath::new(k)), window, cx));
                 self.room.tiles.insert(w.streamer, Tile { mode, kbit, shown: (m, k), touched: false });
@@ -211,7 +211,7 @@ impl Shell {
         let stage = if watched.is_empty() { None } else { Some(self.stage(&watched, cx)) };
         let hint = self.snap.watches.iter().find(|w| w.received_fps > 20.0 && w.shown_fps < w.received_fps * 0.8).map(|w| {
             let name = self.snap.peers.iter().find(|p| p.id == w.streamer).map(|p| p.name.clone()).unwrap_or("?".into());
-            format!("The “{name}” window shows {:.0} fps of {:.0}: the NVIDIA driver limits windows in the background (Background Application Max Frame Rate).", w.shown_fps, w.received_fps)
+            tf("hint.background", &[("name", &name), ("shown", &w.shown_fps.round()), ("rx", &w.received_fps.round())]).to_string()
         });
         let notice = self.error.clone();
         let has_stage = stage.is_some();
@@ -226,15 +226,15 @@ impl Shell {
             .gap_4()
             .when_some(notice, |d, n| d.child(div().p_3().rounded_md().bg(rgb(0x3b2326)).text_color(rgb(0xffb4b4)).child(n)))
             .when_some(hint, |d, h| d.child(div().p_3().rounded_md().bg(rgb(0x3a3220)).text_color(rgb(0xf0d48a)).child(h)))
-            .when(has_stage, |d| d.child(small_text("Double click or F11 — fullscreen, Esc — back, F3 — stats.")))
+            .when(has_stage, |d| d.child(small_text(t("tile.keys"))))
             .when(!others.is_empty(), |d| {
-                d.child(div().flex().flex_col().gap_2().child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child("ALSO LIVE")).child(div().flex().flex_wrap().gap_2p5().children(others.iter().map(|p| {
+                d.child(div().flex().flex_col().gap_2().child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(tu("room.also_live"))).child(div().flex().flex_wrap().gap_2p5().children(others.iter().map(|p| {
                     let id = p.id;
-                    card().flex().items_center().gap_2p5().pl_2().pr_2p5().py_2().child(crate::avatar(&p.name)).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone())).child(Button::new(SharedString::from(format!("watch-{id}"))).primary().small().label("Watch").on_click(cx.listener(move |s, _, _, cx| s.watch_stream(id, cx))))
+                    card().flex().items_center().gap_2p5().pl_2().pr_2p5().py_2().child(crate::avatar(&p.name)).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone())).child(Button::new(SharedString::from(format!("watch-{id}"))).primary().small().label(t("card.watch")).on_click(cx.listener(move |s, _, _, cx| s.watch_stream(id, cx))))
                 }))))
             })
             .when_some(live.clone(), |d, l| d.child(self.live_panel(&l)))
-            .when(watched.is_empty() && others.is_empty() && live.is_none(), |d| d.child(div().py_10().flex().justify_center().text_color(rgb(color::MUTED)).child("Nobody is streaming yet.")))
+            .when(watched.is_empty() && others.is_empty() && live.is_none(), |d| d.child(div().py_10().flex().justify_center().text_color(rgb(color::MUTED)).child(t("room.none"))))
             // The spoiled variant for the watch gate's scroll check.
             .when(std::env::var_os("STREAMER_DEBUG_TALL_BELOW").is_some(), |d| d.child(div().flex_none().h(px(600.))));
         let below = div()
@@ -263,14 +263,14 @@ impl Shell {
         match live {
             Some(l) => row
                 .child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE"))
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("Your stream"))
-                .child(div().flex_1().text_xs().text_color(rgb(color::MUTED)).child(format!("{} Mbit/s · {}", short_quality(&l.ceiling), l.encoder)))
-                .child(Button::new("change-live").small().label("Change").on_click(cx.listener(|s, _, w, cx| s.open_golive(true, w, cx))))
-                .child(Button::new("end-live").danger().small().label("End stream").on_click(cx.listener(|s, _, _, cx| {
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t("live.title")))
+                .child(div().flex_1().text_xs().text_color(rgb(color::MUTED)).child(format!("{} {} · {}", short_quality(&l.ceiling), t("unit.mbit"), l.encoder)))
+                .child(Button::new("change-live").small().label(t("live.change")).on_click(cx.listener(|s, _, w, cx| s.open_golive(true, w, cx))))
+                .child(Button::new("end-live").danger().small().label(t("live.end")).on_click(cx.listener(|s, _, _, cx| {
                     core::end_live(&s.core);
                     s.tick(cx);
                 }))),
-            None => row.child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("Streams")),
+            None => row.child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t("room.streams"))),
         }
     }
 
@@ -340,7 +340,7 @@ impl Shell {
                     .justify_center()
                     .text_color(rgb(color::MUTED))
                     .child(video)
-                    .when(!embedded, |d| d.child(format!("{} is in its own window", p.name))),
+                    .when(!embedded, |d| d.child(tf("tile.popped", &[("name", &p.name)]))),
             )
             .child(
                 div()
@@ -352,16 +352,16 @@ impl Shell {
                     .py_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone()))
                     .child(div().flex_1().text_xs().whitespace_nowrap().text_color(rgb(if throttled { 0xf0b232 } else { color::MUTED })).child(stat))
-                    .when_some(tile, |d, t| d.child(div().w(px(124.)).child(Select::new(&t.mode).small())).child(div().w(px(110.)).child(Select::new(&t.kbit).small())))
-                    .child(Button::new(SharedString::from(format!("apply-{id}"))).small().label("Apply").on_click(cx.listener(move |s, _, _, cx| s.apply_quality(id, cx))))
-                    .child(Button::new(SharedString::from(format!("mute-{id}"))).small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(if w.muted { "Unmute" } else { "Mute" }).on_click(cx.listener(move |s, _, _, cx| {
+                    .when_some(tile, |d, t| d.child(div().w(px(150.)).child(Select::new(&t.mode).small())).child(div().w(px(110.)).child(Select::new(&t.kbit).small())))
+                    .child(Button::new(SharedString::from(format!("apply-{id}"))).small().label(t("card.apply")).on_click(cx.listener(move |s, _, _, cx| s.apply_quality(id, cx))))
+                    .child(Button::new(SharedString::from(format!("mute-{id}"))).small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(t(if w.muted { "tile.unmute" } else { "tile.mute" })).on_click(cx.listener(move |s, _, _, cx| {
                         let _ = core::set_muted(&s.core, id, !w.muted);
                         s.tick(cx);
                     })))
-                    .child(Button::new(SharedString::from(format!("stats-{id}"))).small().label("Stats").when(w.overlay, |b| b.primary()).on_click(act(if w.overlay { "no_overlay" } else { "overlay" })))
-                    .child(Button::new(SharedString::from(format!("pop-{id}"))).small().icon(Icon::default().path(if w.embedded { "icons/square-arrow-out-up-right.svg" } else { "icons/picture-in-picture.svg" })).tooltip(if w.embedded { "Pop out" } else { "Back into the app" }).on_click(act(if w.embedded { "pop_out" } else { "pop_in" })))
-                    .child(Button::new(SharedString::from(format!("fs-{id}"))).small().icon(Icon::default().path("icons/maximize.svg")).tooltip("Fullscreen").on_click(act("toggle_fullscreen")))
-                    .child(Button::new(SharedString::from(format!("stop-{id}"))).danger().small().label("Stop").on_click(cx.listener(move |s, _, _, cx| s.stop_watch(id, cx)))),
+                    .child(Button::new(SharedString::from(format!("stats-{id}"))).small().label(t("tile.stats")).when(w.overlay, |b| b.primary()).on_click(act(if w.overlay { "no_overlay" } else { "overlay" })))
+                    .child(Button::new(SharedString::from(format!("pop-{id}"))).small().icon(Icon::default().path(if w.embedded { "icons/square-arrow-out-up-right.svg" } else { "icons/picture-in-picture.svg" })).tooltip(t(if w.embedded { "tile.popout" } else { "tile.popin" })).on_click(act(if w.embedded { "pop_out" } else { "pop_in" })))
+                    .child(Button::new(SharedString::from(format!("fs-{id}"))).small().icon(Icon::default().path("icons/maximize.svg")).tooltip(t("tile.fullscreen")).on_click(act("toggle_fullscreen")))
+                    .child(Button::new(SharedString::from(format!("stop-{id}"))).danger().small().label(t("card.stop")).on_click(cx.listener(move |s, _, _, cx| s.stop_watch(id, cx)))),
             )
     }
 
@@ -371,7 +371,7 @@ impl Shell {
         let limit = settings_upload_limit();
         let cap = if limit > 0.0 { limit } else { (l.ceiling_mbit * l.viewers.len().max(1) as f64).max(1.0) };
         let wont_fit = limit > 0.0 && l.upload_mbit + l.ceiling_mbit > limit;
-        let tile = |label: &'static str, num: String| card().flex_1().p(px(14.)).flex().flex_col().gap_1p5().child(small_text(label)).child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(num));
+        let tile = |label: SharedString, num: String| card().flex_1().p(px(14.)).flex().flex_col().gap_1p5().child(small_text(label)).child(div().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(num));
         let row = |cells: [AnyElement; 4], head: bool| {
             let grid = div().flex().items_center().gap_3().px_4().py(px(if head { 10. } else { 12. })).border_b_1().border_color(rgb(0x34363c));
             let mut i = 0;
@@ -381,7 +381,7 @@ impl Shell {
                 div().flex_grow(w).flex_shrink(w).flex_basis(px(0.)).min_w_0().child(c)
             }))
         };
-        let up = if limit > 0.0 { format!("{:.1} of {:.1} Mbit/s", l.upload_mbit, limit) } else { format!("{:.1} Mbit/s", l.upload_mbit) };
+        let up = if limit > 0.0 { tf("up.of", &[("used", &num(l.upload_mbit)), ("limit", &num(limit))]).to_string() } else { format!("{} {}", num(l.upload_mbit), t("unit.mbit")) };
         div()
             .flex()
             .flex_col()
@@ -390,34 +390,34 @@ impl Shell {
                 div()
                     .flex()
                     .gap_3()
-                    .child(tile("Viewers", l.viewers.len().to_string()))
-                    .child(tile("Encoding", format!("{fps} fps")).child(small_text(format!("{} layers: {}", active.len(), if active.is_empty() { "—".into() } else { active.iter().map(|x| short_quality(&x.quality)).collect::<Vec<_>>().join(", ") }))))
-                    .child(tile("Upload", up).child(div().h_2().rounded(px(4.)).bg(rgb(color::RAIL)).child(div().h_2().rounded(px(4.)).w(relative((l.upload_mbit / cap).min(1.0) as f32)).bg(rgb(if wont_fit { 0xf0b232 } else { 0x2f9e6e }))))),
+                    .child(tile(t("live.viewers"), l.viewers.len().to_string()))
+                    .child(tile(t("live.encoding"), format!("{fps} fps")).child(small_text(tf("live.layers", &[("n", &active.len()), ("list", &if active.is_empty() { "—".to_string() } else { active.iter().map(|x| short_quality(&x.quality)).collect::<Vec<_>>().join(", ") })]))))
+                    .child(tile(t("live.upload"), up).child(div().h_2().rounded(px(4.)).bg(rgb(color::RAIL)).child(div().h_2().rounded(px(4.)).w(relative((l.upload_mbit / cap).min(1.0) as f32)).bg(rgb(if wont_fit { 0xf0b232 } else { 0x2f9e6e }))))),
             )
-            .when(wont_fit, |d| d.child(div().p_3().rounded_md().bg(rgb(0x3a3220)).text_color(rgb(0xf0d48a)).child(format!("One more viewer at full quality would need {:.1} + {:.1} Mbit/s, more than your {:.1}.", l.upload_mbit, l.ceiling_mbit, limit))))
+            .when(wont_fit, |d| d.child(div().p_3().rounded_md().bg(rgb(0x3a3220)).text_color(rgb(0xf0d48a)).child(tf("up.next_wont_fit", &[("used", &num(l.upload_mbit)), ("add", &num(l.ceiling_mbit)), ("limit", &num(limit))]))))
             .child(if l.viewers.is_empty() {
-                div().py_6().flex().justify_center().text_color(rgb(color::MUTED)).child("Nobody is watching yet. The encoder starts with the first viewer.").into_any_element()
+                div().py_6().flex().justify_center().text_color(rgb(color::MUTED)).child(t("live.no_viewers")).into_any_element()
             } else {
                 card()
                     .overflow_hidden()
-                    .child(row([small_text("VIEWER").into_any_element(), small_text("QUALITY").into_any_element(), small_text("RTT").into_any_element(), small_text("STATE").into_any_element()], true))
+                    .child(row([small_text(t("live.th_viewer")).into_any_element(), small_text(t("live.th_quality")).into_any_element(), small_text(t("live.th_rtt")).into_any_element(), small_text(t("live.th_state")).into_any_element()], true))
                     .children(l.viewers.iter().map(|v| {
                         let q = v.problems.iter().find(|p| p.starts_with("queue:"));
                         let loss = v.problems.iter().find(|p| p.starts_with("loss:"));
                         let dot = |c: u32| div().size_2().rounded_full().bg(rgb(c));
                         let state = if let Some(q) = q {
                             let secs = q[6..].parse::<f64>().unwrap_or(0.0) / 1000.0;
-                            div().flex().flex_col().child(div().flex().items_center().gap_1p5().text_color(rgb(0xf0b232)).child(dot(0xf0b232)).child(format!("Slow link: queue +{secs:.1} s"))).child(small_text("Catching up by skipping frames. A lower quality would help."))
+                            div().flex().flex_col().child(div().flex().items_center().gap_1p5().text_color(rgb(0xf0b232)).child(dot(0xf0b232)).child(tf("live.queue", &[("s", &num(secs))]))).child(small_text(t("live.queue_note")))
                         } else if let Some(l) = loss {
-                            div().flex().items_center().gap_1p5().text_color(rgb(0xf0b232)).child(dot(0xf0b232)).child(format!("Losing {}% of packets", &l[5..]))
+                            div().flex().items_center().gap_1p5().text_color(rgb(0xf0b232)).child(dot(0xf0b232)).child(tf("live.loss", &[("pct", &&l[5..])]))
                         } else {
-                            div().flex().items_center().gap_1p5().text_color(rgb(0x3fbf7f)).child(dot(0x3fbf7f)).child("Good")
+                            div().flex().items_center().gap_1p5().text_color(rgb(0x3fbf7f)).child(dot(0x3fbf7f)).child(t("live.ok"))
                         };
                         row([div().flex().items_center().gap_2p5().child(crate::avatar(&v.name)).child(v.name.clone()).into_any_element(), div().child(short_quality(&v.quality)).into_any_element(), div().child(ms(v.rtt_ms)).into_any_element(), state.into_any_element()], false)
                     }))
                     .into_any_element()
             })
-            .child(small_text("One viewer’s problems never reach the others: each gets its own stream and only they catch up."))
+            .child(small_text(t("live.isolation")))
     }
 
     /// Tests only (STREAMER_APP_TEST_GPUI): the room's layout and our stream, when they change.

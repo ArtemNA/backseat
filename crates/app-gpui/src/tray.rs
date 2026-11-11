@@ -8,12 +8,29 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEv
 
 const ICON: &[u8] = include_bytes!("../../app/icons/icon.png");
 
+thread_local! {
+    /// The menu's items, to put them in the UI language when it changes (UI thread only).
+    static ITEMS: std::cell::RefCell<Option<(MenuItem, MenuItem)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The menu in the current UI language.
+pub fn relabel() {
+    let (s, q) = core::tray_text();
+    ITEMS.with(|i| {
+        if let Some((show, quit)) = i.borrow().as_ref() {
+            show.set_text(s);
+            quit.set_text(q);
+        }
+    });
+}
+
 pub fn start(core: Arc<Core>) -> Result<(), String> {
     let (show_text, quit_text) = core::tray_text();
     let menu = Menu::new();
     let show = MenuItem::with_id("show", show_text, true, None);
     let quit = MenuItem::with_id("quit", quit_text, true, None);
     menu.append_items(&[&show, &quit]).map_err(|e| e.to_string())?;
+    ITEMS.with(|i| *i.borrow_mut() = Some((show.clone(), quit.clone())));
     let picture = image::load_from_memory(ICON).map_err(|e| e.to_string())?.resize(32, 32, image::imageops::FilterType::Lanczos3).into_rgba8();
     let (w, h) = picture.dimensions();
     let icon = Icon::from_rgba(picture.into_raw(), w, h).map_err(|e| e.to_string())?;

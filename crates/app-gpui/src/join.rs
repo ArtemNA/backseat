@@ -2,6 +2,7 @@
 //! where two people swap two texts (or short codes for them) through any messenger.
 //! Same rules as the webview UI's form (app.js, renderJoinForm and renderDirectSteps).
 
+use crate::i18n::{t, tf, tu};
 use crate::{color, settings, set_setting, Room, Shell};
 use backseat_core as core;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -89,6 +90,14 @@ pub fn is_code(room: &str) -> bool {
     room.len() == 12 && room.bytes().all(|c| CODE_ABC.contains(&c))
 }
 
+/// The https page for a room's invite, on the room's own server (ws -> http, wss -> https).
+pub fn invite_link(r: &Room) -> String {
+    let rest = r.server.strip_prefix("ws").unwrap_or(&r.server);
+    let host = rest.split("://").nth(1).unwrap_or_default().split('/').next().unwrap_or_default();
+    let proto = rest.split("://").next().unwrap_or_default();
+    format!("http{proto}://{host}/j/{}", fmt_code(&r.room))
+}
+
 pub fn fmt_code(c: &str) -> String {
     c.as_bytes().chunks(4).map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join("-")
 }
@@ -154,9 +163,9 @@ fn pasted_text(value: &str) -> Result<String, String> {
         return Ok(v.to_string());
     }
     if !short_codes_on() {
-        return Err("This looks like a short code, but short codes are off. Turn them on or ask for the full text.".into());
+        return Err(t("direct.codes_off").to_string());
     }
-    core::shortcode_get(v).map_err(|e| if e == "not_found" { "This code is unknown or has expired (5 minutes). Ask for a new one or for the full text.".into() } else { format!("Could not get the text behind the code ({e}). Ask for the full text.") })
+    core::shortcode_get(v).map_err(|e| if e == "not_found" { t("direct.code_not_found").to_string() } else { tf("direct.code_failed", &[("e", &e)]).to_string() })
 }
 
 impl Join {
@@ -175,8 +184,8 @@ impl Join {
             mode: Mode::Create,
             role: Role::Invite,
             server: cx.new(|cx| InputState::new(window, cx).default_value(server)),
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("Your name").default_value(name)),
-            title: cx.new(|cx| InputState::new(window, cx).placeholder("Room name")),
+            name: cx.new(|cx| InputState::new(window, cx).placeholder(t("connect.name")).default_value(name)),
+            title: cx.new(|cx| InputState::new(window, cx).placeholder(t("join.room_title"))),
             code: cx.new(|cx| InputState::new(window, cx).placeholder("K7Q2-9XMB-4TQ1")),
             incoming: cx.new(|cx| TextareaState::new(window, cx).rows(4)),
             outgoing: cx.new(|cx| TextareaState::new(window, cx).rows(4)),
@@ -236,7 +245,7 @@ impl Shell {
             Mode::Create => {
                 let title = self.field(&self.join.title.clone(), cx);
                 if title.is_empty() {
-                    self.join.error = Some("Give the room a name.".into());
+                    self.join.error = Some(t("join.need_title").to_string());
                     cx.notify();
                     return;
                 }
@@ -245,14 +254,14 @@ impl Shell {
             Mode::Code => match parse_code(&self.field(&self.join.code.clone(), cx)) {
                 Some(code) => Room { server, room: code, name, title: None },
                 None => {
-                    self.join.error = Some("This does not look like an invite code (12 letters and digits).".into());
+                    self.join.error = Some(t("join.bad_code").to_string());
                     cx.notify();
                     return;
                 }
             },
         };
         if room.name.is_empty() {
-            self.join.error = Some("Enter your name first.".into());
+            self.join.error = Some(t("direct.need_name").to_string());
             cx.notify();
             return;
         }
@@ -292,7 +301,7 @@ impl Shell {
     pub fn make_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.field(&self.join.name.clone(), cx);
         if name.is_empty() {
-            self.join.error = Some("Enter your name first.".into());
+            self.join.error = Some(t("direct.need_name").to_string());
             cx.notify();
             return;
         }
@@ -353,7 +362,7 @@ impl Shell {
     pub fn make_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.field(&self.join.name.clone(), cx);
         if name.is_empty() {
-            self.join.error = Some("Enter your name first.".into());
+            self.join.error = Some(t("direct.need_name").to_string());
             cx.notify();
             return;
         }
@@ -411,7 +420,7 @@ impl Shell {
         let j = &self.join;
         let mode = j.mode;
         let back = self.snap.connected || !self.rooms.is_empty();
-        let label = |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(text);
+        let label = |text: SharedString| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(text);
         let server_row = core::built_in().is_none() && mode != Mode::Direct;
         // Like the webview: the darkest page, the form a card on it, fields darker than the card.
         div().id("join-page").size_full().bg(rgb(color::RAIL)).overflow_y_scroll().track_scroll(&self.join.scroll).child(div().min_h_full().flex().flex_col().items_center().child(
@@ -428,18 +437,18 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(14.))
-                .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("Join a room"))
-                .when(server_row, |d| d.child(label("SERVER")).child(sunk(Input::new(&j.server))))
-                .child(label("YOUR NAME"))
+                .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t("connect.title")))
+                .when(server_row, |d| d.child(label(tu("connect.server"))).child(sunk(Input::new(&j.server))))
+                .child(label(tu("connect.name")))
                 .child(sunk(Input::new(&j.name)))
                 .child(
                     seg_bar()
-                        .child(seg("m-create", "Create a room", mode == Mode::Create).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Create, cx))))
-                        .child(seg("m-code", "I have an invite", mode == Mode::Code).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Code, cx))))
-                        .child(seg("m-direct", "Direct", mode == Mode::Direct).child(crate::beta()).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Direct, cx)))),
+                        .child(seg("m-create", t("join.create_mode"), mode == Mode::Create).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Create, cx))))
+                        .child(seg("m-code", t("join.code_mode"), mode == Mode::Code).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Code, cx))))
+                        .child(seg("m-direct", t("join.direct"), mode == Mode::Direct).child(crate::beta()).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Direct, cx)))),
                 )
-                .when(mode == Mode::Create, |d| d.child(label("ROOM NAME")).child(sunk(Input::new(&j.title))))
-                .when(mode == Mode::Code, |d| d.child(label("INVITE CODE OR LINK")).child(sunk(Input::new(&j.code))))
+                .when(mode == Mode::Create, |d| d.child(label(tu("join.room_title"))).child(sunk(Input::new(&j.title))))
+                .when(mode == Mode::Code, |d| d.child(label(tu("join.code"))).child(sunk(Input::new(&j.code))))
                 .when(mode == Mode::Direct, |d| d.child(self.render_direct(cx)))
                 .when_some(j.error.clone(), |d, e| d.child(div().p_2().rounded_md().bg(rgb(0x3b2326)).text_color(rgb(0xffb4b4)).child(e)))
                 .when(mode != Mode::Direct, |d| {
@@ -447,17 +456,17 @@ impl Shell {
                         Button::new("join-submit")
                             .primary()
                             .disabled(self.join.busy)
-                            .label(if self.join.busy { "Connecting…" } else if mode == Mode::Create { "Create" } else { "Join" })
+                            .label(t(if self.join.busy { "direct.connecting" } else if mode == Mode::Create { "join.create" } else { "join.enter" }))
                             .on_click(cx.listener(|s, _, _, cx| s.submit(cx))),
                     )
                 })
                 .when(back, |d| {
-                    d.child(Button::new("join-back").label("Back").on_click(cx.listener(|s, _, _, cx| {
+                    d.child(Button::new("join-back").label(t("join.back")).on_click(cx.listener(|s, _, _, cx| {
                         s.join.open = false;
                         cx.notify();
                     })))
                 })
-                .child(Button::new("join-settings").ghost().label("Settings").on_click(cx.listener(|s, _, w, cx| s.open_settings(crate::dialogs::SetTab::General, w, cx)))),
+                .child(Button::new("join-settings").ghost().label(t("set.open")).on_click(cx.listener(|s, _, w, cx| s.open_settings(crate::dialogs::SetTab::General, w, cx)))),
                 ),
         ))
         .vertical_scrollbar(&self.join.scroll)
@@ -467,14 +476,14 @@ impl Shell {
         let j = &self.join;
         let st = &j.step;
         let making = st.making;
-        let bold = |t: &'static str| div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t);
-        let small = |t: String| div().text_xs().text_color(rgb(color::MUTED)).child(t);
-        let short = Checkbox::new("direct-short").label("Make a short code (keeps the text on our server for 5 minutes)").checked(short_codes_on()).on_click(cx.listener(|_, v: &bool, _, cx| {
+        let bold = |text: SharedString| div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(text);
+        let small = |text: SharedString| div().text_xs().text_color(rgb(color::MUTED)).child(text);
+        let short = Checkbox::new("direct-short").label(t("direct.short")).checked(short_codes_on()).on_click(cx.listener(|_, v: &bool, _, cx| {
             set_setting("shortCode", serde_json::Value::Bool(*v));
             cx.notify();
         }));
         // Our text: the short code first when there is one, the full text below it.
-        let outgoing = |title: &'static str, code: &Option<Code>, cx: &mut Context<Self>| {
+        let outgoing = |title: SharedString, code: &Option<Code>, cx: &mut Context<Self>| {
             let mut col = div().flex().flex_col().gap_2().child(bold(title));
             match code {
                 Some(Code::Valid { code, until }) => {
@@ -487,21 +496,21 @@ impl Shell {
                                 .items_center()
                                 .gap_3()
                                 .child(div().px_3().py_1().rounded_md().bg(rgb(color::RAIL)).border_1().border_color(rgb(color::LINE)).text_size(px(22.)).font_family("Consolas").font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(shown))
-                                .child(Button::new("copy-code").label(if j.copied == Some("code") { "Copied" } else { "Copy code" }).on_click(cx.listener(move |s, _, _, cx| {
+                                .child(Button::new("copy-code").label(t(if j.copied == Some("code") { "direct.copied" } else { "direct.copy_code" })).on_click(cx.listener(move |s, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                                     s.join.copied = Some("code");
                                     cx.notify();
                                 })))
-                                .child(small(format!("valid {}", clock(until.saturating_duration_since(Instant::now()))))),
+                                .child(small(tf("direct.code_left", &[("time", &clock(until.saturating_duration_since(Instant::now())))]))),
                         )
-                        .child(small("Or the full text, if the code does not work:".into()));
+                        .child(small(t("direct.or_text")));
                 }
-                Some(Code::Failed) => col = col.child(small("No short code right now (the server did not answer). Send the full text:".into())),
-                Some(Code::Expired) => col = col.child(small("The short code has expired. Send the full text:".into())),
+                Some(Code::Failed) => col = col.child(small(t("direct.no_code"))),
+                Some(Code::Expired) => col = col.child(small(t("direct.code_expired"))),
                 None => {}
             }
             let text = j.outgoing.read(cx).value().to_string();
-            col.child(sunk(Textarea::new(&j.outgoing).h(px(90.)).readonly(true))).child(div().flex().child(Button::new("copy-text").label(if j.copied == Some("text") { "Copied" } else { "Copy" }).on_click(cx.listener(move |s, _, _, cx| {
+            col.child(sunk(Textarea::new(&j.outgoing).h(px(90.)).readonly(true))).child(div().flex().child(Button::new("copy-text").label(t(if j.copied == Some("text") { "direct.copied" } else { "direct.copy" })).on_click(cx.listener(move |s, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 s.join.copied = Some("text");
                 cx.notify();
@@ -512,39 +521,39 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_3()
-            .child(small("No server: you and one friend swap two texts through any messenger, then either of you can stream to the other. Works on most home networks, not on some mobile ones.".into()))
+            .child(small(t("direct.about")))
             .child(
                 seg_bar()
-                    .child(seg("r-invite", "I invite", role == Role::Invite).on_click(cx.listener(|s, _, w, cx| s.set_role(Role::Invite, w, cx))))
-                    .child(seg("r-answer", "I have an invite", role == Role::Answer).on_click(cx.listener(|s, _, w, cx| s.set_role(Role::Answer, w, cx)))),
+                    .child(seg("r-invite", t("direct.role_invite"), role == Role::Invite).on_click(cx.listener(|s, _, w, cx| s.set_role(Role::Invite, w, cx))))
+                    .child(seg("r-answer", t("direct.role_answer"), role == Role::Answer).on_click(cx.listener(|s, _, w, cx| s.set_role(Role::Answer, w, cx)))),
             );
-        let busy_label = |idle: &'static str| if making { "A few seconds…" } else { idle };
+        let busy_label = |idle: &str| t(if making { "direct.making" } else { idle });
         match (role, st.invite.is_some(), st.answer.is_some()) {
             (Role::Invite, false, _) => {
-                col = col.child(short).child(Button::new("make-invite").primary().disabled(making).label(busy_label("Make the invite")).on_click(cx.listener(|s, _, w, cx| s.make_invite(w, cx))));
+                col = col.child(short).child(Button::new("make-invite").primary().disabled(making).label(busy_label("direct.make_invite")).on_click(cx.listener(|s, _, w, cx| s.make_invite(w, cx))));
             }
             (Role::Invite, true, _) => {
                 col = col
-                    .child(outgoing("1. Send this to your friend:", &st.invite_code, cx))
-                    .child(bold("2. Paste the code or the answer they send back:"))
+                    .child(outgoing(t("direct.send_invite"), &st.invite_code, cx))
+                    .child(bold(t("direct.paste_answer")))
                     .child(sunk(Textarea::new(&j.incoming).h(px(90.))))
                     .child(
                         Button::new("connect")
                             .primary()
                             .disabled(making || st.accepted)
-                            .label(if st.accepted { "Connecting…" } else { busy_label("Connect") })
+                            .label(if st.accepted { t("direct.connecting") } else { busy_label("direct.connect") })
                             .on_click(cx.listener(|s, _, w, cx| s.accept_answer(w, cx))),
                     );
             }
             (Role::Answer, _, false) => {
                 col = col
                     .child(short)
-                    .child(bold("1. Paste the code or the invite you got:"))
+                    .child(bold(t("direct.paste_invite")))
                     .child(sunk(Textarea::new(&j.incoming).h(px(90.))))
-                    .child(Button::new("make-answer").primary().disabled(making).label(busy_label("Make the answer")).on_click(cx.listener(|s, _, w, cx| s.make_answer(w, cx))));
+                    .child(Button::new("make-answer").primary().disabled(making).label(busy_label("direct.make_answer")).on_click(cx.listener(|s, _, w, cx| s.make_answer(w, cx))));
             }
             (Role::Answer, _, true) => {
-                col = col.child(outgoing("2. Send this back:", &st.answer_code, cx)).child(small("You are connected as soon as they paste it.".into()));
+                col = col.child(outgoing(t("direct.send_answer"), &st.answer_code, cx)).child(small(t("direct.wait")));
             }
         }
         col
@@ -569,17 +578,24 @@ fn sunk(field: impl IntoElement) -> Div {
 }
 
 /// A segmented switch like the webview's: options on a sunk strip, the chosen one lighter.
+/// The whole width of the form, the options sharing it; a long name (in a translation)
+/// takes a second line instead of pushing out of the card.
 fn seg_bar() -> Div {
-    div().flex().self_start().gap_1().p_1().rounded_lg().bg(rgb(color::RAIL))
+    div().w_full().flex().gap_1().p_1().rounded_lg().bg(rgb(color::RAIL))
 }
 
-fn seg(id: &'static str, label: &'static str, on: bool) -> Stateful<Div> {
+fn seg(id: &'static str, label: SharedString, on: bool) -> Stateful<Div> {
     div()
         .id(id)
-        .px_3()
-        .h(px(32.))
+        .flex_1()
+        .min_w_0()
+        .px_2()
+        .py_1p5()
+        .min_h(px(32.))
         .flex()
         .items_center()
+        .justify_center()
+        .text_center()
         .rounded_md()
         .cursor_pointer()
         .when(on, |d| d.bg(rgb(0x404249)).text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD))

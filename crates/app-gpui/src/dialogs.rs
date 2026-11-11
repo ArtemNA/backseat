@@ -4,6 +4,7 @@
 //! windows are hidden: they are native windows and would cover it.
 
 use crate::room::PRESETS;
+use crate::i18n::{num, t, tf, tu, LANGS};
 use crate::{color, set_setting, settings, state_value, Shell};
 use backseat_core::{self as core, GoLive, Sources};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -119,8 +120,7 @@ fn decode_data_url(url: &str) -> Option<Arc<Image>> {
 }
 
 fn mbit(kbit: u32) -> String {
-    let v = kbit as f64 / 1000.0;
-    if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v}") }
+    num(kbit as f64 / 1000.0)
 }
 
 pub fn upload_limit() -> f64 {
@@ -143,6 +143,11 @@ fn pref(section: &str, key: &str) -> String {
 }
 
 fn set_pref(section: Option<&str>, key: &str, value: &str) {
+    // The language is the state file's own "lang", as the webview keeps it.
+    if section.is_none() && key == "lang" {
+        crate::i18n::set_language(value);
+        return;
+    }
     match section {
         None => set_setting(key, serde_json::Value::String(value.into())),
         Some(sec) => {
@@ -176,8 +181,8 @@ fn seg(id: impl Into<ElementId>, label: impl Into<SharedString>, on: bool, disab
         .child(label.into())
 }
 
-fn legend(t: &'static str) -> Div {
-    div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(t)
+fn legend(text: SharedString) -> Div {
+    div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(text)
 }
 
 fn small(t: impl Into<SharedString>) -> Div {
@@ -219,7 +224,7 @@ impl Shell {
             live_audio_none: false,
             error: None,
             busy: false,
-            limit: cx.new(|cx| InputState::new(window, cx).placeholder("Mbit/s")),
+            limit: cx.new(|cx| InputState::new(window, cx).placeholder(t("unit.mbit"))),
             scroll: ScrollHandle::new(),
         });
         if first {
@@ -286,7 +291,7 @@ impl Shell {
         let Some(g) = &self.dialogs.golive else { return vec![] };
         let Some(s) = &g.sources else { return vec![] };
         if g.screen {
-            s.monitors.iter().map(|m| Src { id: m.handle, title: format!("{}{}", m.name.trim_start_matches(r"\\.\"), if m.primary { " · primary" } else { "" }), sub: format!("{}×{}", m.width, m.height), minimized: false, pid: None, height: m.height as i32 }).collect()
+            s.monitors.iter().map(|m| Src { id: m.handle, title: format!("{}{}", m.name.trim_start_matches(r"\\.\"), if m.primary { format!(" · {}", t("golive.primary")) } else { String::new() }), sub: format!("{}×{}", m.width, m.height), minimized: false, pid: None, height: m.height as i32 }).collect()
         } else {
             s.windows.iter().map(|w| Src { id: w.hwnd, title: w.title.clone(), sub: w.exe.clone(), minimized: w.minimized, pid: Some(w.pid), height: w.height as i32 }).collect()
         }
@@ -364,7 +369,7 @@ impl Shell {
         let list = self.golive_list();
         let Some(g) = self.dialogs.golive.as_mut() else { return };
         let Some(pick) = list.iter().find(|x| Some(x.id) == g.pick) else {
-            g.error = Some("Pick a window to stream.".into());
+            g.error = Some(t("golive.pick_window").to_string());
             cx.notify();
             return;
         };
@@ -440,7 +445,7 @@ impl Shell {
                 .child(
                     div().w_full().h(px(101.)).rounded_md().bg(rgb(0x000000)).overflow_hidden().flex().items_center().justify_center().map(|d| match image {
                         Some(i) => d.child(img(i).w_full().h_full().object_fit(ObjectFit::Contain)),
-                        None => d.child(small(if x.minimized { "minimized: shows nothing until restored" } else { "" })),
+                        None => d.child(small(if x.minimized { t("golive.minimized") } else { SharedString::default() })),
                     }),
                 )
                 .child(div().flex().items_center().gap_1p5().overflow_hidden().whitespace_nowrap().text_color(rgb(color::BRIGHT)).when_some(icon, |d, i| d.child(img(i).size_4().flex_none())).child(div().overflow_hidden().child(x.title.clone())))
@@ -460,7 +465,7 @@ impl Shell {
             cx.notify();
         };
         let audio_row = {
-            let opts: Vec<(Audio, &str)> = [(Audio::System, "All system sound"), (Audio::App, "This program only"), (Audio::None, "No sound")].into_iter().filter(|(a, _)| *a != Audio::App || !screen).collect();
+            let opts: Vec<(Audio, SharedString)> = [(Audio::System, t("golive.audio_system")), (Audio::App, t("golive.audio_app")), (Audio::None, t("golive.audio_none"))].into_iter().filter(|(a, _)| *a != Audio::App || !screen).collect();
             seg_bar().children(opts.into_iter().map(|(a, label)| {
                 // While live, sound stays on or off as it started; which sound may change.
                 let locked = g.editing && (g.live_audio_none != (a == Audio::None));
@@ -521,14 +526,14 @@ impl Shell {
                 cx.notify();
             }))
         }));
-        let note = match g.codec.as_str() {
-            "h264" => "H.264: plays on any graphics card, needs more bitrate for the same picture.",
-            "av1" => "AV1: the best picture for the bitrate (15 Mbit/s looks like H.265 at 20). Viewers without hardware AV1 decode it on the CPU, about one frame later.",
-            _ => "H.265: better picture at the same bitrate. Older graphics cards may not decode it.",
-        };
-        let control = |label: &'static str, row: Div| div().flex().flex_col().gap_1().child(small(label)).child(row);
+        let note = t(match g.codec.as_str() {
+            "h264" => "golive.codec_h264",
+            "av1" => "golive.codec_av1",
+            _ => "golive.codec_h265",
+        });
+        let control = |label: SharedString, row: Div| div().flex().flex_col().gap_1().child(small(label)).child(row);
         let width = (need / if limit > 0.0 { limit } else { need.max(1.0) }).min(1.0) as f32;
-        let up = if limit > 0.0 { format!("{need:.1} of {limit:.1} Mbit/s") } else { format!("up to {} Mbit/s", mbit(g.kbit * n as u32)) };
+        let up = if limit > 0.0 { tf("up.of", &[("used", &num(need)), ("limit", &num(limit))]) } else { tf("golive.upload_value", &[("mbit", &mbit(g.kbit * n as u32))]) };
         let card = div()
             .w(px(860.))
             .max_h(relative(0.92))
@@ -537,7 +542,7 @@ impl Shell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(div().px_6().pt_5().pb_3().flex().flex_col().gap_1().child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(if g.editing { "Change the stream" } else { "Start streaming" })).child(small(format!("Room “{room}” · viewers who can watch: {}", peers.saturating_sub(1)))))
+            .child(div().px_6().pt_5().pb_3().flex().flex_col().gap_1().child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t(if g.editing { "live.change_title" } else { "golive.title" }))).child(small(tf("golive.sub", &[("room", &room), ("n", &peers.saturating_sub(1))]))))
             .child(
                 div().id("golive-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&g.scroll).child(
                     div()
@@ -546,17 +551,17 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .gap_4()
-                        .child(seg_bar().child(seg("tab-screen", "Screen", screen, false).on_click(cx.listener(set(|g| g.screen = true)))).child(seg("tab-window", "Program window", !screen, false).on_click(cx.listener(set(|g| g.screen = false)))))
+                        .child(seg_bar().child(seg("tab-screen", t("golive.screen"), screen, false).on_click(cx.listener(set(|g| g.screen = true)))).child(seg("tab-window", t("golive.window"), !screen, false).on_click(cx.listener(set(|g| g.screen = false)))))
                         .child(div().flex().flex_wrap().gap_2p5().children(sources))
-                        .child(div().flex().flex_col().gap_2().child(legend("SOUND")).child(audio_row))
+                        .child(div().flex().flex_col().gap_2().child(legend(tu("golive.audio"))).child(audio_row))
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap_2()
-                                .child(legend("QUALITY (THE MOST VIEWERS GET; THEY MAY PICK LESS)"))
-                                .child(div().flex().flex_wrap().gap_4().child(control("Resolution", res_row)).child(control("Frame rate", fps_row)).child(control("Codec", codec_row)))
-                                .child(control("Bitrate, Mbit/s", kbit_row))
+                                .child(legend(tu("golive.quality")))
+                                .child(div().flex().flex_wrap().gap_4().child(control(t("golive.resolution"), res_row)).child(control(t("golive.fps"), fps_row)).child(control(t("golive.codec"), codec_row)))
+                                .child(control(t("golive.bitrate"), kbit_row))
                                 .child(small(note)),
                         )
                         .child(
@@ -567,12 +572,12 @@ impl Shell {
                                 .flex()
                                 .flex_col()
                                 .gap_2()
-                                .child(div().flex().justify_between().child(small(format!("Upload for {n} viewers"))).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(up)))
+                                .child(div().flex().justify_between().child(small(tf("golive.upload", &[("n", &n)]))).child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(up)))
                                 .child(div().h_2().rounded(px(4.)).bg(rgb(color::RAIL)).child(div().h_2().rounded(px(4.)).w(relative(width)).bg(rgb(if over { 0xf0b232 } else { 0x2f9e6e }))))
-                                .child(small(format!("Each viewer at full quality adds {} Mbit/s; at a lower quality, less.", mbit(g.kbit))))
-                                .child(div().flex().items_center().gap_3().child(small("Your upload limit, Mbit/s")).child(div().w(px(120.)).rounded_md().bg(rgb(color::RAIL)).child(Input::new(&g.limit).small())))
-                                .child(small("Find it with any speed test (“upload”). Leave empty if unsure."))
-                                .when(over, |d| d.child(banner(format!("At full quality for everyone this needs {need:.1} Mbit/s, over your limit of {limit:.1}. Viewers can pick a lower quality."), true))),
+                                .child(small(tf("golive.upload_note", &[("kbit", &mbit(g.kbit))])))
+                                .child(div().flex().items_center().gap_3().child(small(t("up.limit"))).child(div().w(px(120.)).rounded_md().bg(rgb(color::RAIL)).child(Input::new(&g.limit).small())))
+                                .child(small(t("up.limit_hint")))
+                                .when(over, |d| d.child(banner(tf("up.over", &[("need", &num(need)), ("limit", &num(limit))]), true))),
                         )
                         .when_some(g.error.clone(), |d, e| d.child(banner(e, false))),
                 ).vertical_scrollbar(&g.scroll),
@@ -585,8 +590,8 @@ impl Shell {
                     .justify_end()
                     .gap_2()
                     .bg(rgb(color::SIDE))
-                    .child(Button::new("gl-cancel").ghost().label("Cancel").on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
-                    .child(Button::new("gl-start").primary().disabled(g.busy).label(if g.busy { "A few seconds…" } else if g.editing { "Apply" } else { "Start streaming" }).on_click(cx.listener(|s, _, _, cx| s.golive_start(cx)))),
+                    .child(Button::new("gl-cancel").ghost().label(t("golive.cancel")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx))))
+                    .child(Button::new("gl-start").primary().disabled(g.busy).label(t(if g.busy { "direct.making" } else if g.editing { "live.apply" } else { "golive.start" })).on_click(cx.listener(|s, _, _, cx| s.golive_start(cx)))),
             );
         card.into_any_element()
     }
@@ -601,23 +606,25 @@ impl Shell {
                 }
             }
         })];
-        let kbits: Vec<(&'static str, String)> = PRESETS.iter().map(|k| (Box::leak(k.to_string().into_boxed_str()) as &'static str, format!("{} Mbit/s", mbit(*k)))).collect();
+        let kbits: Vec<(&'static str, String)> = PRESETS.iter().map(|k| (Box::leak(k.to_string().into_boxed_str()) as &'static str, format!("{} {}", mbit(*k), t("unit.mbit")))).collect();
         type Rows = Vec<(&'static str, String)>;
-        let rows = |items: &[(&'static str, &str)]| -> Rows { items.iter().map(|(v, l)| (*v, l.to_string())).collect() };
+        let rows = |items: &[(&'static str, SharedString)]| -> Rows { items.iter().map(|(v, l)| (*v, l.to_string())).collect() };
+        let plain = |v: &'static str| SharedString::from(v);
         let with_kbits = |first: &str| -> Rows { std::iter::once(("", first.to_string())).chain(kbits.iter().cloned()).collect() };
         let defs: Vec<(Option<&'static str>, &'static str, Rows)> = vec![
-            (Some("stream"), "res", rows(&[("", "Auto (by the screen or window)"), ("720", "720p"), ("1080", "1080p"), ("1440", "1440p")])),
-            (Some("stream"), "fps", rows(&[("", "Auto"), ("30", "30"), ("60", "60")])),
-            (Some("stream"), "kbit", with_kbits("Auto")),
-            (Some("stream"), "codec", rows(&[("", "Auto"), ("av1", "AV1"), ("h265", "H.265"), ("h264", "H.264")])),
-            (Some("stream"), "audio", rows(&[("", "Auto: the window’s program only, or the system for a screen"), ("system", "All system sound"), ("none", "No sound")])),
-            (Some("watch"), "res", rows(&[("", "As the streamer"), ("1440", "1440p"), ("1080", "1080p"), ("720", "720p")])),
-            (Some("watch"), "fps", rows(&[("", "As the streamer"), ("60", "60"), ("30", "30")])),
-            (Some("watch"), "kbit", with_kbits("As the streamer")),
+            (Some("stream"), "res", rows(&[("", t("set.auto_res")), ("720", plain("720p")), ("1080", plain("1080p")), ("1440", plain("1440p"))])),
+            (Some("stream"), "fps", rows(&[("", t("set.auto")), ("30", plain("30")), ("60", plain("60"))])),
+            (Some("stream"), "kbit", with_kbits(&t("set.auto"))),
+            (Some("stream"), "codec", rows(&[("", t("set.auto")), ("av1", plain("AV1")), ("h265", plain("H.265")), ("h264", plain("H.264"))])),
+            (Some("stream"), "audio", rows(&[("", t("set.audio_auto")), ("system", t("golive.audio_system")), ("none", t("golive.audio_none"))])),
+            (Some("watch"), "res", rows(&[("", t("set.as_streamer")), ("1440", plain("1440p")), ("1080", plain("1080p")), ("720", plain("720p"))])),
+            (Some("watch"), "fps", rows(&[("", t("set.as_streamer")), ("60", plain("60")), ("30", plain("30"))])),
+            (Some("watch"), "kbit", with_kbits(&t("set.as_streamer"))),
+            (None, "lang", rows(&LANGS.map(|(id, name)| (id, plain(name))))),
         ];
         let mut prefs = vec![];
         for (section, key, items) in defs {
-            let now = pref(section.unwrap_or_default(), key);
+            let now = if section.is_none() && key == "lang" { crate::i18n::current() } else { pref(section.unwrap_or_default(), key) };
             let row = items.iter().position(|(v, _)| *v == now).unwrap_or(0);
             let labels: Vec<SharedString> = items.iter().map(|(_, l)| SharedString::from(l.clone())).collect();
             let values: Vec<&'static str> = items.iter().map(|(v, _)| *v).collect();
@@ -627,6 +634,7 @@ impl Shell {
                 let SelectEvent::Confirm(_) = e;
                 let row = p.read(cx).selected_index(cx).map_or(0, |i| i.row);
                 set_pref(section, key, vals.get(row).copied().unwrap_or(""));
+                cx.notify();
             }));
             prefs.push(Pref { section, key, values, picker });
         }
@@ -654,7 +662,7 @@ impl Shell {
 
     fn check_update(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = self.dialogs.settings.as_mut() {
-            s.status = "Checking…".into();
+            s.status = t("set.checking").to_string();
         }
         let core = self.core.clone();
         let task = cx.background_executor().spawn(async move { core::check_update(&core) });
@@ -664,10 +672,10 @@ impl Shell {
                 if let Some(st) = s.dialogs.settings.as_mut() {
                     match r {
                         Ok(r) => {
-                            st.status = if r.newer { format!("Version {} is available.", r.latest) } else { "You have the latest version.".into() };
+                            st.status = if r.newer { tf("set.available", &[("v", &r.latest)]).to_string() } else { t("set.uptodate").to_string() };
                             st.update = r.newer.then_some(r);
                         }
-                        Err(e) => st.status = format!("Update check failed: {e}"),
+                        Err(e) => st.status = tf("set.failed", &[("e", &e)]).to_string(),
                     }
                 }
                 cx.notify();
@@ -679,7 +687,7 @@ impl Shell {
 
     fn install_update(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = self.dialogs.settings.as_mut() {
-            s.status = "Downloading the update; Backseat will restart…".into();
+            s.status = t("set.installing").to_string();
         }
         let core = self.core.clone();
         let task = cx.background_executor().spawn(async move { core::install_update(&core) });
@@ -691,7 +699,7 @@ impl Shell {
                     Ok(false) => {}
                     Err(e) => {
                         if let Some(st) = s.dialogs.settings.as_mut() {
-                            st.status = format!("Update check failed: {e}");
+                            st.status = tf("set.failed", &[("e", &e)]).to_string();
                         }
                     }
                 }
@@ -707,17 +715,17 @@ impl Shell {
         let tab = st.tab;
         let tray = settings().get("tray").and_then(|v| v.as_bool()) != Some(false);
         let auto = settings().get("autoUpdate").and_then(|v| v.as_bool()) != Some(false);
-        let field = |label: &'static str, el: AnyElement| div().flex().flex_col().gap_1p5().child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(label)).child(el);
-        let pick = |section: &'static str, key: &'static str| -> AnyElement {
-            match st.prefs.iter().find(|p| p.section == Some(section) && p.key == key) {
+        let field = |label: SharedString, el: AnyElement| div().flex().flex_col().gap_1p5().child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(label)).child(el);
+        let pick = |section: Option<&'static str>, key: &'static str| -> AnyElement {
+            match st.prefs.iter().find(|p| p.section == section && p.key == key) {
                 Some(p) => div().rounded_md().bg(rgb(color::RAIL)).child(Select::new(&p.picker)).into_any_element(),
                 None => div().into_any_element(),
             }
         };
-        let tab_button = |t: SetTab, label: &'static str, cx: &mut Context<Self>| {
-            let on = tab == t;
+        let tab_button = |which: SetTab, id: &'static str, label: SharedString, cx: &mut Context<Self>| {
+            let on = tab == which;
             div()
-                .id(label)
+                .id(id)
                 .px_3()
                 .py_2()
                 .rounded_md()
@@ -727,7 +735,7 @@ impl Shell {
                 .child(label)
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if let Some(st) = s.dialogs.settings.as_mut() {
-                        st.tab = t;
+                        st.tab = which;
                     }
                     cx.notify();
                 }))
@@ -737,48 +745,49 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap_4()
-                .child(field("DEFAULT SERVER", div().rounded_md().bg(rgb(color::RAIL)).child(Input::new(&st.server).disabled(core::built_in().is_some())).into_any_element()))
+                .child(field(tu("set.server"), div().rounded_md().bg(rgb(color::RAIL)).child(Input::new(&st.server).disabled(core::built_in().is_some())).into_any_element()))
                 .child(small(match core::built_in() {
-                    Some(u) => format!("This build always uses its own server: {u}"),
-                    None => "Signaling server address (wss://…/ws) for new rooms and invite links.".into(),
+                    Some(u) => tf("set.server_fixed", &[("url", &u)]),
+                    None => t("set.server_hint"),
                 }))
-                .child(Checkbox::new("set-tray").label("Closing the window keeps Backseat in the tray").checked(tray).on_click(cx.listener(|s, v: &bool, _, cx| {
+                .child(field(tu("connect.language"), pick(None, "lang")))
+                .child(Checkbox::new("set-tray").label(t("set.tray")).checked(tray).on_click(cx.listener(|s, v: &bool, _, cx| {
                     s.set_tray(*v);
                     cx.notify();
                 })))
-                .child(div().flex().items_center().gap_3().child(Button::new("set-logs").label("Open the log folder").on_click(cx.listener(|s, _, _, cx| {
+                .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
                     if let Err(e) = core::open_logs() {
                         s.error = Some(e);
                     }
                     cx.notify();
-                }))).child(small("Logs help find what went wrong: send the newest files with a bug report.")))
+                }))).child(small(t("set.logs_hint"))))
                 .into_any_element(),
             SetTab::Stream => div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(small("Picked in advance each time you go live; anything this computer cannot do falls back to what it can."))
-                .child(field("RESOLUTION", pick("stream", "res")))
-                .child(field("FRAME RATE", pick("stream", "fps")))
-                .child(field("BITRATE, MBIT/S", pick("stream", "kbit")))
-                .child(field("CODEC", pick("stream", "codec")))
-                .child(field("SOUND", pick("stream", "audio")))
+                .child(small(t("set.stream_hint")))
+                .child(field(tu("golive.resolution"), pick(Some("stream"), "res")))
+                .child(field(tu("golive.fps"), pick(Some("stream"), "fps")))
+                .child(field(tu("golive.bitrate"), pick(Some("stream"), "kbit")))
+                .child(field(tu("golive.codec"), pick(Some("stream"), "codec")))
+                .child(field(tu("golive.audio"), pick(Some("stream"), "audio")))
                 .into_any_element(),
             SetTab::Watch => div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(small("The most you want to receive. A stream asks for this from the start; if the streamer sends less, you get what they send."))
-                .child(field("RESOLUTION, AT MOST", pick("watch", "res")))
-                .child(field("FRAME RATE, AT MOST", pick("watch", "fps")))
-                .child(field("BITRATE, AT MOST", pick("watch", "kbit")))
+                .child(small(t("set.watch_hint")))
+                .child(field(tu("set.max_res"), pick(Some("watch"), "res")))
+                .child(field(tu("set.max_fps"), pick(Some("watch"), "fps")))
+                .child(field(tu("set.max_kbit"), pick(Some("watch"), "kbit")))
                 .into_any_element(),
             SetTab::Updates => div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(format!("Version {}", core::app_version())))
-                .child(Checkbox::new("set-auto").label("Install updates automatically at start").checked(auto).on_click(cx.listener(|_, v: &bool, _, cx| {
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(tf("set.version", &[("v", &core::app_version())])))
+                .child(Checkbox::new("set-auto").label(t("set.auto_update")).checked(auto).on_click(cx.listener(|_, v: &bool, _, cx| {
                     set_setting("autoUpdate", serde_json::Value::Bool(*v));
                     cx.notify();
                 })))
@@ -786,8 +795,8 @@ impl Shell {
                     div()
                         .flex()
                         .gap_2()
-                        .child(Button::new("set-check").label("Check for updates").on_click(cx.listener(|s, _, _, cx| s.check_update(cx))))
-                        .when(st.update.is_some(), |d| d.child(Button::new("set-install").primary().label("Update now").on_click(cx.listener(|s, _, _, cx| s.install_update(cx))))),
+                        .child(Button::new("set-check").label(t("set.check")).on_click(cx.listener(|s, _, _, cx| s.check_update(cx))))
+                        .when(st.update.is_some(), |d| d.child(Button::new("set-install").primary().label(t("set.install")).on_click(cx.listener(|s, _, _, cx| s.install_update(cx))))),
                 )
                 .child(small(st.status.clone()))
                 .into_any_element(),
@@ -801,7 +810,7 @@ impl Shell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(div().px_6().pt_5().pb_3().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("Settings"))
+            .child(div().px_6().pt_5().pb_3().text_size(px(18.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(t("set.title")))
             .child(
                 div()
                     .flex_1()
@@ -810,10 +819,10 @@ impl Shell {
                     .gap_4()
                     .px_6()
                     .pb_4()
-                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "General", cx)).child(tab_button(SetTab::Stream, "Streaming", cx)).child(tab_button(SetTab::Watch, "Watching", cx)).child(tab_button(SetTab::Updates, "Updates", cx)))
+                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)))
                     .child(div().id("set-page").flex_1().min_w_0().overflow_y_scroll().track_scroll(&st.scroll).child(div().pb_2().pr_3().child(page)).vertical_scrollbar(&st.scroll)),
             )
-            .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").primary().label("Close").on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
+            .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").primary().label(t("set.close")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
             .into_any_element()
     }
 
@@ -875,6 +884,8 @@ pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
                 s.close_dialog(cx);
             });
             eprintln!("test: settings saved {}", serde_json::Value::Object(settings()));
+            let (show, quit) = core::tray_text();
+            eprintln!("test: language now {}; tray {show} / {quit}", crate::i18n::current());
         }
         if let Some(tab) = show {
             let tab = match tab.as_str() {

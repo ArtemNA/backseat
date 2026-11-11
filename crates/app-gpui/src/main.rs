@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dialogs;
+mod i18n;
 mod join;
 mod room;
 mod tray;
@@ -14,6 +15,7 @@ use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::{Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use i18n::{t, tf};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,10 +170,10 @@ impl Shell {
         if let Some(n) = self.snap.notice.clone() {
             let (kind, rest) = n.split_once(':').unwrap_or((n.as_str(), ""));
             self.error = Some(match kind {
-                "direct_ended" => "The direct connection ended.".into(),
-                "lost" => "Lost the connection to the server.".into(),
-                "watch_ended" => format!("Stream ended: {rest}"),
-                _ => format!("Error: {rest}"),
+                "direct_ended" => t("notice.direct_ended").to_string(),
+                "lost" => t("notice.lost").to_string(),
+                "watch_ended" => tf("notice.watch_ended", &[("reason", &rest)]).to_string(),
+                _ => tf("notice.error", &[("msg", &rest)]).to_string(),
             });
             self.error_since = Some(std::time::Instant::now());
         }
@@ -347,7 +349,7 @@ impl Shell {
 
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let direct = self.snap.direct.is_some();
-        let title = if direct { "Direct connection".to_string() } else { self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into()) };
+        let title = if direct { t("direct.title").to_string() } else { self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into()) };
         let invite = self.current.clone().filter(|_| self.snap.connected && self.snap.direct.is_none());
         let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).or_else(|| self.current.as_ref().map(|c| c.name.clone())).unwrap_or_default();
         let live = self.snap.live.is_some();
@@ -369,23 +371,24 @@ impl Shell {
                     .border_color(rgb(color::LINE))
                     .child(div().flex_1().min_w_0().flex().items_center().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(title).when(direct, |d| d.child(beta())))
                     .when_some(invite, |d, r| {
-                        d.child(icon_button("invite", "icons/user-plus.svg", "Invite", color::BRIGHT).on_click(cx.listener(move |this, _, _, cx| {
+                        d.child(icon_button("invite", "icons/user-plus.svg", t("room.invite"), color::BRIGHT).on_click(cx.listener(move |this, _, _, cx| {
                             let code = if join::is_code(&r.room) { join::fmt_code(&r.room) } else { r.room.clone() };
-                            let text = if join::is_code(&r.room) { format!("Join me in Backseat: {}, invite code {}", r.label(), code) } else { code.clone() };
+                            let text = if join::is_code(&r.room) { tf("invite.text", &[("title", &r.label()), ("code", &code), ("link", &join::invite_link(&r))]).to_string() } else { code.clone() };
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            this.error = Some(format!("Invite copied: {code}"));
+                            this.error = Some(tf(if join::is_code(&r.room) { "room.copied" } else { "room.copied_plain" }, &[("code", &code)]).to_string());
+                            this.error_since = Some(std::time::Instant::now());
                             cx.notify();
                         })))
                     })
                     .when(self.snap.connected, |d| {
-                        d.child(icon_button("leave", "icons/log-out.svg", "Leave room", color::LIVE).on_click(cx.listener(|this, _, _, cx| this.leave(cx))))
+                        d.child(icon_button("leave", "icons/log-out.svg", t("room.leave"), color::LIVE).on_click(cx.listener(|this, _, _, cx| this.leave(cx))))
                     }),
             )
             .child({
                 let person = |p: &backseat_core::PeerView| {
                     row()
                         .child(avatar(&p.name))
-                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_color(rgb(if p.me { color::BRIGHT } else { color::TEXT })).child(if p.me { format!("{} (You)", p.name) } else { p.name.clone() }))
+                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_color(rgb(if p.me { color::BRIGHT } else { color::TEXT })).child(if p.me { format!("{} ({})", p.name, t("room.you")) } else { p.name.clone() }))
                         .when(p.streaming, |d| d.child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE")))
                 };
                 let section = |t: String| div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(t);
@@ -395,22 +398,22 @@ impl Shell {
                     .id("people")
                     .flex_1()
                     .overflow_y_scroll()
-                    .when(self.snap.connected, |d| d.child(section(format!("LIVE — {}", live.len()))).children(live.iter().map(|p| person(p))).child(section(format!("IN THE ROOM — {}", rest.len()))).children(rest.iter().map(|p| person(p))))
+                    .when(self.snap.connected, |d| d.child(section(tf("room.live", &[("n", &live.len())]).to_string())).children(live.iter().map(|p| person(p))).child(section(tf("room.here", &[("n", &rest.len())]).to_string())).children(rest.iter().map(|p| person(p))))
             })
             .child(
                 row()
                     .h(px(56.))
                     .bg(rgb(color::BAR))
                     .child(avatar(&me))
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => "not live".into() })))
-                    .child(icon_button("settings-btn", "icons/settings.svg", "Settings", color::BRIGHT).on_click(cx.listener(|s, _, w, cx| s.open_settings(dialogs::SetTab::General, w, cx))))
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => t("room.not_live") })))
+                    .child(icon_button("settings-btn", "icons/settings.svg", t("set.open"), color::BRIGHT).on_click(cx.listener(|s, _, w, cx| s.open_settings(dialogs::SetTab::General, w, cx))))
                     .when(self.snap.connected && !live, |d| {
                         d.child(
                             gpui_kit::component::button::Button::new("go-live")
                                 .primary()
                                 .small()
                                 .icon(gpui_kit::component::Icon::default().path("icons/monitor.svg"))
-                                .label("Stream")
+                                .label(t("room.go_live"))
                                 .on_click(cx.listener(|s, _, w, cx| s.open_golive(false, w, cx))),
                         )
                     }),
@@ -419,13 +422,13 @@ impl Shell {
 
     fn main(&self) -> impl IntoElement {
         let status = if self.joining {
-            "Connecting…".to_string()
+            t("direct.connecting").to_string()
         } else if let Some(e) = &self.error {
-            format!("Could not join: {e}")
+            tf("join.failed", &[("e", e)]).to_string()
         } else if self.rooms.is_empty() {
-            "No rooms yet. Joining and making rooms comes in stage 2.".into()
+            t("lobby.pick").to_string()
         } else {
-            "Not in a room. Pick one on the left.".into()
+            t("lobby.pick").to_string()
         };
         let header = self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_default();
         div()
@@ -445,7 +448,7 @@ pub(crate) fn beta() -> Div {
 }
 
 /// A small icon button in a header: grey, `hover` colour under the pointer, a tooltip.
-pub(crate) fn icon_button(id: &'static str, icon: &'static str, tip: &'static str, hover: u32) -> Stateful<Div> {
+pub(crate) fn icon_button(id: &'static str, icon: &'static str, tip: SharedString, hover: u32) -> Stateful<Div> {
     use gpui_kit::component::{Icon, Sizable as _};
     div()
         .id(id)
@@ -457,7 +460,7 @@ pub(crate) fn icon_button(id: &'static str, icon: &'static str, tip: &'static st
         .cursor_pointer()
         .text_color(rgb(color::MUTED))
         .hover(move |s| s.text_color(rgb(hover)).bg(rgb(0x3a3c42)))
-        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
         .child(Icon::default().path(icon).small())
 }
 
@@ -570,6 +573,7 @@ fn test_actions(cx: &mut Context<Shell>) {
 
 fn main() {
     let Some(core) = core::start(|_, _| show_main_window()) else { return };
+    i18n::init();
     if settings().get("tray").and_then(|v| v.as_bool()) == Some(false) {
         core.close_to_tray.store(false, Ordering::SeqCst);
     }
@@ -607,6 +611,10 @@ fn main() {
             // ...and their text colour from the plain colours.
             t.button_primary_foreground = h(0xffffff);
             t.button_foreground = h(0xffffff);
+            // Checkboxes and other accents read the primary token: blue, as the buttons.
+            t.tokens.primary = h(0x3b6fd8).into();
+            t.tokens.primary_hover = h(0x4a7ee6).into();
+            t.tokens.primary_active = h(0x335fba).into();
             t.tokens.button_danger = h(0xa1282f).into();
             t.tokens.button_danger_hover = h(0xb8323a).into();
             t.tokens.button_danger_active = h(0x8c2229).into();
