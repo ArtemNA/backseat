@@ -33,12 +33,14 @@ $plugins = @(
   # AV1: RTP (de)payloader and the software decoder
   'rsrtp', 'dav1d',
   # Data channels of a direct connection (no server).
-  'sctp'
+  'sctp',
+  # Voice chat: echo canceller and echo probe, and the mixer of the shared sound output.
+  'webrtcdsp', 'audiomixer'
 )
 # License folders under share\licenses for the libraries that end up in the folder.
 $licenses = @(
   'gstreamer-1.0', 'gst-plugins-base-1.0', 'gst-plugins-bad-1.0', 'glib', 'libffi',
-  'proxy-libintl', 'pcre2', 'zlib', 'orc', 'opus', 'libnice', 'libsrtp', 'openssl', 'dav1d', 'gst-plugins-rs'
+  'proxy-libintl', 'pcre2', 'zlib', 'orc', 'opus', 'libnice', 'libsrtp', 'openssl', 'dav1d', 'gst-plugins-rs', 'webrtc-audio-processing'
 )
 $vcRuntime = '^(vcruntime140(_1)?|msvcp140(_\d)?|concrt140)\.dll$'
 

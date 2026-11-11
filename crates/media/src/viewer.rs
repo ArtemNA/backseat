@@ -566,11 +566,13 @@ const AUDIO_VOLUME: &str = "avolume";
 struct Audio {
     muted: std::sync::atomic::AtomicBool,
     volume: std::sync::atomic::AtomicU32,
+    /// The stream's input of the shared output (Windows), kept while the branch lives.
+    output: Mutex<Option<Arc<crate::playback::Input>>>,
 }
 
 impl Default for Audio {
     fn default() -> Self {
-        Self { muted: false.into(), volume: 100.into() }
+        Self { muted: false.into(), volume: 100.into(), output: Mutex::new(None) }
     }
 }
 
@@ -637,7 +639,25 @@ fn add_audio(
             gst::PadProbeReturn::Ok
         });
     }
-    let chain = vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume, make("audioresample")?, sink];
+    // Windows: to the speakers through the process's shared output, so a voice chat's echo
+    // canceller hears the stream too. The appsink keeps the stream's pacing (sync).
+    // STREAMER_DEBUG_OWN_SINK keeps the viewer's own sink (the old way).
+    let shared = cfg!(windows) && !debug_level && std::env::var_os("STREAMER_DEBUG_OWN_SINK").is_none();
+    // If the shared output cannot start (a missing plugin, no device), the stream keeps its
+    // sound through its own sink, as before.
+    let shared_tail = if shared {
+        crate::playback::tail("stream", audio_sync).inspect_err(|e| eprintln!("viewer: shared sound output unavailable ({e}); own sink")).ok()
+    } else {
+        None
+    };
+    let chain = if let Some((tail, input)) = shared_tail {
+        *audio.output.lock().unwrap() = Some(input);
+        let mut c = vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume];
+        c.extend(tail);
+        c
+    } else {
+        vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume, make("audioresample")?, sink]
+    };
     link_branch(pipeline, pad, &chain)?;
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
     Ok(())

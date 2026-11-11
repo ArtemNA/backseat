@@ -30,6 +30,7 @@ pub struct App {
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
     /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
     voice_prefs: Mutex<(bool, bool)>,
+    voice_settings: Mutex<VoiceSettings>,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -140,6 +141,27 @@ pub struct VoiceView {
     pub speaking: Vec<u64>,
     pub mic_muted: bool,
     pub deafened: bool,
+    /// Others in voice with their microphone off / sound off.
+    pub muted: Vec<u64>,
+    pub deaf: Vec<u64>,
+    /// Push-to-talk is on, and whether its key is down now.
+    pub ptt: bool,
+    pub talking: bool,
+}
+
+/// What the voice settings say (the UI keeps them in its settings).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoiceSettings {
+    /// Device ids, None for the system's default.
+    pub mic: Option<String>,
+    pub speakers: Option<String>,
+    /// Push-to-talk key (a Windows virtual-key code), None for voice activity.
+    pub ptt_key: Option<i32>,
+    /// Sounds for events (live, viewers, voice members, microphone) and for push-to-talk.
+    pub event_sounds: bool,
+    pub ptt_sounds: bool,
+    /// Voice activity threshold, dBFS; None sends all the time (noise suppression only).
+    pub threshold: Option<f64>,
 }
 
 /// Sound above this (dBFS over 100 ms) counts as speaking.
@@ -148,14 +170,17 @@ const SPEAKING_DB: f64 = -50.0;
 /// The voice part of the snapshot; cheap, for the fast "who is speaking" refresh.
 pub fn voice_view(app: &App) -> VoiceView {
     let (mic_muted, deafened) = *app.voice_prefs.lock().unwrap();
+    let ptt = app.voice_settings.lock().unwrap().ptt_key.is_some();
     let s = app.session.lock().unwrap().clone();
-    let Some(s) = s else { return VoiceView { mic_muted, deafened, ..Default::default() } };
+    let Some(s) = s else { return VoiceView { mic_muted, deafened, ptt, ..Default::default() } };
     let mut members = s.voice_members();
     let mut speaking = vec![];
     let voice = s.voice();
+    let mut talking = false;
     if let Some(v) = &voice {
         members.push(s.id);
-        if !mic_muted && v.mic_db() > SPEAKING_DB {
+        talking = v.transmitting();
+        if talking && v.mic_db() > SPEAKING_DB {
             speaking.push(s.id);
         }
         for (id, db) in v.peer_db() {
@@ -167,23 +192,43 @@ pub fn voice_view(app: &App) -> VoiceView {
     members.sort_unstable();
     members.dedup();
     speaking.sort_unstable();
-    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened }
+    let states = s.voice_states();
+    let mut muted: Vec<u64> = states.iter().filter(|(_, st)| st.0 || st.1).map(|(id, _)| *id).collect();
+    let mut deaf: Vec<u64> = states.iter().filter(|(_, st)| st.1).map(|(id, _)| *id).collect();
+    muted.sort_unstable();
+    deaf.sort_unstable();
+    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened, muted, deaf, ptt, talking }
+}
+
+fn cue(app: &App, c: media::sounds::Cue) {
+    use media::sounds::Cue::*;
+    let st = app.voice_settings.lock().unwrap();
+    let on = if matches!(c, TalkOn | TalkOff) { st.ptt_sounds } else { st.event_sounds };
+    if on {
+        media::sounds::play(c);
+    }
 }
 
 /// Joins the open room's voice chat. Opens the microphone: run it off the UI thread.
-pub fn join_voice(app: &App) -> Result<(), String> {
+pub fn join_voice(app: &Arc<App>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
-    let mut cfg = media::voice::VoiceConfig::default();
+    let mut cfg = media::voice::VoiceConfig { mic: app.voice_settings.lock().unwrap().mic.clone(), ..Default::default() };
     // Tests only: STREAMER_APP_TEST_VOICE=<Hz> sends a tone instead of the microphone and
     // plays nothing.
     if let Some(hz) = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok()) {
         cfg.test_tone = Some(hz);
         cfg.silent = true;
     }
-    let v = s.join_voice(cfg).inspect_err(|e| eprintln!("voice failed: {e}"))?;
     let (mic, deaf) = *app.voice_prefs.lock().unwrap();
+    s.set_voice_state(mic || deaf, deaf);
+    let v = s.join_voice(cfg).inspect_err(|e| eprintln!("voice failed: {e}"))?;
     v.set_mic_muted(mic || deaf);
     v.set_deafened(deaf);
+    let st = app.voice_settings.lock().unwrap().clone();
+    v.set_transmit(st.ptt_key.is_none());
+    v.set_threshold(st.threshold.filter(|_| st.ptt_key.is_none()));
+    start_ptt(app);
+    cue(app, media::sounds::Cue::VoiceJoined);
     eprintln!("voice: joined");
     Ok(())
 }
@@ -191,8 +236,11 @@ pub fn join_voice(app: &App) -> Result<(), String> {
 pub fn leave_voice(app: &App) {
     let s = app.session.lock().unwrap().clone();
     if let Some(s) = s {
-        s.leave_voice();
-        eprintln!("voice: left");
+        if s.voice().is_some() {
+            s.leave_voice();
+            cue(app, media::sounds::Cue::VoiceLeft);
+            eprintln!("voice: left");
+        }
     }
 }
 
@@ -207,6 +255,7 @@ pub fn set_mic_muted(app: &App, on: bool) {
         *p
     };
     apply_voice_prefs(app, mic, deaf);
+    cue(app, if on { media::sounds::Cue::MicOff } else { media::sounds::Cue::MicOn });
 }
 
 /// Sound off (the microphone goes off with it) or on.
@@ -217,15 +266,159 @@ pub fn set_deafened(app: &App, on: bool) {
         *p
     };
     apply_voice_prefs(app, mic, deaf);
+    cue(app, if on { media::sounds::Cue::MicOff } else { media::sounds::Cue::MicOn });
 }
 
 fn apply_voice_prefs(app: &App, mic: bool, deaf: bool) {
-    let v = app.session.lock().unwrap().clone().and_then(|s| s.voice());
-    if let Some(v) = v {
-        v.set_mic_muted(mic || deaf);
-        v.set_deafened(deaf);
+    let s = app.session.lock().unwrap().clone();
+    if let Some(s) = s {
+        s.set_voice_state(mic || deaf, deaf);
+        if let Some(v) = s.voice() {
+            v.set_mic_muted(mic || deaf);
+            v.set_deafened(deaf);
+        }
     }
     eprintln!("voice: microphone {}, sound {}", if mic || deaf { "off" } else { "on" }, if deaf { "off" } else { "on" });
+}
+
+/// The microphone's level before the threshold (dBFS), while in voice.
+pub fn mic_input_db(app: &App) -> Option<f64> {
+    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.input_db())
+}
+
+/// One member's loudness in voice, 0..2 (1: as they send it).
+pub fn set_peer_volume(app: &App, id: u64, v: f64) {
+    let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+    if let Some(voice) = voice {
+        voice.set_peer_volume(id, v);
+    }
+}
+
+/// What each member in voice sounds like here now (dBFS over 100 ms, after their volume).
+pub fn voice_levels(app: &App) -> Vec<(u64, f64)> {
+    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.peer_db()).unwrap_or_default()
+}
+
+pub fn peer_volume(app: &App, id: u64) -> f64 {
+    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.peer_volume(id)).unwrap_or(1.0)
+}
+
+/// Microphones (`input`) or speakers to pick from.
+pub fn audio_devices(input: bool) -> Vec<media::playback::Device> {
+    media::playback::devices(input)
+}
+
+/// Applies the voice settings: speakers at once, a new microphone by rejoining voice,
+/// push-to-talk from the next key poll.
+pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
+    let old = std::mem::replace(&mut *app.voice_settings.lock().unwrap(), new.clone());
+    if old.speakers != new.speakers {
+        media::playback::set_device(new.speakers.clone());
+    }
+    let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+    if let Some(v) = &voice {
+        if old.ptt_key != new.ptt_key {
+            v.set_transmit(new.ptt_key.is_none());
+        }
+        // The threshold is for voice activity; push-to-talk sends what the key lets through.
+        v.set_threshold(new.threshold.filter(|_| new.ptt_key.is_none()));
+    }
+    if old.mic != new.mic && voice.is_some() {
+        eprintln!("voice: microphone changed, rejoining");
+        if let Some(s) = app.session.lock().unwrap().clone() {
+            s.leave_voice();
+        }
+        let a = app.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = join_voice(&a) {
+                a.notify(format!("error:{e}"));
+            }
+        });
+    }
+    start_ptt(app);
+}
+
+/// Push-to-talk: polls the key every 10 ms while in voice with a key set (one thread).
+fn start_ptt(app: &Arc<App>) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let weak = Arc::downgrade(app);
+    std::thread::Builder::new()
+        .name("push-to-talk".into())
+        .spawn(move || {
+            let mut down = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let Some(app) = weak.upgrade() else { return };
+                let key = app.voice_settings.lock().unwrap().ptt_key;
+                let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+                let (Some(key), Some(v)) = (key, voice) else {
+                    down = false;
+                    continue;
+                };
+                // Tests only: STREAMER_APP_TEST_PTT holds the key from +6 s to +10 s of the app.
+                let now = match test_ptt() {
+                    Some(held) => held,
+                    None => media::platform::key_down(key),
+                };
+                if now != down {
+                    down = now;
+                    v.set_transmit(now);
+                    cue(&app, if now { media::sounds::Cue::TalkOn } else { media::sounds::Cue::TalkOff });
+                }
+            }
+        })
+        .unwrap();
+}
+
+fn test_ptt() -> Option<bool> {
+    static T0: std::sync::OnceLock<Option<std::time::Instant>> = std::sync::OnceLock::new();
+    let t0 = (*T0.get_or_init(|| std::env::var_os("STREAMER_APP_TEST_PTT").map(|_| std::time::Instant::now())))?;
+    let s = t0.elapsed().as_secs_f64();
+    Some((6.0..10.0).contains(&s))
+}
+
+/// Sounds for what happened in the room: someone went live or stopped, someone started or
+/// stopped watching us, someone joined or left voice while we are in it.
+#[derive(Default)]
+struct Heard {
+    live: std::collections::HashSet<u64>,
+    voice: Vec<u64>,
+    started: bool,
+}
+
+fn event_cue(app: &App, e: &Event, h: &mut Heard) {
+    use media::sounds::Cue;
+    match e {
+        Event::Peers(peers) => {
+            let live: std::collections::HashSet<u64> = peers.iter().filter(|p| p.streaming).map(|p| p.id).collect();
+            if h.started {
+                if live.difference(&h.live).next().is_some() {
+                    cue(app, Cue::LiveStart);
+                } else if h.live.difference(&live).next().is_some() {
+                    cue(app, Cue::LiveEnd);
+                }
+            }
+            h.live = live;
+            h.started = true;
+        }
+        Event::ViewerJoined { .. } => cue(app, Cue::ViewerJoined),
+        Event::ViewerLeft { .. } => cue(app, Cue::ViewerLeft),
+        Event::VoiceMembers(m) => {
+            let joined = app.session.lock().unwrap().as_ref().is_some_and(|s| s.voice().is_some());
+            if joined {
+                if m.iter().any(|id| !h.voice.contains(id)) {
+                    cue(app, Cue::VoiceJoined);
+                } else if h.voice.iter().any(|id| !m.contains(id)) {
+                    cue(app, Cue::VoiceLeft);
+                }
+            }
+            h.voice = m.clone();
+        }
+        _ => {}
+    }
 }
 
 pub fn snapshot(app: &App) -> Snapshot {
@@ -263,7 +456,9 @@ fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &s
     app.sampler.attach(s);
     let a = app.clone();
     std::thread::spawn(move || {
+        let mut heard = Heard::default();
         while let Ok(e) = events.recv() {
+            event_cue(&a, &e, &mut heard);
             match e {
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
@@ -503,7 +698,9 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     app.sampler.attach(s.clone());
     let a = app.clone();
     std::thread::spawn(move || {
+        let mut heard = Heard::default();
         while let Ok(e) = events.recv() {
+            event_cue(&a, &e, &mut heard);
             match e {
                 // Leaving the room on purpose ends its watches; that is no news.
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
@@ -773,6 +970,13 @@ pub fn automate(app: &Arc<App>) {
             let id = if p.get(2) == Some(&"monitor") {
                 media::platform::monitors().into_iter().find(|m| m.primary).map(|m| m.handle).unwrap_or(0)
             } else {
+                // The test pattern exists only with dev sources; without them id 0 would be
+                // the real primary monitor (and the real system sound), which a test must
+                // never stream by accident. Ask for "monitor" to mean that.
+                if !dev_sources() {
+                    app.notify("error:STREAMER_APP_AUTOLIVE: the test pattern needs STREAMER_APP_DEV_SOURCES (or \"monitor\" for the real screen)".into());
+                    return;
+                }
                 0
             };
             let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000), codec: p.get(3).map(|c| c.to_string()) };

@@ -9,6 +9,7 @@ mod i18n;
 mod join;
 mod room;
 mod testing;
+mod voice_ui;
 mod tray;
 
 use backseat_core::{self as core, App as Core, Snapshot};
@@ -99,6 +100,10 @@ struct Shell {
     ticks: u64,
     /// A room's menu (right click in the rail) and where it opened.
     room_menu: Option<(Room, Point<Pixels>)>,
+    /// A voice member's volume (right click on them).
+    voice_menu: Option<voice_ui::VoiceMenu>,
+    /// The voice members the saved volumes were last given to.
+    volumes_for: Vec<u64>,
     /// A newer release found by the update check.
     update: Option<core::update::Release>,
 }
@@ -133,7 +138,8 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, voice_menu: None, volumes_for: vec![] };
+        voice_ui::apply_settings(&shell.core);
         // With a saved room, start in the last one opened. Not when a test joins by itself.
         if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none() || (*k == "STREAMER_APP_TEST_FORM" && std::env::var(k).is_ok_and(|v| v.starts_with("show")))) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
@@ -172,6 +178,11 @@ impl Shell {
                 let v = core::voice_view(&s.core);
                 if v != s.snap.voice {
                     s.snap.voice = v;
+                    cx.notify();
+                }
+                s.apply_volumes();
+                voice_ui::test_volume(s);
+                if s.dialogs.settings.as_ref().is_some_and(|d| d.tab == dialogs::SetTab::Voice) && s.snap.voice.joined {
                     cx.notify();
                 }
             });
@@ -605,12 +616,21 @@ impl Shell {
                 let in_voice: Vec<_> = self.snap.peers.iter().filter(|p| v.members.contains(&p.id)).collect();
                 let voice_person = |p: &backseat_core::PeerView| {
                     use gpui_kit::component::{Icon, Sizable as _};
+                    let (id, name, me) = (p.id, p.name.clone(), p.me);
+                    let muted = if p.me { v.mic_muted || v.deafened } else { v.muted.contains(&p.id) };
+                    let deaf = if p.me { v.deafened } else { v.deaf.contains(&p.id) };
                     row()
                         .py_1()
+                        // Right click: this member's volume (not for ourselves).
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                            if !me {
+                                this.open_voice_menu(id, name.clone(), e.position, window, cx);
+                            }
+                        }))
                         .child(voice_avatar(&p.name, v.speaking.contains(&p.id)))
                         .child(div().flex_1().min_w_0().truncate().text_color(rgb(if v.speaking.contains(&p.id) { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
-                        .when(p.me && (v.mic_muted || v.deafened), |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/mic-off.svg").small())))
-                        .when(p.me && v.deafened, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/headphone-off.svg").small())))
+                        .when(muted, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/mic-off.svg").small())))
+                        .when(deaf, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/headphone-off.svg").small())))
                 };
                 div()
                     .id("people")
@@ -789,6 +809,7 @@ impl Render for Shell {
         self.sync_tiles(window, cx);
         let dialog = self.render_dialog(cx);
         let menu = self.render_room_menu(cx);
+        let voice_menu = self.render_voice_menu(cx);
         if self.join_shown() {
             return div().size_full().relative().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).children(dialog).into_any_element();
         }
@@ -804,6 +825,7 @@ impl Render for Shell {
             .child(self.side(cx))
             .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() })
             .children(menu)
+            .children(voice_menu)
             .children(dialog)
             .into_any_element()
     }

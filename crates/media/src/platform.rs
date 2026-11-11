@@ -165,6 +165,18 @@ pub fn audio_sink() -> &'static str {
     }
 }
 
+/// Whether a key or mouse button (a Windows virtual-key code) is held down now, whichever
+/// window has the focus: push-to-talk while a game runs. Only reads the key's state.
+#[cfg(windows)]
+pub fn key_down(vk: i32) -> bool {
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn key_down(_vk: i32) -> bool {
+    false
+}
+
 /// A monitor a host can stream, for a source picker.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MonitorInfo {

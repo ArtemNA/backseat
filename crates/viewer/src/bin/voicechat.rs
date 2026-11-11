@@ -13,6 +13,10 @@ fn main() {
     let (mut server, mut room, mut name) = (None::<String>, "default".to_string(), "voice".to_string());
     let mut cfg = VoiceConfig::default();
     let (mut seconds, mut leave_after) = (0u64, 0u64);
+    // Also watch this streamer (no window, sound to the shared output).
+    let mut watch = None::<String>;
+    // Voice activity threshold, dBFS.
+    let mut threshold = None::<f64>;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -31,6 +35,8 @@ fn main() {
             "--room" => room = val,
             "--name" => name = val,
             "--tone" => cfg.test_tone = val.parse().ok(),
+            "--watch" => watch = Some(val),
+            "--threshold" => threshold = val.parse().ok(),
             "--seconds" => seconds = val.parse().unwrap_or(0),
             "--leave-after" => leave_after = val.parse().unwrap_or(0),
             "--stun" => cfg.ice = IceConfig { stun: (val != "none").then_some(val), turn: None },
@@ -53,8 +59,10 @@ fn main() {
         eprintln!("cannot join voice: {e}");
         std::process::exit(1);
     });
+    voice.set_threshold(threshold);
     println!("voice: in room {room} as {name} (id {})", session.id);
     let t0 = Instant::now();
+    let mut watching = false;
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let s = t0.elapsed().as_secs();
@@ -65,7 +73,17 @@ fn main() {
             break;
         }
         let peers = session.peers();
-        let mut line = format!("t {s:>3} mic {:>6.1}", voice.mic_db());
+        if let (Some(w), false) = (&watch, watching) {
+            if let Some(p) = peers.iter().find(|p| p.streaming && &p.name == w) {
+                let cfg = media::config::ViewerConfig { headless: true, ..Default::default() };
+                match session.watch(p.id, cfg, None) {
+                    Ok(_) => println!("voice: watching {w}"),
+                    Err(e) => eprintln!("voice: cannot watch {w}: {e}"),
+                }
+                watching = true;
+            }
+        }
+        let mut line = format!("t {s:>3} mic {:>6.1} max {:>6.1} raw {:>6.1}", voice.mic_db(), voice.mic_max_db(), voice.raw_max_db());
         let mut levels = voice.peer_db();
         levels.sort_by_key(|(id, _)| *id);
         for (id, db) in levels {

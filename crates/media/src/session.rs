@@ -87,6 +87,10 @@ struct State {
     voice: Option<Arc<Voice>>,
     /// Other members who said they are in voice.
     voice_members: std::collections::BTreeSet<PeerId>,
+    /// Our microphone off and sound off, as the others are told ("c/state").
+    voice_state: (bool, bool),
+    /// The others' microphone off and sound off.
+    voice_states: HashMap<PeerId, (bool, bool)>,
 }
 
 /// Peer ids in a direct session (no server, beta): the one who invited and the invited.
@@ -396,6 +400,34 @@ impl Session {
         self.state.lock().unwrap().voice_members.iter().copied().collect()
     }
 
+    /// The others in voice whose microphone (first) or sound (second) is off.
+    pub fn voice_states(&self) -> HashMap<PeerId, (bool, bool)> {
+        self.state.lock().unwrap().voice_states.clone()
+    }
+
+    /// Tells the others in voice whether our microphone and sound are off.
+    pub fn set_voice_state(&self, mic_off: bool, sound_off: bool) {
+        let members = {
+            let mut st = self.state.lock().unwrap();
+            if st.voice_state == (mic_off, sound_off) {
+                return;
+            }
+            st.voice_state = (mic_off, sound_off);
+            if st.voice.is_none() {
+                return;
+            }
+            st.voice_members.iter().copied().collect::<Vec<_>>()
+        };
+        for id in members {
+            self.send_voice_state(id);
+        }
+    }
+
+    fn send_voice_state(&self, id: PeerId) {
+        let (m, d) = self.state.lock().unwrap().voice_state;
+        self.voice_link(id).send("state", &format!("{} {}", m as u8, d as u8));
+    }
+
     fn voice_link(&self, id: PeerId) -> Arc<dyn Outbox> {
         Arc::new(Tagged { inner: self.client.to_peer(id), tag: VOICE })
     }
@@ -422,6 +454,15 @@ impl Session {
                         self.voice_link(from).send("hi", "");
                         self.voice_connect(&v, from);
                     }
+                    self.send_voice_state(from);
+                }
+            }
+            "state" => {
+                let mut f = payload.split(' ').map(|x| x == "1");
+                let s = (f.next().unwrap_or(false), f.next().unwrap_or(false));
+                let changed = self.state.lock().unwrap().voice_states.insert(from, s) != Some(s);
+                if changed {
+                    let _ = self.events.send(Event::VoiceMembers(self.voice_members()));
                 }
             }
             "bye" => self.voice_gone(from),
@@ -436,6 +477,7 @@ impl Session {
     fn voice_gone(&self, id: PeerId) {
         let (was, voice) = {
             let mut st = self.state.lock().unwrap();
+            st.voice_states.remove(&id);
             (st.voice_members.remove(&id), st.voice.clone())
         };
         if let Some(v) = voice {

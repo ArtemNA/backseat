@@ -159,9 +159,11 @@ fn video_source(cfg: &HostConfig) -> String {
 
 fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
     match cfg.source {
+        // Tests only: STREAMER_DEBUG_TEST_AUDIO=<audiotestsrc wave> instead of ticks (the
+        // echo gate needs sound all the time, as speech or a game has).
         Source::Bars | Source::Noise => gst::ElementFactory::make("audiotestsrc")
             .property("is-live", true)
-            .property_from_str("wave", "ticks")
+            .property_from_str("wave", &std::env::var("STREAMER_DEBUG_TEST_AUDIO").unwrap_or_else(|_| "ticks".into()))
             .property("volume", 0.3f64)
             .build()
             .map_err(|e| e.to_string()),

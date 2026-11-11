@@ -208,11 +208,16 @@ pub fn test_voice(window: &mut Window, cx: &mut Context<Shell>) {
                 }
                 let v = &s.snap.voice;
                 let name = |id: &u64| s.snap.peers.iter().find(|p| p.id == *id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
+                let levels: Vec<String> = core::voice_levels(&s.core).iter().map(|(id, db)| format!("{}:{db:.1}", name(id))).collect();
                 eprintln!(
-                    "test voice: t {since} joined {} members [{}] speaking [{}]",
+                    "test voice: t {since} joined {} members [{}] speaking [{}] muted [{}] deaf [{}] talking {} levels [{}]",
                     v.joined,
                     v.members.iter().map(name).collect::<Vec<_>>().join(","),
-                    v.speaking.iter().map(name).collect::<Vec<_>>().join(",")
+                    v.speaking.iter().map(name).collect::<Vec<_>>().join(","),
+                    v.muted.iter().map(name).collect::<Vec<_>>().join(","),
+                    v.deaf.iter().map(name).collect::<Vec<_>>().join(","),
+                    v.talking,
+                    levels.join(",")
                 );
             });
             if alive.is_err() {

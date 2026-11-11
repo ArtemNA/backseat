@@ -92,6 +92,7 @@ pub enum SetTab {
     General,
     Stream,
     Watch,
+    Voice,
     Updates,
 }
 
@@ -103,6 +104,8 @@ pub struct SettingsState {
     pub update: Option<core::update::Release>,
     scroll: ScrollHandle,
     _subs: Vec<Subscription>,
+    /// Voice activity threshold slider.
+    pub threshold: Entity<gpui_kit::component::slider::SliderState>,
 }
 
 #[derive(Default)]
@@ -162,6 +165,15 @@ fn set_pref(section: Option<&str>, key: &str, value: &str) {
             set_setting(sec, s);
         }
     }
+}
+
+/// Microphones or speakers for a settings list: the system's default first (value ""),
+/// then each device by id.
+fn devices(input: bool) -> Vec<(&'static str, String)> {
+    let mut out = vec![("", t("voice.default").to_string())];
+    // The ids live as long as the app: the lists are made when the settings open.
+    out.extend(core::audio_devices(input).into_iter().map(|d| (Box::leak(d.id.into_boxed_str()) as &'static str, d.name)));
+    out
 }
 
 /// A segmented switch: options on a sunk strip, the chosen one lighter.
@@ -665,6 +677,10 @@ impl Shell {
             (Some("watch"), "fps", rows(&[("", t("set.as_streamer")), ("60", plain("60")), ("30", plain("30"))])),
             (Some("watch"), "kbit", with_kbits(&t("set.as_streamer"))),
             (None, "lang", rows(&LANGS.map(|(id, name)| (id, plain(name))))),
+            (Some("voice"), "mic", devices(true)),
+            (Some("voice"), "out", devices(false)),
+            (Some("voice"), "mode", rows(&[("", t("voice.mode_va")), ("ptt", t("voice.mode_ptt"))])),
+            (Some("voice"), "key", rows(&crate::voice_ui::PTT_KEYS.map(|(k, n)| (k, plain(n))))),
         ];
         let mut prefs = vec![];
         for (section, key, items) in defs {
@@ -674,16 +690,21 @@ impl Shell {
             let values: Vec<&'static str> = items.iter().map(|(v, _)| *v).collect();
             let picker = cx.new(|cx| SelectState::new(labels, Some(IndexPath::new(row)), window, cx));
             let vals = values.clone();
-            subs.push(cx.subscribe_in(&picker, window, move |_, p, e: &SelectEvent<Vec<SharedString>>, _, cx| {
+            subs.push(cx.subscribe_in(&picker, window, move |this: &mut Shell, p, e: &SelectEvent<Vec<SharedString>>, _, cx| {
                 let SelectEvent::Confirm(_) = e;
                 let row = p.read(cx).selected_index(cx).map_or(0, |i| i.row);
                 set_pref(section, key, vals.get(row).copied().unwrap_or(""));
+                if section == Some("voice") {
+                    crate::voice_ui::apply_settings(&this.core);
+                }
                 cx.notify();
             }));
             prefs.push(Pref { section, key, values, picker });
         }
         let update = self.update.clone().or_else(|| self.dialogs.settings.as_ref().and_then(|s| s.update.clone()));
-        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs });
+        let (threshold, sub) = self.threshold_slider(window, cx);
+        subs.push(sub);
+        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold });
         self.dialogs.open = Some(Open::Settings);
         cx.notify();
     }
@@ -695,6 +716,9 @@ impl Shell {
         let Some(row) = p.values.iter().position(|v| *v == value) else { return false };
         p.picker.update(cx, |s, cx| s.set_selected_index(Some(IndexPath::new(row)), window, cx));
         set_pref(section, key, value);
+        if section == Some("voice") {
+            crate::voice_ui::apply_settings(&self.core);
+        }
         true
     }
 
@@ -826,6 +850,31 @@ impl Shell {
                 .child(field(tu("set.max_fps"), pick(Some("watch"), "fps")))
                 .child(field(tu("set.max_kbit"), pick(Some("watch"), "kbit")))
                 .into_any_element(),
+            SetTab::Voice => {
+                let (sounds, ptt_sounds) = (settings().get("voiceSounds").and_then(|v| v.as_bool()) != Some(false), settings().get("pttSounds").and_then(|v| v.as_bool()) != Some(false));
+                let ptt = pref("voice", "mode") == "ptt";
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(small(t("voice.settings_hint")))
+                    .child(field(tu("voice.mic"), pick(Some("voice"), "mic")))
+                    .child(field(tu("voice.speakers"), pick(Some("voice"), "out")))
+                    .child(field(tu("voice.mode"), pick(Some("voice"), "mode")))
+                    .when(ptt, |d| d.child(field(tu("voice.key"), pick(Some("voice"), "key"))).child(small(t("voice.key_hint"))))
+                    .when(!ptt, |d| d.child(crate::voice_ui::threshold_view(&st.threshold, core::mic_input_db(&self.core))))
+                    .child(Checkbox::new("set-voice-sounds").cursor_pointer().label(t("voice.sounds")).checked(sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
+                        set_setting("voiceSounds", serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    })))
+                    .child(Checkbox::new("set-ptt-sounds").cursor_pointer().label(t("voice.ptt_sounds")).checked(ptt_sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
+                        set_setting("pttSounds", serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    })))
+                    .into_any_element()
+            }
             SetTab::Updates => div()
                 .flex()
                 .flex_col()
@@ -863,7 +912,7 @@ impl Shell {
                     .gap_4()
                     .px_6()
                     .pb_4()
-                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)))
+                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Voice, "tab-voice", t("set.voice"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)))
                     .child(div().id("set-page").flex_1().min_w_0().overflow_y_scroll().track_scroll(&st.scroll).child(div().pb_2().pr_3().child(page)).vertical_scrollbar(&st.scroll)),
             )
             .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").cursor_pointer().primary().label(t("set.close")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
@@ -936,6 +985,7 @@ pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
             let tab = match tab.as_str() {
                 "stream" => SetTab::Stream,
                 "watch" => SetTab::Watch,
+                "voice" => SetTab::Voice,
                 "updates" => SetTab::Updates,
                 _ => SetTab::General,
             };

@@ -40,6 +40,7 @@ GStreamer 1.28.8 build; source: <https://gitlab.freedesktop.org/gstreamer/gst-pl
 | zlib | `z-1.dll` | zlib |
 | usrsctp (inside `gstsctp-1.0-0.dll`) | | BSD 3-clause |
 | dav1d (AV1 decoding on the CPU) | `dav1d.dll` | BSD 2-clause |
+| WebRTC audio processing (voice chat: echo cancelling, noise suppression; inside `gstwebrtcdsp.dll`) | | BSD 3-clause |
 | Microsoft Visual C++ runtime | `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` | Microsoft Visual Studio redistributable |
 
 ## Rust crates
