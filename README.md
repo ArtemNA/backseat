@@ -42,6 +42,8 @@ good connection) and the picture as sharp as your upload allows.
   nobody has to reconnect.
 - **Comfortable to watch:** video inside the app or in its own window, fullscreen,
   volume and mute right on the video, stats with F3.
+- **Light:** a native window drawn on the graphics card, one process and no browser engine
+  inside; it needs nothing else installed.
 - **Stays out of the way:** closing the window keeps Backseat in the tray. It updates
   itself.
 - **Direct connection (beta):** two people can connect with no server at all (see below).
@@ -110,7 +112,6 @@ Good to know before you use it:
   cards from the last several years).
 - To **watch**: any reasonably recent PC. AV1 streams are decoded on the processor when
   the graphics card cannot decode AV1.
-- Microsoft Edge WebView2, which Windows 11 has. The installer adds it when missing.
 
 ## Tips
 
@@ -170,13 +171,11 @@ workload, GStreamer 1.28.8 (the official MSVC x86_64 installer from
 ```powershell
 $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = 'C:\path\to\gstreamer\1.0\msvc_x86_64\'
 .\tools\bundle.ps1                     # dist\backseat: the app with the DLLs it needs
-.\tools\installer.ps1 -WebView2 .\MicrosoftEdgeWebview2Setup.exe
-                                       # dist\backseat-setup-X.Y.Z.exe
+.\tools\installer.ps1                  # dist\backseat-setup-X.Y.Z.exe
 ```
 
 `bundle.ps1` copies the GStreamer libraries and plugins the app uses, the Visual C++
-runtime and the license texts, and fails if any DLL import does not resolve. The
-WebView2 bootstrapper is at <https://go.microsoft.com/fwlink/p/?LinkId=2124703>.
+runtime and the license texts, and fails if any DLL import does not resolve.
 A build can have one server built in, with no server field in the app: pass
 `-Server wss://HOST/ws` to `tools\installer.ps1`.
 

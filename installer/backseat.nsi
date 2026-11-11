@@ -1,6 +1,6 @@
 ; Per-user installer for Backseat (no administrator rights needed, like most chat apps).
 ; Built by tools\installer.ps1 from the folder tools\bundle.ps1 makes:
-;   makensis /DVERSION=0.1.0 /DSRC=dist\backseat /DWEBVIEW2=...\MicrosoftEdgeWebview2Setup.exe /DOUT=dist\backseat-setup.exe installer\backseat.nsi
+;   makensis /DVERSION=0.1.0 /DSRC=dist\backseat /DOUT=dist\backseat-setup.exe installer\backseat.nsi
 Unicode true
 SetCompressor /SOLID lzma
 RequestExecutionLevel user
@@ -10,8 +10,6 @@ RequestExecutionLevel user
 
 !define NAME "Backseat"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${NAME}"
-; WebView2 Runtime client id (Microsoft documentation, "Detect if a WebView2 Runtime is installed").
-!define WV2_ID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 Name "${NAME}"
 OutFile "${OUT}"
@@ -38,10 +36,6 @@ VIAddVersionKey "LegalCopyright" ""
 !insertmacro MUI_LANGUAGE "Ukrainian"
 !insertmacro MUI_LANGUAGE "Russian"
 
-LangString NoWebView2 ${LANG_ENGLISH} "Backseat needs Microsoft Edge WebView2 Runtime, and it could not be installed (is the computer offline?).$\r$\n$\r$\nConnect to the internet and run this installer again, or install WebView2 from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-LangString NoWebView2 ${LANG_UKRAINIAN} "Для Backseat потрібен Microsoft Edge WebView2 Runtime, але встановити його не вдалося (немає інтернету?).$\r$\n$\r$\nПідключіться до інтернету й запустіть інсталятор ще раз або встановіть WebView2 з https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-LangString NoWebView2 ${LANG_RUSSIAN} "Для Backseat нужен Microsoft Edge WebView2 Runtime, но установить его не удалось (нет интернета?).$\r$\n$\r$\nПодключитесь к интернету и запустите установщик ещё раз или установите WebView2 с https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-
 ; Closes a running Backseat from this install folder: its files cannot be replaced or
 ; removed while it runs ("Error opening file for writing: ...\MSVCP140.dll").
 !macro CloseRunning
@@ -57,21 +51,6 @@ LangString NoWebView2 ${LANG_RUSSIAN} "Для Backseat нужен Microsoft Edge
   Pop $0
   Sleep 500
 !macroend
-
-Function HasWebView2
-  ; Leaves "1" on the stack when a WebView2 Runtime is installed for the machine or the user.
-  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WV2_ID}" "pv"
-  ${If} $0 == ""
-  ${OrIf} $0 == "0.0.0.0"
-    ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\${WV2_ID}" "pv"
-  ${EndIf}
-  ${If} $0 == ""
-  ${OrIf} $0 == "0.0.0.0"
-    Push "0"
-  ${Else}
-    Push "1"
-  ${EndIf}
-FunctionEnd
 
 Section "Backseat" Main
   SectionIn RO
@@ -90,24 +69,6 @@ Section "Backseat" Main
   ; A previous version's plugins must not linger next to the new ones.
   RMDir /r "$INSTDIR\gstreamer-1.0"
   File /r "${SRC}\*"
-
-  Call HasWebView2
-  Pop $1
-  ${If} $1 == "0"
-    DetailPrint "Installing Microsoft Edge WebView2 Runtime..."
-    SetOutPath "$PLUGINSDIR"
-    File "/oname=MicrosoftEdgeWebview2Setup.exe" "${WEBVIEW2}"
-    ExecWait '"$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe" /silent /install' $2
-    DetailPrint "WebView2 setup exit code: $2"
-    SetOutPath "$INSTDIR"
-    ; The bootstrapper downloads the runtime; without internet it cannot.
-    Call HasWebView2
-    Pop $1
-    ${If} $1 == "0"
-      DetailPrint "WebView2 Runtime is still missing"
-      MessageBox MB_OK|MB_ICONEXCLAMATION "$(NoWebView2)" /SD IDOK
-    ${EndIf}
-  ${EndIf}
 
   ; The plugin registry is a cache rebuilt on start; drop the old one.
   Delete "$LOCALAPPDATA\${NAME}\gst-registry-*.bin"
@@ -144,8 +105,12 @@ Section "Uninstall"
   Delete "$INSTDIR\backseat.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
-  ; Logs and the plugin cache; the user's settings in the WebView2 profile stay.
-  RMDir /r "$LOCALAPPDATA\${NAME}"
+  ; Logs, the plugin cache and the saved places go; the rooms and settings (state.json)
+  ; stay, as they did in the WebView2 profile, for a later install.
+  RMDir /r "$LOCALAPPDATA\${NAME}\logs"
+  Delete "$LOCALAPPDATA\${NAME}\gst-registry-*.bin"
+  Delete "$LOCALAPPDATA\${NAME}\places.json"
+  RMDir "$LOCALAPPDATA\${NAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\Classes\backseat"
 SectionEnd

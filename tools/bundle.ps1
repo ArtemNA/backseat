@@ -53,7 +53,8 @@ if (-not $NoBuild) {
   $env:PKG_CONFIG_PATH = "$Gst\lib\pkgconfig"
   # Compiled into the app (option_env!); empty means the user types the server.
   $env:STREAMER_SERVER_URL = $Server
-  cargo build --release -p app
+  # The app with the native UI (crates/app-gpui; its exe is app.exe).
+  cargo build --release -p app-gpui
   Remove-Item Env:STREAMER_SERVER_URL -ErrorAction SilentlyContinue
   if ($LASTEXITCODE) { throw 'build failed' }
 }
@@ -96,7 +97,7 @@ while ($todo.Count) {
 foreach ($l in $licenses) { Copy-Item "$Gst\share\licenses\$l" "$Out\licenses\" -Recurse }
 Copy-Item "$root\THIRD-PARTY.md" "$Out\licenses\"
 # Every crate compiled into backseat.exe for Windows, with its license.
-$crates = cargo tree -p app --target x86_64-pc-windows-msvc -e normal --prefix none --format '{p}  {l}' 2>$null |
+$crates = cargo tree -p app-gpui --target x86_64-pc-windows-msvc -e normal --prefix none --format '{p}  {l}' 2>$null |
   ForEach-Object { $_ -replace ' \(.*?\)', '' -replace ' \(\*\)$', '' } | Sort-Object -Unique
 if (-not $crates) { throw 'cargo tree gave no crate list' }
 @('Rust crates in backseat.exe (name version  license)', '') + $crates | Set-Content "$Out\licenses\rust-crates.txt"

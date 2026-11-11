@@ -2,9 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
-## Unreleased
+## 0.2.0
 
-- The join form scrolls when it is taller than the window (a direct connection's texts in a small window) instead of being cut off at the top and bottom.
+- **A native window instead of the webview.** Backseat now draws its own window; Microsoft Edge WebView2 is no longer needed, and the app runs as one process instead of seven. It uses about 80–140 MB less memory (in a room, watching or streaming) and less processor time while watching.
+- Your rooms, settings and language carry over from 0.1.9. Coming straight from 0.1.8 or older, the room list starts empty: join your rooms again with their invites.
+- The join form scrolls when it is taller than the window (a direct connection's texts in a small window), and a long list of rooms on the left scrolls instead of squeezing.
+- Uninstalling keeps your rooms and settings, as before.
 
 ## 0.1.9
 

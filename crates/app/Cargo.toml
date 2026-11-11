@@ -1,18 +1,18 @@
 [package]
-name = "app"
+name = "app-webview"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# The former webview UI, kept to check that both read the same state file.
+[[bin]]
+name = "app-webview"
+path = "src/main.rs"
+
 [dependencies]
-gst.workspace = true
+backseat-core = { path = "../backseat-core" }
 media.workspace = true
-protocol = { path = "../protocol" }
 tauri = { version = "2", features = ["tray-icon"] }
-ureq = "3"
-sha2 = "0.10"
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

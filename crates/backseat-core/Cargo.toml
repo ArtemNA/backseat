@@ -1,0 +1,16 @@
+[package]
+name = "backseat-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Everything the app does apart from drawing its window: rooms, the direct connection,
+# streaming and watching, short codes, the state file, updates. Both UIs use it.
+[dependencies]
+gst.workspace = true
+media.workspace = true
+protocol = { path = "../protocol" }
+ureq = "3"
+sha2 = "0.10"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }

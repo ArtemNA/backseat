@@ -49,7 +49,7 @@ BSD, zlib, ISC, Unicode, Unlicense and MPL 2.0 licenses (the MPL 2.0 crates are 
 unmodified; their source is on crates.io). The full list with each crate's license is in
 `licenses/rust-crates.txt`.
 
-## Microsoft Edge WebView2
+## User interface
 
-The user interface runs in Microsoft Edge WebView2, which is part of Windows 11 and is
-installed from Microsoft when missing. It is not shipped in this folder.
+The window is drawn with GPUI (from the Zed editor, Apache 2.0) and gpui-component (Apache
+2.0), with Lucide icons (ISC); they are among the crates in `licenses/rust-crates.txt`.
