@@ -414,7 +414,7 @@ impl Shell {
         let label = |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(text);
         let server_row = core::built_in().is_none() && mode != Mode::Direct;
         // Like the webview: the darkest page, the form a card on it, fields darker than the card.
-        div().id("join-page").size_full().bg(rgb(color::RAIL)).overflow_y_scroll().track_scroll(&self.join.scroll).vertical_scrollbar(&self.join.scroll).flex().flex_col().items_center().child(
+        div().id("join-page").size_full().bg(rgb(color::RAIL)).overflow_y_scroll().track_scroll(&self.join.scroll).child(div().min_h_full().flex().flex_col().items_center().child(
             div()
                 .my_auto()
                 .py_8()
@@ -436,7 +436,7 @@ impl Shell {
                     seg_bar()
                         .child(seg("m-create", "Create a room", mode == Mode::Create).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Create, cx))))
                         .child(seg("m-code", "I have an invite", mode == Mode::Code).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Code, cx))))
-                        .child(seg("m-direct", "Direct (beta)", mode == Mode::Direct).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Direct, cx)))),
+                        .child(seg("m-direct", "Direct", mode == Mode::Direct).child(crate::beta()).on_click(cx.listener(|s, _, _, cx| s.set_mode(Mode::Direct, cx)))),
                 )
                 .when(mode == Mode::Create, |d| d.child(label("ROOM NAME")).child(sunk(Input::new(&j.title))))
                 .when(mode == Mode::Code, |d| d.child(label("INVITE CODE OR LINK")).child(sunk(Input::new(&j.code))))
@@ -458,7 +458,8 @@ impl Shell {
                     })))
                 }),
                 ),
-        )
+        ))
+        .vertical_scrollbar(&self.join.scroll)
     }
 
     fn render_direct(&self, cx: &mut Context<Self>) -> impl IntoElement {

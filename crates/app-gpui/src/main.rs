@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod join;
+mod room;
 mod tray;
 
 use backseat_core::{self as core, App as Core, Snapshot};
@@ -84,6 +85,14 @@ struct Shell {
     prev_direct: Option<&'static str>,
     /// The direct form starts over at the next refresh (it needs the window).
     reset_pending: bool,
+    room: room::Room,
+    /// When the message in `error` came, so a notice in a room goes away after a while.
+    error_since: Option<std::time::Instant>,
+}
+
+/// One value of the state file.
+pub(crate) fn state_value(key: &str) -> Option<serde_json::Value> {
+    core::state_load().remove(key)
 }
 
 /// The saved settings (the state file's "settings" object).
@@ -111,7 +120,7 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None };
         // With a saved room, start in the last one opened. Not when a test joins by itself.
         if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none()) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
@@ -123,6 +132,7 @@ impl Shell {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update_in(cx, |s, window, cx| {
                 s.tick(cx);
+                s.sync_tiles(window, cx);
                 if s.reset_pending {
                     s.reset_pending = false;
                     s.reset_direct(window, cx);
@@ -136,13 +146,26 @@ impl Shell {
         test_actions(cx);
         join::test_direct(window, cx);
         join::test_form(window, cx);
+        room::test_click_watch(window, cx);
+        room::test_quality(window, cx);
         shell
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.snap = core::snapshot(&self.core);
         if let Some(n) = self.snap.notice.clone() {
-            self.error = Some(n);
+            let (kind, rest) = n.split_once(':').unwrap_or((n.as_str(), ""));
+            self.error = Some(match kind {
+                "direct_ended" => "The direct connection ended.".into(),
+                "lost" => "Lost the connection to the server.".into(),
+                "watch_ended" => format!("Stream ended: {rest}"),
+                _ => format!("Error: {rest}"),
+            });
+            self.error_since = Some(std::time::Instant::now());
+        }
+        if self.error.is_some() && self.snap.connected && self.error_since.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
+            self.error = None;
+            self.error_since = None;
         }
         if let Some(link) = self.snap.link.clone() {
             self.handle_link(&link, cx);
@@ -173,6 +196,7 @@ impl Shell {
             self.current = Some(r);
         }
         self.report();
+        self.report_room();
         cx.notify();
     }
 
@@ -301,16 +325,17 @@ impl Shell {
                 .rounded(px(24.))
                 .bg(rgb(color::MAIN))
                 .text_color(rgb(color::GREEN))
-                .text_size(px(24.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(color::GREEN)).text_color(rgb(color::BRIGHT)).rounded(px(16.)))
-                .child("+")
+                // An icon, not a "+" character: a font's plus sits off centre.
+                .child(gpui_kit::component::Icon::default().path("icons/plus.svg").size_6())
                 .on_click(cx.listener(|this, _, _, cx| this.open_join(cx))),
         )
     }
 
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.snap.direct.is_some() { "Direct connection (beta)".to_string() } else { self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into()) };
+        let direct = self.snap.direct.is_some();
+        let title = if direct { "Direct connection".to_string() } else { self.snap.title.clone().or_else(|| self.current.as_ref().map(Room::label)).unwrap_or_else(|| "Backseat".into()) };
         let invite = self.current.clone().filter(|_| self.snap.connected && self.snap.direct.is_none());
         let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).or_else(|| self.current.as_ref().map(|c| c.name.clone())).unwrap_or_default();
         let live = self.snap.live.is_some();
@@ -330,9 +355,9 @@ impl Shell {
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(color::LINE))
-                    .child(div().flex_1().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(title))
+                    .child(div().flex_1().min_w_0().flex().items_center().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(title).when(direct, |d| d.child(beta())))
                     .when_some(invite, |d, r| {
-                        d.child(div().id("invite").px_1p5().rounded_sm().cursor_pointer().text_color(rgb(color::MUTED)).hover(|s| s.text_color(rgb(color::BRIGHT))).child("Invite").on_click(cx.listener(move |this, _, _, cx| {
+                        d.child(icon_button("invite", "icons/user-plus.svg", "Invite", color::BRIGHT).on_click(cx.listener(move |this, _, _, cx| {
                             let code = if join::is_code(&r.room) { join::fmt_code(&r.room) } else { r.room.clone() };
                             let text = if join::is_code(&r.room) { format!("Join me in Backseat: {}, invite code {}", r.label(), code) } else { code.clone() };
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -341,24 +366,31 @@ impl Shell {
                         })))
                     })
                     .when(self.snap.connected, |d| {
-                        d.child(div().id("leave").px_1p5().rounded_sm().cursor_pointer().text_color(rgb(color::MUTED)).hover(|s| s.text_color(rgb(color::LIVE))).child("Leave").on_click(cx.listener(|this, _, _, cx| this.leave(cx))))
+                        d.child(icon_button("leave", "icons/log-out.svg", "Leave room", color::LIVE).on_click(cx.listener(|this, _, _, cx| this.leave(cx))))
                     }),
             )
-            .child(div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(format!("IN THE ROOM — {}", self.snap.peers.len())))
-            .child(
-                div().id("people").flex_1().overflow_y_scroll().children(self.snap.peers.iter().map(|p| {
+            .child({
+                let person = |p: &backseat_core::PeerView| {
                     row()
                         .child(avatar(&p.name))
-                        .child(div().flex_1().text_color(rgb(if p.me { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
+                        .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_color(rgb(if p.me { color::BRIGHT } else { color::TEXT })).child(if p.me { format!("{} (You)", p.name) } else { p.name.clone() }))
                         .when(p.streaming, |d| d.child(div().px_1p5().rounded_sm().bg(rgb(color::LIVE)).text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child("LIVE")))
-                })),
-            )
+                };
+                let section = |t: String| div().px_4().pt_4().pb_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(t);
+                let live: Vec<_> = self.snap.peers.iter().filter(|p| p.streaming).collect();
+                let rest: Vec<_> = self.snap.peers.iter().filter(|p| !p.streaming).collect();
+                div()
+                    .id("people")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(self.snap.connected, |d| d.child(section(format!("LIVE — {}", live.len()))).children(live.iter().map(|p| person(p))).child(section(format!("IN THE ROOM — {}", rest.len()))).children(rest.iter().map(|p| person(p))))
+            })
             .child(
                 row()
                     .h(px(56.))
                     .bg(rgb(color::BAR))
                     .child(avatar(&me))
-                    .child(div().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(color::MUTED)).child(if live { "Live" } else { "Not live" }))),
+                    .child(div().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => "not live".into() }))),
             )
     }
 
@@ -367,9 +399,6 @@ impl Shell {
             "Connecting…".to_string()
         } else if let Some(e) = &self.error {
             format!("Could not join: {e}")
-        } else if self.snap.connected {
-            let streams = self.snap.peers.iter().filter(|p| p.streaming && !p.me).count();
-            format!("{streams} streaming. Watching comes in stage 3.")
         } else if self.rooms.is_empty() {
             "No rooms yet. Joining and making rooms comes in stage 2.".into()
         } else {
@@ -387,6 +416,28 @@ impl Shell {
     }
 }
 
+/// The "BETA" badge, like the webview's: small, bold, on orange.
+pub(crate) fn beta() -> Div {
+    div().ml_1p5().px(px(5.)).py(px(1.)).rounded(px(4.)).bg(rgb(0xb5652a)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child("BETA")
+}
+
+/// A small icon button in a header: grey, `hover` colour under the pointer, a tooltip.
+pub(crate) fn icon_button(id: &'static str, icon: &'static str, tip: &'static str, hover: u32) -> Stateful<Div> {
+    use gpui_kit::component::{Icon, Sizable as _};
+    div()
+        .id(id)
+        .size_7()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(rgb(color::MUTED))
+        .hover(move |s| s.text_color(rgb(hover)).bg(rgb(0x3a3c42)))
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+        .child(Icon::default().path(icon).small())
+}
+
 fn row() -> Div {
     div().flex().items_center().gap_2p5().px_4().py_1p5()
 }
@@ -400,6 +451,8 @@ impl Render for Shell {
         if let Some(code) = self.join.pending_code.take() {
             self.join.code.update(cx, |i, cx| i.set_value(code, window, cx));
         }
+        self.sync_videos_hidden();
+        self.sync_tiles(window, cx);
         if self.join_shown() {
             return div().size_full().font_family("Segoe UI").text_size(px(14.)).text_color(rgb(color::TEXT)).child(self.render_join(window, cx)).into_any_element();
         }
@@ -412,8 +465,30 @@ impl Render for Shell {
             .bg(rgb(color::MAIN))
             .child(self.rail(cx))
             .child(self.side(cx))
-            .child(self.main())
+            .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() })
             .into_any_element()
+    }
+}
+
+// Icons (lucide): gpui-kit's default set for its components, plus the few this app uses that
+// the default set leaves out. Only these are in the exe, not the whole catalog.
+gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus]);
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = ExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_kit::assets::Assets.load(path)
+    }
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 }
 
@@ -467,7 +542,7 @@ fn test_actions(cx: &mut Context<Shell>) {
 
 fn main() {
     let Some(core) = core::start(|_, _| show_main_window()) else { return };
-    gpui_kit::application().run(move |cx: &mut App| {
+    gpui_kit::application().with_assets(AppAssets).run(move |cx: &mut App| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         // The webview's colours for fields and buttons: fields darker than the card with a
@@ -501,6 +576,11 @@ fn main() {
             // ...and their text colour from the plain colours.
             t.button_primary_foreground = h(0xffffff);
             t.button_foreground = h(0xffffff);
+            t.tokens.button_danger = h(0xa1282f).into();
+            t.tokens.button_danger_hover = h(0xb8323a).into();
+            t.tokens.button_danger_active = h(0x8c2229).into();
+            t.tokens.button_danger_foreground = h(0xffffff).into();
+            t.button_danger_foreground = h(0xffffff);
         }
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(800.)), cx)),
