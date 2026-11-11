@@ -548,12 +548,12 @@ function systemLanguage() {
 }
 
 let lang = (() => {
-  try { return localStorage.getItem('lang') || systemLanguage(); } catch { return systemLanguage(); }
+  try { return stored('lang') || systemLanguage(); } catch { return systemLanguage(); }
 })();
 
 function setLanguage(id) {
   lang = STRINGS[id] ? id : 'en';
-  try { localStorage.setItem('lang', lang); } catch {}
+  try { store('lang', lang); } catch {}
   document.documentElement.lang = lang;
   try { window.__TAURI__.core.invoke('set_ui_language', { lang }); } catch {}
 }

@@ -311,6 +311,43 @@ async fn shortcode_get(code: String) -> Result<String, String> {
     .inspect_err(|e| eprintln!("shortcode: get failed: {e}"))
 }
 
+/// The UI's saved rooms and settings, mirrored from localStorage: another build of the app
+/// (one without WebView2) reads them from here.
+fn state_file() -> Option<std::path::PathBuf> {
+    // Test runs keep their own WebView2 profiles; only the state gate may write the file.
+    let testing = std::env::vars().any(|(k, _)| k.starts_with("STREAMER_APP_") && k != "STREAMER_APP_TEST_STATE");
+    if testing && std::env::var_os("STREAMER_APP_TEST_STATE").is_none() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Backseat").join("state.json"))
+}
+
+/// Writes the state file whole: a temporary file first, then a rename over the old one.
+#[tauri::command]
+fn state_save(json: String) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if !value.is_object() {
+        return Err("the state is not a JSON object".into());
+    }
+    let Some(path) = state_file() else { return Ok(()) };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    // The text as the UI made it (checked above): keys keep the UI's order.
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        eprintln!("state: save failed: {e}");
+        e.to_string()
+    })
+}
+
+/// Tests only: STREAMER_APP_TEST_STATE=fill|show (see app.js).
+#[tauri::command]
+fn test_state() -> Option<String> {
+    std::env::var("STREAMER_APP_TEST_STATE").ok()
+}
+
 /// Opens the log folder in Explorer, for sending logs with a bug report.
 #[tauri::command]
 fn open_logs() -> Result<(), String> {
@@ -644,7 +681,7 @@ fn test_form() -> Option<String> {
 
 #[tauri::command]
 fn test_report(msg: String) {
-    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() || std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some() || std::env::var_os("STREAMER_APP_TEST_DIRECT").is_some() {
+    if std::env::var_os("STREAMER_APP_TEST_FORM").is_some() || std::env::var_os("STREAMER_APP_OPEN_GOLIVE").is_some() || std::env::var_os("STREAMER_APP_TEST_DIRECT").is_some() || std::env::var_os("STREAMER_APP_TEST_STATE").is_some() {
         eprintln!("test: {msg}");
     }
 }
@@ -1034,7 +1071,7 @@ fn main() {
             }
         })
         .manage(app)
-        .invoke_handler(tauri::generate_handler![shortcode_put, shortcode_get, open_logs, test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
+        .invoke_handler(tauri::generate_handler![state_save, test_state, shortcode_put, shortcode_get, open_logs, test_direct, test_put, test_get, direct_invite, direct_accept, direct_answer, test_prefs, test_open_settings, update_live, updates_enabled, set_close_to_tray, app_version, check_update, install_update, codecs, set_muted, test_form, test_report, test_click_watch, test_autojoin, test_rooms, video_place, videos_hidden, set_ui_language, built_in_server, test_ui_stress, test_upload_limit, video_window_do, thumbnails, test_open_golive, forced_language, snapshot, connect, leave, sources, go_live, end_live, watch, unwatch, set_quality])
         .build(tauri::generate_context!())
         .expect("tauri app")
         .run(|h, e| {

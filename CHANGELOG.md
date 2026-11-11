@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## Unreleased
+
+- Your rooms and settings are now also kept in `%LOCALAPPDATA%\Backseat\state.json`, so later versions can carry them over.
+
 ## 0.1.8
 
 - **Direct connection (beta).** Two people can connect with no server at all: one makes an invite, the other answers, and you swap these two texts once through any messenger. Then either of you can stream to the other, both at once too. Only for two people and with no reconnection: see the README for what to know before using it.

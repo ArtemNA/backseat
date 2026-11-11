@@ -15,10 +15,10 @@ const el = (tag, attrs = {}, ...kids) => {
 const PRESETS = [2000, 4000, 8000, 12000, 15000, 20000, 35000, 50000];
 // The streamer's own upload limit in Mbit/s, or 0 when unknown.
 function uploadLimit() {
-  try { return Math.max(0, +localStorage.getItem('uploadLimit') || 0); } catch { return 0; }
+  try { return Math.max(0, +stored('uploadLimit') || 0); } catch { return 0; }
 }
 function setUploadLimit(v) {
-  try { if (v > 0) localStorage.setItem('uploadLimit', String(v)); else localStorage.removeItem('uploadLimit'); } catch {}
+  try { if (v > 0) store('uploadLimit', String(v)); else unstore('uploadLimit'); } catch {}
 }
 const fmt = (v) => v.toLocaleString(lang, { maximumFractionDigits: 1 });
 const VIEW_MODES = ['1440p60', '1080p60', '1080p30', '720p60', '720p30'];
@@ -97,10 +97,10 @@ async function call(cmd, args, errBox) {
 // Rooms the user has been in, shown in the left rail like Discord servers. Only the open
 // one is joined; the others are shortcuts.
 function savedRooms() {
-  try { return JSON.parse(localStorage.getItem('rooms') || '[]'); } catch { return []; }
+  try { return JSON.parse(stored('rooms') || '[]'); } catch { return []; }
 }
 function saveRooms(list) {
-  try { localStorage.setItem('rooms', JSON.stringify(list)); } catch {}
+  try { store('rooms', JSON.stringify(list)); } catch {}
 }
 const sameRoom = (a, b) => a && b && a.room === b.room && a.server === b.server;
 // Rooms made here are named by a random invite code (Crockford base32, 12 symbols, about
@@ -150,7 +150,7 @@ async function handleLink(link) {
   const fixed = await invoke('built_in_server');
   const server = fixed || settings().server || (state.current && state.current.server) || $('f-server').value.trim();
   let name = (state.current && state.current.name) || '';
-  try { name = name || JSON.parse(localStorage.getItem('join') || '{}').name || ''; } catch {}
+  try { name = name || JSON.parse(stored('join') || '{}').name || ''; } catch {}
   if (name) { await switchRoom({ server, room: code, name }); return; }
   // First time: ask for a name, the code is filled in.
   state.joinMode = 'code';
@@ -182,8 +182,8 @@ async function joinRoom(r) {
   await call('connect', { server: r.server, room: r.room, name: r.name, title: r.title || null }, $('join-error'));
   state.current = r;
   rememberRoom(r);
-  try { localStorage.setItem('lastRoom', JSON.stringify(r)); } catch {}
-  try { localStorage.setItem('join', JSON.stringify(r)); } catch {}
+  try { store('lastRoom', JSON.stringify(r)); } catch {}
+  try { store('join', JSON.stringify(r)); } catch {}
   state.joinOpen = false;
   state.cardsKey = '';
   tick();
@@ -258,7 +258,7 @@ $('rename').addEventListener('close', async () => {
 // ---------- join ----------
 function loadForm() {
   try {
-    const saved = JSON.parse(localStorage.getItem('join') || '{}');
+    const saved = JSON.parse(stored('join') || '{}');
     for (const k of ['server', 'name']) if (saved[k]) $('f-' + k).value = saved[k];
   } catch {}
   // The default server from the settings comes first.
@@ -276,10 +276,10 @@ function loadForm() {
 // ---------- settings ----------
 function settings() {
   const base = { tray: true, autoUpdate: true, server: '' };
-  try { return { ...base, ...JSON.parse(localStorage.getItem('settings') || '{}') }; } catch { return base; }
+  try { return { ...base, ...JSON.parse(stored('settings') || '{}') }; } catch { return base; }
 }
 function saveSettings(s) {
-  try { localStorage.setItem('settings', JSON.stringify(s)); } catch {}
+  try { store('settings', JSON.stringify(s)); } catch {}
 }
 function setTab(tab) {
   for (const b of document.querySelectorAll('.set-tabs button')) b.setAttribute('aria-pressed', String(b.dataset.tab === tab));
@@ -520,7 +520,7 @@ function render(s) {
     // The server's title wins: a room joined by code learns its name here.
     state.current = { ...(state.current && state.current.room === s.room ? state.current : { server: $('f-server').value.trim(), name: me.name }), room: s.room, title: s.title || (state.current && state.current.title) || null };
     rememberRoom(state.current);
-    try { localStorage.setItem('lastRoom', JSON.stringify(state.current)); } catch {}
+    try { store('lastRoom', JSON.stringify(state.current)); } catch {}
   }
   $('room-name').textContent = s.title || s.room;
   $('room-name').title = isCode(s.room) ? fmtCode(s.room) : s.room;
@@ -544,7 +544,7 @@ function renderLobby(s) {
   $('room-name').title = '';
   $('people').replaceChildren();
   let name = '';
-  try { name = JSON.parse(localStorage.getItem('join') || '{}').name || ''; } catch {}
+  try { name = JSON.parse(stored('join') || '{}').name || ''; } catch {}
   $('me-avatar').replaceWith(Object.assign(avatar(name || '?'), { id: 'me-avatar' }));
   $('me-state').textContent = '';
   $('go-live').classList.add('hidden');
@@ -1039,6 +1039,26 @@ invoke('test_direct').then(async (spec) => {
 invoke('test_open_golive').then((on) => { if (on) setTimeout(() => { $('go-live').click(); if (on === 'start') setTimeout(() => $('gl-start').click(), 2500); if (on === 'audio') setTimeout(() => { const pick = () => document.querySelector('input[name=audio]:checked')?.value; const screen = pick(); $('gl-tab-window').click(); setTimeout(() => invoke('test_report', { msg: `audio screen ${screen} window ${pick()} prefs ${JSON.stringify(settings().stream)}` }), 800); }, 2500); }, 3000); });
 // Tests only: settings given by the test run, before anything reads them.
 invoke('test_prefs').then((p) => { if (p) saveSettings({ ...settings(), ...JSON.parse(p) }); });
+// Tests only: STREAMER_APP_TEST_STATE=fill saves sample rooms and settings the way the UI
+// does; any value reports what localStorage holds, for comparing with the state file.
+invoke('test_state').then(async (mode) => {
+  if (!mode) return;
+  if (mode === 'fill') {
+    const a = { server: 'wss://example.test/ws', room: 'K7Q29XMBH4TZ', name: 'Olena', title: 'Evening ✓ Вечір' };
+    const b = { server: 'wss://example.test/ws', room: 'friends', name: 'Olena' };
+    saveRooms([a, b]);
+    store('join', JSON.stringify(a)); store('lastRoom', JSON.stringify(b));
+    setUploadLimit(37.5);
+    saveSettings({ ...settings(), shortCode: false, tray: false, watch: { res: '1080', fps: '60', kbit: '' } });
+    setLanguage('uk');
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+  const local = {};
+  for (const k of STORED_KEYS) { const v = stored(k); if (v != null) local[k] = v; }
+  invoke('test_report', { msg: `state local ${JSON.stringify(local)}` });
+});
+// Users who saved things before the state file existed get it at the first start.
+mirrorState();
 fillLanguages();
 loadForm();
 invoke('set_close_to_tray', { on: settings().tray });
@@ -1056,7 +1076,7 @@ invoke('snapshot').then(async (s) => {
   if (s.connected) return;
   if (await invoke('test_autojoin')) return;
   let last = null;
-  try { last = JSON.parse(localStorage.getItem('lastRoom') || 'null'); } catch {}
+  try { last = JSON.parse(stored('lastRoom') || 'null'); } catch {}
   const list = savedRooms();
   const r = list.find((x) => sameRoom(x, last)) || list[list.length - 1];
   if (!r) return;
