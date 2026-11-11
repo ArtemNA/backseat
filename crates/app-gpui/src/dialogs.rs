@@ -322,6 +322,11 @@ impl Shell {
         }
         let codecs = self.golive_codecs();
         let Some(g) = self.dialogs.golive.as_mut() else { return };
+        // Until this machine's encoders are known (they are found in the background), nothing
+        // is replaced: an AV1 from the settings was swapped for H.265 that way and stayed so.
+        if g.codecs.is_none() {
+            return;
+        }
         if !g.codec_picked && !codecs.is_empty() && g.codec != codecs[0] {
             if codecs[0] == "av1" && g.kbit == 20000 {
                 g.kbit = 15000;
@@ -336,7 +341,8 @@ impl Shell {
     /// Only codecs this machine encodes in hardware, AV1 first; while live only the running one.
     fn golive_codecs(&self) -> Vec<String> {
         let Some(g) = &self.dialogs.golive else { return vec![] };
-        let have = g.codecs.clone().unwrap_or_else(|| vec!["h265".into(), "h264".into()]);
+        // Not known yet: all three for now.
+        let have = g.codecs.clone().unwrap_or_else(|| vec!["av1".into(), "h265".into(), "h264".into()]);
         ["av1", "h265", "h264"].iter().filter(|c| have.iter().any(|h| h == *c) && (!g.editing || **c == g.codec)).map(|c| c.to_string()).collect()
     }
 

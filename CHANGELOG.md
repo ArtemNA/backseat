@@ -2,6 +2,11 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.1
+
+- The go-live dialog keeps the codec from *Settings → Streaming*: AV1 chosen there was replaced with H.265 when the dialog opened right after start.
+- Your name and status at the bottom left stay on one line (a long name ends with "…"); the go-live button there is an icon now.
+
 ## 0.2.0
 
 - **A native window instead of the webview.** Backseat now draws its own window; Microsoft Edge WebView2 is no longer needed, and the app runs as one process instead of seven. It uses about 80–140 MB less memory (in a room, watching or streaming) and less processor time while watching.

@@ -592,7 +592,8 @@ impl Shell {
                     .h(px(56.))
                     .bg(rgb(color::BAR))
                     .child(avatar(&me))
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => t("room.not_live") })))
+                    // One line each; a long name ends with "…" instead of wrapping.
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().truncate().text_color(rgb(color::BRIGHT)).font_weight(FontWeight::SEMIBOLD).child(me)).child(div().truncate().text_xs().text_color(rgb(if live { 0xff9aa0 } else { color::MUTED })).child(match &self.snap.live { Some(l) => room::live_for(l.since_secs), None => t("room.not_live") })))
                     .child(icon_button("settings-btn", "icons/settings.svg", t("set.open"), color::BRIGHT).on_click(cx.listener(|s, _, w, cx| s.open_settings(dialogs::SetTab::General, w, cx))))
                     .when(self.snap.connected && !live, |d| {
                         d.child(
@@ -600,7 +601,8 @@ impl Shell {
                                 .primary()
                                 .small()
                                 .icon(gpui_kit::component::Icon::default().path("icons/monitor.svg"))
-                                .label(t("room.go_live"))
+                                // An icon (with its name as a tooltip): the bar is narrow, the name needs the room.
+                                .tooltip(t("room.go_live"))
                                 .on_click(cx.listener(|s, _, w, cx| s.open_golive(false, w, cx))),
                         )
                     }),
