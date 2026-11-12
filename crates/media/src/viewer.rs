@@ -26,6 +26,8 @@ pub struct ViewerStats {
     /// Packet transit per received stream: local arrival minus RTP time, offset by
     /// TRANSIT_BIAS. Only its spread means anything: how unevenly packets arrive.
     pub transit: Arc<Mutex<Vec<Series>>>,
+    /// The decoded video's size (the stream's own, before fitting to the window).
+    pub video_size: Arc<Mutex<Option<(u32, u32)>>>,
 }
 
 /// Keeps transit values positive for `Series`.
@@ -529,17 +531,25 @@ fn add_video(
         #[cfg(windows)]
         chain.push(make("d3d11upload")?);
     }
-    if std::env::var_os("STREAMER_DEBUG_DECODER").is_some() {
+    let debug = std::env::var_os("STREAMER_DEBUG_DECODER").is_some();
+    if debug {
         eprintln!("viewer: video decoder {decoder_name}");
-        decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
-            if let Some(gst::EventView::Caps(c)) = info.event().map(|e| e.view()) {
-                if let Some(s) = c.caps().structure(0) {
-                    eprintln!("viewer: decoded frames {}x{}", s.get::<i32>("width").unwrap_or(0), s.get::<i32>("height").unwrap_or(0));
+    }
+    let video_size = stats.video_size.clone();
+    decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::EventView::Caps(c)) = info.event().map(|e| e.view()) {
+            if let Some(s) = c.caps().structure(0) {
+                let (w, h) = (s.get::<i32>("width").unwrap_or(0), s.get::<i32>("height").unwrap_or(0));
+                if debug {
+                    eprintln!("viewer: decoded frames {w}x{h}");
+                }
+                if w > 0 && h > 0 {
+                    *video_size.lock().unwrap() = Some((w as u32, h as u32));
                 }
             }
-            gst::PadProbeReturn::Ok
-        });
-    }
+        }
+        gst::PadProbeReturn::Ok
+    });
     chain.extend(tail?);
     link_branch(pipeline, pad, &chain)?;
 
