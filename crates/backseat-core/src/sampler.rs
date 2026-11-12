@@ -32,6 +32,8 @@ pub struct WatchStats {
     /// Round trip of the clock ping (through signaling), ms; 0 before the first.
     pub ping_ms: f64,
     pub overlay: bool,
+    /// The small badge in the video's corner (F3); the overlay is the detailed stats.
+    pub badge: bool,
     /// Shown inside the main window (else popped out into its own).
     pub embedded: bool,
     pub muted: bool,
@@ -97,8 +99,28 @@ impl Sampler {
         *i = Inner { session: Some(Arc::downgrade(&s)), ..Default::default() };
     }
 
+    /// The last sample, with the window's own state (stats, badge, fullscreen, popped out,
+    /// sound) read now: a button reflects a click at once, not up to a second later.
     pub fn watches(&self) -> Vec<WatchStats> {
-        self.0.lock().unwrap().watches.clone()
+        let (mut watches, session) = {
+            let i = self.0.lock().unwrap();
+            (i.watches.clone(), i.session.as_ref().and_then(|w| w.upgrade()))
+        };
+        if let Some(s) = session {
+            for w in s.watching() {
+                let Some(x) = watches.iter_mut().find(|x| x.streamer == w.streamer) else { continue };
+                if let Some(win) = w.viewer.window {
+                    let st = win.state();
+                    x.overlay = st.overlay;
+                    x.badge = st.badge;
+                    x.fullscreen = st.fullscreen;
+                    x.topmost = st.topmost;
+                    x.embedded = st.embedded;
+                }
+                x.muted = w.viewer.muted();
+            }
+        }
+        watches
     }
 
     pub fn live(&self) -> Option<LiveStats> {
@@ -122,9 +144,45 @@ fn overlay_text(w: &WatchStats) -> String {
     let quality = w.quality.as_deref().unwrap_or("streamer's quality");
     let codec = if w.codec.is_empty() { String::new() } else { format!(" · {}", w.codec) };
     format!(
-        "{quality}{codec}\n{:.0} fps shown / {:.0} received\n{:.1} Mbit/s   loss {:.1}%\nlatency {:.0} ms   ping {:.0} ms\nframe gap p99 {:.1} ms   F3 hides",
+        "{quality}{codec}\n{:.0} fps shown / {:.0} received\n{:.1} Mbit/s   loss {:.1}%\nlatency {:.0} ms   ping {:.0} ms\nframe gap p99 {:.1} ms   Shift+F3 hides",
         w.shown_fps, w.received_fps, w.mbit, w.loss_pct, w.latency_ms, w.ping_ms, w.gap_p99_ms
     )
+}
+
+/// The badge's line, "1080p60 · 12.4 Mbit/s · AV1", and whether all is well (the dot).
+/// Modes are 30 or 60 fps: within a few frames of one (58 of 60 is normal) the mode is named;
+/// further off, the frames shown are ("1080p · 48 fps") and the dot turns amber, as it does
+/// at 2% packets lost or more. Empty before the first frame.
+fn badge_line(size: Option<(u32, u32)>, w: &WatchStats, codec: &str) -> (String, bool) {
+    let Some((_, h)) = size else { return (String::new(), true) };
+    if w.received_fps <= 0.0 {
+        return (String::new(), true);
+    }
+    let sep = media::present::badge_separator();
+    let fps = w.shown_fps;
+    let mode = if (fps - 60.0).abs() <= 4.0 {
+        Some(60)
+    } else if (fps - 30.0).abs() <= 3.0 {
+        Some(30)
+    } else {
+        None
+    };
+    let lang = UI_LANG.lock().unwrap().clone();
+    let unit = match lang.as_str() {
+        "uk" => "Мбіт/с",
+        "ru" => "Мбит/с",
+        _ => "Mbit/s",
+    };
+    let quality = match mode {
+        Some(m) => format!("{h}p{m}"),
+        None => format!("{h}p{sep}{fps:.0} fps"),
+    };
+    let mut text = format!("{quality}{sep}{:.1} {unit}", w.mbit);
+    if !codec.is_empty() {
+        text.push_str(sep);
+        text.push_str(codec);
+    }
+    (text, mode.is_some() && w.loss_pct < 2.0)
 }
 
 /// The UI language ("en", "uk", "ru"), set by the webview; for text drawn natively.
@@ -190,6 +248,7 @@ fn sample(inner: &Mutex<Inner>) {
             loss_pct,
             ping_ms: w.clock.last_rtt_ns().map(|n| n as f64 / 1e6).unwrap_or(0.0),
             overlay: st.overlay,
+            badge: st.badge,
             embedded: st.embedded,
             muted: w.viewer.muted(),
             codec: w
@@ -235,6 +294,12 @@ fn sample(inner: &Mutex<Inner>) {
         let Some(st) = watches.iter().find(|x| x.streamer == w.streamer) else { continue };
         if let (Some(win), true) = (w.viewer.window, st.overlay) {
             win.set_overlay_text(&overlay_text(st));
+        }
+        if let (Some(win), true) = (w.viewer.window, st.badge) {
+            let codec = w.viewer.video_codec.lock().unwrap().as_ref().map(|(c, _)| c.clone()).unwrap_or_default();
+            let size = *w.viewer.stats.video_size.lock().unwrap();
+            let (text, ok) = badge_line(size, st, &codec);
+            win.set_badge_info(&text, ok);
         }
     }
     if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {

@@ -224,9 +224,36 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_4()
-            .when_some(notice, |d, n| d.child(div().p_3().rounded_md().bg(rgb(0x3b2326)).text_color(rgb(0xffb4b4)).child(n)))
-            .when_some(hint, |d, h| d.child(div().p_3().rounded_md().bg(rgb(0x3a3220)).text_color(rgb(0xf0d48a)).child(h)))
-            .when(has_stage, |d| d.child(small_text(t("tile.keys"))))
+            // With a video on: one line of fixed height under it for a notice, a hint or the
+            // keys, so a notice coming or going no longer resizes the video (it jumped).
+            // Long text ends with "…"; all of it shows on hover.
+            .when(has_stage, |d| {
+                let (text, bg, fg): (SharedString, Option<u32>, u32) = match (&notice, &hint) {
+                    (Some(n), _) => (n.clone().into(), Some(0x3b2326), 0xffb4b4),
+                    (None, Some(h)) => (h.clone().into(), Some(0x3a3220), 0xf0d48a),
+                    (None, None) => (t("tile.keys"), None, color::MUTED),
+                };
+                let tip = text.clone();
+                d.child(
+                    div()
+                        .id("below-line")
+                        .h(px(30.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .rounded_md()
+                        .when_some(bg, |d, c| d.bg(rgb(c)))
+                        .text_color(rgb(fg))
+                        .text_xs()
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                        .child(div().min_w_0().truncate().child(text)),
+                )
+            })
+            .when(!has_stage, |d| {
+                d.when_some(notice.clone(), |d, n| d.child(div().p_3().rounded_md().bg(rgb(0x3b2326)).text_color(rgb(0xffb4b4)).child(n)))
+                    .when_some(hint.clone(), |d, h| d.child(div().p_3().rounded_md().bg(rgb(0x3a3220)).text_color(rgb(0xf0d48a)).child(h)))
+            })
             .when(!others.is_empty(), |d| {
                 d.child(div().flex().flex_col().gap_2().child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(tu("room.also_live"))).child(div().flex().flex_wrap().gap_2p5().children(others.iter().map(|p| {
                     let id = p.id;
@@ -318,10 +345,12 @@ impl Shell {
         .size_full();
         let tile = self.room.tiles.get(&id);
         let act = |action: &'static str| {
-            let core = self.core.clone();
-            move |_: &ClickEvent, _: &mut Window, _: &mut App| {
-                let _ = core::video_window_do(&core, id, action);
-            }
+            cx.listener(move |s: &mut Shell, _: &ClickEvent, _: &mut Window, cx: &mut Context<Shell>| {
+                let _ = core::video_window_do(&s.core, id, action);
+                // The buttons' look follows at once (the stats sample once a second).
+                s.snap.watches = core::watches(&s.core);
+                cx.notify();
+            })
         };
         card()
             .flex_1()

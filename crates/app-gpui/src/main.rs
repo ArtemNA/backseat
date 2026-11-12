@@ -16,6 +16,8 @@ use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::{Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+actions!(backseat, [VideoBadge, VideoStats, VideoFullscreen, VideoWindowed]);
 use i18n::{t, tf};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
@@ -609,6 +611,28 @@ impl Shell {
             )
     }
 
+    /// F3, Shift+F3, F11 and Esc for the video. F3 the badge, Shift+F3 the detailed stats:
+    /// each one state for all videos (on if no video shows it). F11 and Esc: the most
+    /// recently opened video.
+    fn video_keys(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) {
+        let Some(w) = self.snap.watches.last().cloned() else { return };
+        let any_stats = self.snap.watches.iter().any(|w| w.overlay);
+        let any_badge = self.snap.watches.iter().any(|w| w.badge);
+        let action = match key {
+            "f3" if shift => if any_stats { "no_overlay" } else { "overlay" },
+            "f3" => if any_badge { "no_badge" } else { "badge" },
+            "f11" => "toggle_fullscreen",
+            "escape" if w.fullscreen => "windowed",
+            _ => return,
+        };
+        if let Err(e) = core::video_window_do(&self.core, w.streamer, action) {
+            eprintln!("keys: {action}: {e}");
+        }
+        eprintln!("keys: {key} -> {action}");
+        self.snap.watches = core::watches(&self.core);
+        cx.notify();
+    }
+
     fn main(&self) -> impl IntoElement {
         let status = if self.joining {
             t("direct.connecting").to_string()
@@ -839,7 +863,29 @@ fn main() {
                 true
             });
             let c = c.clone();
-            cx.new(|cx| Shell::new(c, window, cx))
+            let shell = cx.new(|cx| Shell::new(c, window, cx));
+            // The video's keys anywhere in the app, not only after a click on the video itself
+            // (which has its own window and focus). App-wide actions: they run with nothing
+            // focused too, where an element's key listener never hears the key.
+            cx.bind_keys([
+                KeyBinding::new("f3", VideoBadge, None),
+                KeyBinding::new("shift-f3", VideoStats, None),
+                KeyBinding::new("f11", VideoFullscreen, None),
+                KeyBinding::new("escape", VideoWindowed, None),
+            ]);
+            for (key, shift) in [("f3", false), ("shift-f3", true), ("f11", false), ("escape", false)] {
+                let w = shell.downgrade();
+                let run = move |cx: &mut App| {
+                    let _ = w.update(cx, |s, cx| s.video_keys(key.trim_start_matches("shift-"), shift, cx));
+                };
+                match key {
+                    "f3" => cx.on_action(move |_: &VideoBadge, cx| run(cx)),
+                    "shift-f3" => cx.on_action(move |_: &VideoStats, cx| run(cx)),
+                    "f11" => cx.on_action(move |_: &VideoFullscreen, cx| run(cx)),
+                    _ => cx.on_action(move |_: &VideoWindowed, cx| run(cx)),
+                };
+            }
+            shell
         });
         if let Err(e) = opened {
             eprintln!("window: {e}");

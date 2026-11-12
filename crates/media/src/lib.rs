@@ -22,6 +22,12 @@ pub mod viewer;
 #[cfg(windows)]
 mod controls;
 #[cfg(windows)]
+mod loader;
+#[cfg(windows)]
+mod badge;
+#[cfg(windows)]
+mod scaler;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 pub mod present;

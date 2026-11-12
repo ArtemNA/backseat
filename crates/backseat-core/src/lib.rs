@@ -126,6 +126,11 @@ pub struct Snapshot {
     pub direct: Option<&'static str>,
 }
 
+/// The watched streams only (no notices or links taken), for a quick refresh after a click.
+pub fn watches(app: &App) -> Vec<sampler::WatchStats> {
+    app.sampler.watches()
+}
+
 pub fn snapshot(app: &App) -> Snapshot {
     let s = app.session.lock().unwrap().clone();
     let notice = app.notice.lock().unwrap().take();
@@ -480,6 +485,8 @@ pub fn video_window_do(app: &App, streamer: u64, action: &str) -> Result<(), Str
         "pop_out" => w.set_popped(true),
         "pop_in" => w.set_popped(false),
         "no_overlay" => w.set_overlay(false),
+        "badge" => w.set_badge(true),
+        "no_badge" => w.set_badge(false),
         _ => return Err(format!("unknown window action {action}")),
     }
     Ok(())

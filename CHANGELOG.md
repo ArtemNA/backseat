@@ -2,9 +2,17 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
-## 0.2.4
+## 0.2.5
 
+- **Stream badge.** A small badge in the top right corner of the video shows the quality, bitrate and codec (`1080p60 · 12.4 Mbit/s · AV1`). Its dot is green while frames come as they should and amber when fewer come (the frame rate is then shown as a number) or packets are lost. **F3** shows or hides it; **Shift+F3** opens the detailed stats as F3 did before.
+- F3, Shift+F3, F11 and Esc work anywhere in the app window, not only after clicking the video. The badge and the stats are one setting for all streams you watch, and a stream you open next starts with it.
 - The video window's volume bar and buttons respond at once: they were redrawn only with the next video frame (at 30 fps a click showed up to 35 ms later, and the bar jumped while dragging). Median from input to screen now about 6 ms.
+- Fixed in this release (it was broken in 0.2.4): after using the video window's volume bar, the mouse stayed captured by the video, the hand cursor showed everywhere and the rest of the window could not be clicked.
+- Switching fullscreen is about three times faster (median 47 ms instead of 155 ms), and the misplaced text that flashed in the video's place during the switch is gone.
+- A loading animation and the connection status show in the video's place until the first frame, instead of a black rectangle.
+- Resizing the window no longer stretches the video for a moment and then jumps: the picture keeps its proportions at every size.
+- The line under the video (the frame rate warning, hints) keeps its height, so the layout no longer jumps when a warning appears or goes away.
+- The Stats button under the video changes its colour at once, not up to a second later.
 
 ## 0.2.3
 

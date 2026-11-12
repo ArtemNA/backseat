@@ -146,15 +146,32 @@ impl Window {
                 fullscreen: w.fullscreen.is_some(),
                 topmost: w.topmost,
                 overlay: w.overlay,
+                badge: w.badge,
                 embedded: w.parent != 0 && !w.popped,
             })
             .unwrap_or_default()
     }
 
-    /// Shows or hides the diagnostic overlay (F3 in the window does the same).
+    /// Shows or hides the diagnostic overlay (F3 in the window does the same). One state for
+    /// all video windows: every open window follows, and the next one opens with it.
     pub fn set_overlay(&self, on: bool) {
+        set_overlay_all(self.hwnd, on);
+    }
+
+    /// Shows or hides the badge (F3 in the window does the same); like the overlay, one
+    /// state for all video windows.
+    pub fn set_badge(&self, on: bool) {
+        set_badge_all(self.hwnd, on);
+    }
+
+    /// The badge's line ("1080p60 · 12.4 Mbit/s · AV1", parts joined by `badge_separator`)
+    /// and the dot: true green, false amber. Empty text: no badge (no video yet).
+    pub fn set_badge_info(&self, text: &str, ok: bool) {
         if let Some(st) = WINDOWS.lock().unwrap().get_mut(&self.hwnd) {
-            st.overlay = on;
+            if st.badge_text != text {
+                st.badge_text = text.to_string();
+            }
+            st.badge_ok = ok;
         }
     }
 
@@ -191,12 +208,16 @@ pub struct WindowState {
     pub fullscreen: bool,
     pub topmost: bool,
     pub overlay: bool,
+    /// The small badge (quality, fps, bitrate, codec) in the top right corner.
+    pub badge: bool,
     /// Shown inside the app's main window (not popped out).
     pub embedded: bool,
 }
 
 /// Per-window state, by HWND: an app may show several streams at once.
 struct WinState {
+    /// A frame was shown: the loader stops.
+    video: bool,
     closed: Arc<AtomicBool>,
     /// Placement and style before fullscreen, while fullscreen.
     fullscreen: Option<(WINDOWPLACEMENT, i32)>,
@@ -204,6 +225,10 @@ struct WinState {
     overlay: bool,
     overlay_text: String,
     overlay_version: u64,
+    badge: bool,
+    /// The badge's line and whether all is well (the dot's colour); empty: not drawn.
+    badge_text: String,
+    badge_ok: bool,
     /// Shown before the first frame; see `Window::set_status`.
     status: String,
     /// The app's main window when the video lives inside it, else 0 (own window).
@@ -281,6 +306,56 @@ unsafe fn controls_cursor(hwnd: HWND) -> bool {
     }
 }
 
+/// A fullscreen switch: the next size is taken at once, not after the 120 ms that wait out a
+/// border being dragged (a switch took 156 ms median, 120 of them waiting).
+/// STREAMER_DEBUG_FS_WAIT keeps the wait: the spoiled variant.
+/// The diagnostic overlay is one state for all video windows (`set_overlay_all`).
+static OVERLAY: AtomicBool = AtomicBool::new(false);
+
+/// Turns the overlay on or off in every video window, and for the ones opened later.
+/// STREAMER_DEBUG_OVERLAY_PER_WINDOW: every window keeps its own (the old way, for the gate).
+fn set_overlay_all(hwnd: isize, on: bool) {
+    let mut all = WINDOWS.lock().unwrap();
+    if std::env::var_os("STREAMER_DEBUG_OVERLAY_PER_WINDOW").is_some() {
+        if let Some(st) = all.get_mut(&hwnd) {
+            st.overlay = on;
+        }
+        return;
+    }
+    OVERLAY.store(on, Ordering::Relaxed);
+    for st in all.values_mut() {
+        st.overlay = on;
+    }
+}
+
+/// The badge, one state for all video windows, on by default.
+static BADGE: AtomicBool = AtomicBool::new(true);
+
+fn set_badge_all(hwnd: isize, on: bool) {
+    let mut all = WINDOWS.lock().unwrap();
+    if std::env::var_os("STREAMER_DEBUG_OVERLAY_PER_WINDOW").is_some() {
+        if let Some(st) = all.get_mut(&hwnd) {
+            st.badge = on;
+        }
+        return;
+    }
+    BADGE.store(on, Ordering::Relaxed);
+    for st in all.values_mut() {
+        st.badge = on;
+    }
+}
+
+/// What joins the badge's parts.
+pub fn badge_separator() -> &'static str {
+    crate::badge::SEP
+}
+
+static FIT_NOW: AtomicBool = AtomicBool::new(false);
+
+/// STREAMER_DEBUG_CONTROLS_TIMING also times a fullscreen switch: from the request to the
+/// first frame shown at the window's new size.
+static FS_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
 /// STREAMER_DEBUG_CONTROLS_TIMING: when the last input to the controls came, to report how
 /// long it took to show (`shown_input`).
 static INPUT_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -317,10 +392,16 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         if msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL {
             st.controls_until = Some(std::time::Instant::now() + CONTROLS_FOR);
         }
+        // Taken before the button-up clears it: cleared first, the button-up never saw a drag
+        // and never let the mouse go, so every click anywhere kept coming here (the app and
+        // other windows could not be clicked after moving the volume bar).
+        // STREAMER_DEBUG_KEEP_CAPTURE: the old order, the spoiled variant for the gate.
+        let was = st.dragging;
         if msg == WM_LBUTTONUP {
             st.dragging = false;
         }
-        (st.audio.clone(), showing, st.dragging)
+        let dragging = if std::env::var_os("STREAMER_DEBUG_KEEP_CAPTURE").is_some() { st.dragging } else { was };
+        (st.audio.clone(), showing, dragging)
     };
     let Some(audio) = audio else { return false };
     let (size, scale) = client_and_scale(hwnd);
@@ -363,6 +444,13 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         },
         _ => false,
     }
+}
+
+/// The badge's line and dot while the badge is on and there is something to show.
+fn badge_of(hwnd: HWND) -> Option<(String, bool)> {
+    let map = WINDOWS.lock().unwrap();
+    let st = map.get(&(hwnd.0 as isize))?;
+    (st.badge && !st.badge_text.is_empty()).then(|| (st.badge_text.clone(), st.badge_ok))
 }
 
 /// The overlay text and its version while the overlay is on.
@@ -453,8 +541,74 @@ const KEY_ESCAPE: usize = 0x1B;
 const KEY_F11: usize = 0x7A;
 const KEY_F3: usize = 0x72;
 
-/// Black, with the status line in the middle while there is one. Once frames come, the
-/// swapchain covers the window and the status is empty.
+/// Black, with a turning loader until the first frame and the status line under it while
+/// there is one. Once frames come, the swapchain covers the window. (Black alone looked
+/// broken while a stream started.)
+/// The window's client size in pixels.
+unsafe fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    ((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32)
+}
+
+/// `src` (a frame, `from` pixels) into `back` (`size` pixels): a plain copy when the sizes
+/// match, else the video part drawn where a frame of `size` has it (`crate::scaler`).
+unsafe fn blit(pdevice: &ID3D11Device, pcontext: &ID3D11DeviceContext, scaler: &mut Option<crate::scaler::Scaler>, back: &ID3D11Texture2D, size: (u32, u32), src: &ID3D11Texture2D, from: (u32, u32), aspect: Option<f32>) {
+    if from == size {
+        pcontext.CopyResource(back, src);
+        return;
+    }
+    if scaler.is_none() {
+        *scaler = crate::scaler::Scaler::new(pdevice).map_err(|e| eprintln!("scaler: {e}")).ok();
+    }
+    if let Some(s) = scaler.as_mut() {
+        let aspect = aspect.unwrap_or(from.0 as f32 / from.1.max(1) as f32);
+        if let Err(e) = s.draw(back, size, src, from, aspect) {
+            eprintln!("scaler: {e}");
+        }
+    }
+}
+
+/// The decoded video's aspect (width / height), from the fitting element's input.
+fn video_aspect(fit: &Option<gst::Element>) -> Option<f32> {
+    use gst::prelude::{ElementExt, PadExt};
+    // `fit` is the capsfilter after the converter; the converter's input is the decoded video.
+    let convert = fit.as_ref()?.static_pad("sink")?.peer()?.parent_element()?;
+    let caps = convert.static_pad("sink")?.current_caps()?;
+    let s = caps.structure(0)?;
+    let (w, h) = (s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?);
+    (w > 0 && h > 0).then(|| w as f32 / h as f32)
+}
+
+/// A flip-model swapchain for the window, `size` pixels, and its frame-latency handle.
+unsafe fn make_swapchain(factory: &IDXGIFactory6, device: &ID3D11Device, hwnd: HWND, size: (u32, u32), flags: u32) -> (IDXGISwapChain1, windows::Win32::Foundation::HANDLE) {
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: size.0,
+        Height: size.1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Stereo: false.into(),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        // Several buffers, so DWM holding one never blocks Present (as in Moonlight).
+        BufferCount: 3,
+        // Frames already match the window; stretch only covers the moment between a resize
+        // and the next frame of the new size.
+        Scaling: DXGI_SCALING_STRETCH,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: flags,
+    };
+    let sc = factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None).unwrap();
+    // A frame queue slot is free when this handle is signalled; checking it with a zero
+    // timeout lets us skip a frame instead of blocking inside Present.
+    let mut waitable = windows::Win32::Foundation::HANDLE::default();
+    if let Ok(sc2) = sc.cast::<IDXGISwapChain2>() {
+        let _ = sc2.SetMaximumFrameLatency(2);
+        waitable = sc2.GetFrameLatencyWaitableObject();
+    }
+    (sc, waitable)
+}
+
 unsafe fn paint_status(hwnd: HWND) {
     use windows::Win32::Graphics::Gdi::*;
     let mut ps = PAINTSTRUCT::default();
@@ -462,9 +616,14 @@ unsafe fn paint_status(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     FillRect(dc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
-    let status = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).map(|s| s.status.clone()).unwrap_or_default();
+    let (status, video) = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).map(|s| (s.status.clone(), s.video)).unwrap_or_default();
+    let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
+    // The loader and the status are drawn into the swapchain (`crate::loader`): painted here
+    // they never showed inside the main window, which DirectComposition composes.
+    let loader = false;
+    let ring = 0;
+    let _ = video;
     if !status.is_empty() {
-        let scale = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
         let font = CreateFontW(-(18 * scale / 96), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"));
         let old = SelectObject(dc, font.into());
         SetTextColor(dc, windows::Win32::Foundation::COLORREF(0x00DCDCDC));
@@ -475,7 +634,8 @@ unsafe fn paint_status(hwnd: HWND) {
         let mut box_ = RECT { left: rc.left + pad, top: 0, right: rc.right - pad, bottom: 0 };
         DrawTextW(dc, &mut wide, &mut box_, DT_CALCRECT | DT_WORDBREAK | DT_CENTER);
         let h = box_.bottom - box_.top;
-        let mut place = RECT { left: rc.left + pad, top: (rc.bottom - h) / 2, right: rc.right - pad, bottom: (rc.bottom + h) / 2 };
+        let below = if loader { ring + 12 * scale / 96 } else { 0 };
+        let mut place = RECT { left: rc.left + pad, top: (rc.bottom - h) / 2 + below, right: rc.right - pad, bottom: (rc.bottom + h) / 2 + below };
         DrawTextW(dc, &mut wide, &mut place, DT_WORDBREAK | DT_CENTER);
         SelectObject(dc, old);
         let _ = DeleteObject(font.into());
@@ -531,6 +691,10 @@ unsafe fn fullscreen_old(hwnd: HWND, mode: usize) {
 /// across those calls, the lock froze both the app and the video (found going in and out
 /// of fullscreen several times while watching).
 unsafe fn fullscreen(hwnd: HWND, mode: usize) {
+    FIT_NOW.store(true, Ordering::SeqCst);
+    if controls_timing() {
+        *FS_AT.lock().unwrap() = Some(std::time::Instant::now());
+    }
     if std::env::var_os("STREAMER_DEBUG_FS_OLD").is_some() {
         return fullscreen_old(hwnd, mode);
     }
@@ -565,9 +729,11 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         if !monitor_after {
             let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
         }
-        // From inside the main window: become a window of its own first.
+        // From inside the main window: become a window of its own first, borderless at once.
+        // (Through a framed window on the way, its title bar and frame showed for a moment.)
         if embedded {
-            SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
+            let style = if std::env::var_os("STREAMER_DEBUG_FS_FRAMED").is_some() { WS_OVERLAPPEDWINDOW | WS_VISIBLE } else { WS_POPUP | WS_VISIBLE };
+            SetWindowLongW(hwnd, GWL_STYLE, style.0 as i32);
             let _ = SetParent(hwnd, None);
         }
         let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
@@ -675,6 +841,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                 apply_place(hwnd);
                 LRESULT(0)
             }
+            // The mouse taken away mid-drag (Alt+Tab, another capture): the drag is over.
+            WM_CAPTURECHANGED => {
+                if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                    st.dragging = false;
+                }
+                LRESULT(0)
+            }
             // The hand over the panel's buttons and volume bar, as over the app's own buttons.
             WM_SETCURSOR if (l.0 & 0xFFFF) as u32 == HTCLIENT && controls_cursor(hwnd) => LRESULT(1),
             WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONUP if controls_mouse(hwnd, msg, w, l) => LRESULT(0),
@@ -699,8 +872,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                 LRESULT(0)
             }
             WM_KEYDOWN if w.0 == KEY_F3 => {
-                if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
-                    st.overlay = !st.overlay;
+                // F3 the badge, Shift+F3 the detailed stats.
+                let shift = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) < 0;
+                let map = WINDOWS.lock().unwrap();
+                let (badge, overlay) = map.get(&(hwnd.0 as isize)).map(|st| (st.badge, st.overlay)).unwrap_or_default();
+                drop(map);
+                if shift {
+                    set_overlay_all(hwnd.0 as isize, !overlay);
+                } else {
+                    set_badge_all(hwnd.0 as isize, !badge);
                 }
                 LRESULT(0)
             }
@@ -712,6 +892,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                 paint_status(hwnd);
                 LRESULT(0)
             }
+
             WM_LBUTTONDBLCLK => {
                 fullscreen(hwnd, 2);
                 LRESULT(0)
@@ -901,7 +1082,7 @@ unsafe fn run(
         .unwrap()
     };
     // STREAMER_OVERLAY=1: windows open with the overlay on (diagnosis and tests).
-    let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some();
+    let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some() || OVERLAY.load(Ordering::Relaxed);
     WINDOWS.lock().unwrap().insert(
         hwnd.0 as isize,
         WinState {
@@ -911,7 +1092,11 @@ unsafe fn run(
             overlay: overlay_on,
             overlay_text: String::new(),
             overlay_version: 0,
+            badge: BADGE.load(Ordering::Relaxed),
+            badge_text: String::new(),
+            badge_ok: true,
             status: String::new(),
+            video: false,
             parent,
             slot: None,
             popped: false,
@@ -957,10 +1142,25 @@ unsafe fn run(
     let mut applied = (0u32, 0u32);
     let mut pending = ((0u32, 0u32), std::time::Instant::now());
     let mut overlay: Option<crate::overlay::Overlay> = None;
+    let mut badge: Option<crate::badge::Badge> = None;
     let mut controls: Option<crate::controls::Controls> = None;
     let mut drawn_look: Option<crate::controls::Look> = None;
-    // The last frame, kept while the controls show, to draw them again without a new frame.
+    // Before the first frame: the loader, redrawn every 90 ms. STREAMER_DEBUG_NO_LOADER: a
+    // black window instead, as before.
+    let mut first_frame = false;
+    let mut loader_ui: Option<crate::loader::Loader> = None;
+    let loader_started = std::time::Instant::now();
+    let mut loader_at = loader_started;
+    let no_loader = std::env::var_os("STREAMER_DEBUG_NO_LOADER").is_some();
+    // The last frame: the controls are drawn again on it without a new frame, and a resized
+    // window gets it at once, scaled (`crate::scaler`). Its size, and the shared texture's.
     let mut last: Option<ID3D11Texture2D> = None;
+    let mut last_size = (0u32, 0u32);
+    let mut shared_size = (0u32, 0u32);
+    let mut scaler: Option<crate::scaler::Scaler> = None;
+    // STREAMER_DEBUG_RESIZE_STRETCH: the swapchain keeps the frame's size and stretches it
+    // until fitted frames come (the old way, for the gate).
+    let stretch = std::env::var_os("STREAMER_DEBUG_RESIZE_STRETCH").is_some();
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -980,9 +1180,11 @@ unsafe fn run(
             let _ = GetClientRect(hwnd, &mut rc);
             let want = ((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32);
             if want.0 > 0 && want.1 > 0 && want != applied {
-                if want != pending.0 {
+                let now = std::env::var_os("STREAMER_DEBUG_FS_WAIT").is_none() && FIT_NOW.swap(false, Ordering::SeqCst);
+                if want != pending.0 && !now {
                     pending = (want, std::time::Instant::now());
-                } else if applied == (0, 0) || pending.1.elapsed() > std::time::Duration::from_millis(120) {
+                } else if now || applied == (0, 0) || pending.1.elapsed() > std::time::Duration::from_millis(120) {
+                    pending = (want, pending.1);
                     let caps = gst::Caps::builder("video/x-raw")
                         .features(["memory:D3D11Memory"])
                         .field("format", "BGRA")
@@ -992,6 +1194,46 @@ unsafe fn run(
                         .build();
                     gst::prelude::ObjectExt::set_property(f, "caps", &caps);
                     applied = want;
+                }
+            }
+        }
+        if !first_frame && !no_loader && (loader_at == loader_started || loader_at.elapsed() >= std::time::Duration::from_millis(90)) {
+            loader_at = std::time::Instant::now();
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let want = (((rc.right - rc.left).max(16)) as u32, ((rc.bottom - rc.top).max(16)) as u32);
+            match &swapchain {
+                None => {
+                    let (sc, w) = make_swapchain(&factory, &pdevice, hwnd, want, swap_flags);
+                    swapchain = Some(sc);
+                    waitable = w;
+                    size = want;
+                }
+                Some(sc) if size != want => {
+                    // The same: the loader's context lets go of the buffers first.
+                    loader_ui = None;
+                    let _ = sc.ResizeBuffers(0, want.0, want.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(swap_flags as i32));
+                    size = want;
+                }
+                _ => {}
+            }
+            let free = waitable.is_invalid() || windows::Win32::System::Threading::WaitForSingleObjectEx(waitable, 0, false) == windows::Win32::Foundation::WAIT_OBJECT_0;
+            if let (Some(sc), true) = (&swapchain, free) {
+                let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                if loader_ui.as_ref().is_some_and(|l| l.scale() != scale) {
+                    loader_ui = None;
+                }
+                if loader_ui.is_none() {
+                    loader_ui = crate::loader::Loader::new(&pdevice, scale).map_err(|e| eprintln!("loader: {e}")).ok();
+                }
+                if let Some(l) = loader_ui.as_mut() {
+                    let status = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).map(|s| s.status.clone()).unwrap_or_default();
+                    let step = (loader_started.elapsed().as_millis() / 90 % 8) as u32;
+                    let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
+                    if l.draw(&back, size, step, &status).is_ok() {
+                        drop(back);
+                        let _ = sc.Present(0, present_flags);
+                    }
                 }
             }
         }
@@ -1010,14 +1252,25 @@ unsafe fn run(
             // frame again with them. Drawn only with frames, they lagged a frame or more (30
             // fps: p90 33 ms, max 59) and stood still while the stream did.
             let look = controls_of(hwnd);
-            if !old_way && look != drawn_look {
+            let client = client_size(hwnd);
+            let resized = !stretch && !no_fit && first_frame && client.0 > 0 && client.1 > 0 && client != size;
+            if (!old_way && look != drawn_look) || resized {
                 if let (Some(sc), Some(prev)) = (&swapchain, &last) {
+                    if resized {
+                        if let Err(e) = sc.ResizeBuffers(0, client.0, client.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(swap_flags as i32)) {
+                            eprintln!("present: resizing the swapchain to {}x{} failed: {e}", client.0, client.1);
+                        }
+                        size = client;
+                    }
                     let free = waitable.is_invalid() || windows::Win32::System::Threading::WaitForSingleObjectEx(waitable, 0, false) == windows::Win32::Foundation::WAIT_OBJECT_0;
                     if free {
                         let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
-                        pcontext.CopyResource(&back, prev);
+                        blit(&pdevice, &pcontext, &mut scaler, &back, size, prev, last_size, video_aspect(&fit));
                         if let (Some((version, text)), Some(o)) = (overlay_of(hwnd), overlay.as_mut()) {
                             o.draw(&pcontext, &back, size, version, &text);
+                        }
+                        if let (Some((text, ok)), Some(b)) = (badge_of(hwnd), badge.as_mut()) {
+                            let _ = b.draw(&back, size, &text, ok);
                         }
                         if let (Some(l), Some(c)) = (look, controls.as_mut()) {
                             c.draw(&pcontext, &back, size, l);
@@ -1035,44 +1288,58 @@ unsafe fn run(
             continue;
         };
         let (Some(buffer), Some(frame)) = (sample.buffer(), frame_size(&sample)) else { continue };
+        // Tests only: STREAMER_DEBUG_FIRST_FRAME_AFTER_MS holds the picture back that long, as a
+        // slow network would (to see what shows before the first frame).
+        {
+            static HOLD: std::sync::OnceLock<Option<(std::time::Instant, u64)>> = std::sync::OnceLock::new();
+            if let Some((t0, ms)) = *HOLD.get_or_init(|| std::env::var("STREAMER_DEBUG_FIRST_FRAME_AFTER_MS").ok().and_then(|v| v.parse().ok()).map(|ms| (std::time::Instant::now(), ms))) {
+                if t0.elapsed() < std::time::Duration::from_millis(ms) {
+                    continue;
+                }
+            }
+        }
 
-        if swapchain.is_none() || frame != size {
+        // The loader is done: its Direct2D context still refers to the swapchain's buffers,
+        // and ResizeBuffers fails while anything does (the video stayed black).
+        if !first_frame {
+            loader_ui = None;
+        }
+        // Also when the loader's swapchain already has the frame's size: the shared texture for
+        // the frames does not exist yet (the thread fell over on it, the video stayed black).
+        // The swapchain takes the window's size; frames of another size (the window changed,
+        // fitted frames not here yet) are scaled into it. Without fitting (or the old way),
+        // the frame's size, stretched by the swapchain.
+        let client = client_size(hwnd);
+        let target = if first_frame && !stretch && !no_fit && fit.is_some() && client.0 > 0 && client.1 > 0 { client } else { frame };
+        if shared.is_none() || shared_size != frame {
             gst_d3d11_device_lock(gst_device);
             shared = Some(Shared::new(&device, &pdevice, frame));
             gst_d3d11_device_unlock(gst_device);
-            if let Some(sc) = &swapchain {
-                let _ = sc.ResizeBuffers(0, frame.0, frame.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(swap_flags as i32));
-            } else {
-                let desc = DXGI_SWAP_CHAIN_DESC1 {
-                    Width: frame.0,
-                    Height: frame.1,
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    Stereo: false.into(),
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                    // Several buffers, so DWM holding one never blocks Present (as in Moonlight).
-                    BufferCount: 3,
-                    // Frames already match the window; stretch only covers the moment
-                    // between a resize and the next frame of the new size.
-                    Scaling: DXGI_SCALING_STRETCH,
-                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                    AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-                    Flags: swap_flags,
-                };
-                let sc = factory.CreateSwapChainForHwnd(&pdevice, hwnd, &desc, None, None).unwrap();
-                // A frame queue slot is free when this handle is signalled; checking it with a
-                // zero timeout lets us skip a frame instead of blocking inside Present.
-                if let Ok(sc2) = sc.cast::<IDXGISwapChain2>() {
-                    let _ = sc2.SetMaximumFrameLatency(2);
-                    waitable = sc2.GetFrameLatencyWaitableObject();
+            shared_size = frame;
+        }
+        if swapchain.is_none() || target != size {
+            match &swapchain {
+                Some(sc) => {
+                    if let Err(e) = sc.ResizeBuffers(0, target.0, target.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(swap_flags as i32)) {
+                        eprintln!("present: resizing the swapchain to {}x{} failed: {e}", target.0, target.1);
+                    }
                 }
-                swapchain = Some(sc);
-                let mut r = RECT { left: 0, top: 0, right: frame.0 as i32, bottom: frame.1 as i32 };
-                if parent == 0 && AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false).is_ok() {
-                    let _ = SetWindowPos(hwnd, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
+                None => {
+                    let (sc, w) = make_swapchain(&factory, &pdevice, hwnd, target, swap_flags);
+                    swapchain = Some(sc);
+                    waitable = w;
                 }
             }
-            size = frame;
+            size = target;
+        }
+        // The first frame: a window of its own takes the video's size (once; the loader's
+        // swapchain was the window's size).
+        if !first_frame {
+            first_frame = true;
+            let mut r = RECT { left: 0, top: 0, right: frame.0 as i32, bottom: frame.1 as i32 };
+            if parent == 0 && AdjustWindowRect(&mut r, WS_OVERLAPPEDWINDOW, false).is_ok() {
+                let _ = SetWindowPos(hwnd, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
+            }
         }
         let sc = swapchain.as_ref().unwrap();
         let sh = shared.as_ref().unwrap();
@@ -1097,7 +1364,7 @@ unsafe fn run(
         let raw = gst_d3d11_memory_get_resource_handle(mem as *mut c_void);
         let sub = gst_d3d11_memory_get_subresource_index(mem as *mut c_void);
         let src = ID3D11Resource::from_raw_borrowed(&raw).unwrap();
-        let src_box = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
+        let src_box = D3D11_BOX { left: 0, top: 0, front: 0, right: frame.0, bottom: frame.1, back: 1 };
         // On the decoder's device only the copy into the shared texture happens, under
         // GStreamer's lock (stage 1: holding it during Present grew latency without bound).
         let locked = std::time::Instant::now();
@@ -1115,25 +1382,28 @@ unsafe fn run(
         // Everything below runs on the presentation device and cannot stall the decoder.
         let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
         let _ = sh.km_present.AcquireSync(1, 100);
-        pcontext.CopyResource(&back, &sh.present);
-        // Kept for redrawing the controls between frames (only while they show).
-        if controls_of(hwnd).is_some() {
+        if frame == size {
+            pcontext.CopyResource(&back, &sh.present);
+        }
+        // Kept: the controls are redrawn on it, a resized window gets it scaled.
+        if last.is_none() || last_size != frame {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             sh.present.GetDesc(&mut d);
-            if last.as_ref().is_none_or(|t| {
-                let mut ld = D3D11_TEXTURE2D_DESC::default();
-                t.GetDesc(&mut ld);
-                (ld.Width, ld.Height) != (d.Width, d.Height)
-            }) {
-                d.MiscFlags = 0;
-                let mut t = None;
-                last = pdevice.CreateTexture2D(&d, None, Some(&mut t)).ok().and(t);
-            }
-            if let Some(t) = &last {
-                pcontext.CopyResource(t, &sh.present);
-            }
+            d.MiscFlags = 0;
+            d.BindFlags = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+            let mut t = None;
+            last = pdevice.CreateTexture2D(&d, None, Some(&mut t)).ok().and(t);
+            last_size = frame;
+        }
+        if let Some(t) = &last {
+            pcontext.CopyResource(t, &sh.present);
         }
         let _ = sh.km_present.ReleaseSync(0);
+        if frame != size {
+            if let Some(t) = &last {
+                blit(&pdevice, &pcontext, &mut scaler, &back, size, t, frame, video_aspect(&fit));
+            }
+        }
         if let Some((version, text)) = overlay_of(hwnd) {
             let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
             if overlay.as_ref().is_some_and(|o| o.scale() != scale) {
@@ -1144,6 +1414,18 @@ unsafe fn run(
             }
             if let Some(o) = overlay.as_mut() {
                 o.draw(&pcontext, &back, size, version, &text);
+            }
+        }
+        if let Some((text, ok)) = badge_of(hwnd) {
+            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+            if badge.as_ref().is_some_and(|b| b.scale() != scale) {
+                badge = None;
+            }
+            if badge.is_none() {
+                badge = crate::badge::Badge::new(&pdevice, scale).map_err(|e| eprintln!("badge: {e}")).ok();
+            }
+            if let Some(b) = badge.as_mut() {
+                let _ = b.draw(&back, size, &text, ok);
             }
         }
         let frame_look = controls_of(hwnd);
@@ -1163,6 +1445,13 @@ unsafe fn run(
 
         let presenting = std::time::Instant::now();
         let hr = sc.Present(0, present_flags);
+        if hr != DXGI_ERROR_WAS_STILL_DRAWING && controls_timing() {
+            if frame == client_size(hwnd) {
+                if let Some(t) = FS_AT.lock().unwrap().take() {
+                    eprintln!("fullscreen: switch to a fitted frame {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+        }
         if hr != DXGI_ERROR_WAS_STILL_DRAWING && frame_look != drawn_look {
             if frame_look.is_some() {
                 shown_input();
@@ -1177,6 +1466,9 @@ unsafe fn run(
             stats.skipped.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.presented.fetch_add(1, Ordering::Relaxed);
+            if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
+                st.video = true;
+            }
         }
     }
 }
