@@ -257,6 +257,30 @@ unsafe fn client_and_scale(hwnd: HWND) -> ((u32, u32), f32) {
     (((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32), GetDpiForWindow(hwnd).max(96) as f32 / 96.0)
 }
 
+/// Sets the hand cursor when the pointer is on a control (mute, volume bar, fullscreen) of
+/// a window that has them. True when it did.
+unsafe fn controls_cursor(hwnd: HWND) -> bool {
+    use crate::controls::Hit;
+    let has = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).is_some_and(|st| st.audio.is_some());
+    if !has {
+        return false;
+    }
+    let mut p = windows::Win32::Foundation::POINT::default();
+    if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p).is_err() || !windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p).as_bool() {
+        return false;
+    }
+    let (size, scale) = client_and_scale(hwnd);
+    match crate::controls::hit(size, scale, p.x, p.y) {
+        Hit::Mute | Hit::Bar(_) | Hit::Fullscreen => {
+            if let Ok(c) = LoadCursorW(None, IDC_HAND) {
+                SetCursor(Some(c));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Mouse input for the controls. True when it was theirs.
 unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     use crate::controls::Hit;
@@ -507,6 +531,15 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
             mark(st);
         }
+        // The monitor it is on now, before leaving the main window: taken out, its position
+        // relative to the main window turns into one on the primary monitor, and the video
+        // went fullscreen there instead of where the app was (any other monitor).
+        // STREAMER_DEBUG_FS_MONITOR_AFTER: asked afterwards, the spoiled variant for the gate.
+        let monitor_after = std::env::var_os("STREAMER_DEBUG_FS_MONITOR_AFTER").is_some();
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !monitor_after {
+            let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        }
         // From inside the main window: become a window of its own first.
         if embedded {
             SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
@@ -515,8 +548,9 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         let _ = GetWindowPlacement(hwnd, &mut place);
         let style = GetWindowLongW(hwnd, GWL_STYLE);
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        if monitor_after {
+            let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        }
         let r = mi.rcMonitor;
         SetWindowLongW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as i32)) | WS_POPUP.0 as i32);
         let _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
@@ -616,6 +650,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                 apply_place(hwnd);
                 LRESULT(0)
             }
+            // The hand over the panel's buttons and volume bar, as over the app's own buttons.
+            WM_SETCURSOR if (l.0 & 0xFFFF) as u32 == HTCLIENT && controls_cursor(hwnd) => LRESULT(1),
             WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONUP if controls_mouse(hwnd, msg, w, l) => LRESULT(0),
             WM_MOUSEMOVE | WM_LBUTTONUP => DefWindowProcW(hwnd, msg, w, l),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if controls_mouse(hwnd, msg, w, l) => LRESULT(0),
