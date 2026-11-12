@@ -74,9 +74,16 @@ enum End {
 }
 
 /// Moves messages both ways until the connection ends.
-fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<ServerMsg>, break_at: &mut Option<Instant>) -> End {
+fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<ServerMsg>, break_at: &mut Option<Instant>, keep_place: &std::sync::atomic::AtomicBool) -> End {
     let mut alive = Instant::now() - Duration::from_secs(1);
     loop {
+        // Closed with no Leave: the server keeps our place for its grace (20 s), so coming
+        // back soon takes it again (`close_keeping_place`).
+        if keep_place.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = ws.close(None);
+            let _ = ws.flush();
+            return End::Left;
+        }
         // Test only: STREAMER_DEBUG_SIGNALING_BREAK_AT cuts the connection once, as a
         // broken TLS session did.
         if break_at.is_some_and(|t| Instant::now() >= t) {
@@ -159,6 +166,8 @@ pub struct ServerClient {
     pub resumed: bool,
     /// The connection broke and is being made again.
     pub reconnecting: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `close_keeping_place`: the connection closes with no Leave.
+    keep_place: Arc<std::sync::atomic::AtomicBool>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -190,6 +199,8 @@ impl ServerClient {
         let url = url.to_string();
         let reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let again_flag = reconnecting.clone();
+        let keep_place = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keep = keep_place.clone();
         let mut break_at = std::env::var("STREAMER_DEBUG_SIGNALING_BREAK_AT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -197,7 +208,7 @@ impl ServerClient {
         let thread = std::thread::Builder::new()
             .name("signaling".into())
             .spawn(move || loop {
-                match pump(&mut ws, &out_rx, &in_tx, &mut break_at) {
+                match pump(&mut ws, &out_rx, &in_tx, &mut break_at, &keep) {
                     End::Left | End::Gone => return,
                     End::Broken => {}
                 }
@@ -235,14 +246,20 @@ impl ServerClient {
             })
             .unwrap();
         let resume = w.token.clone().map(|token| Resume { id, token });
-        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, reconnecting, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
+        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, reconnecting, keep_place, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
     }
 
     /// A client with no server, for a direct session: what it is asked to send comes out of
     /// the returned receiver, for the direct link to carry.
     pub fn local(id: PeerId, peers: Vec<PeerInfo>) -> (Arc<Self>, mpsc::Receiver<ClientMsg>) {
         let (out, rx) = mpsc::channel();
-        (Arc::new(Self { out, id, peers, title: None, resume: None, resumed: false, reconnecting: Arc::default(), thread: std::sync::Mutex::new(None) }), rx)
+        (Arc::new(Self { out, id, peers, title: None, resume: None, resumed: false, reconnecting: Arc::default(), keep_place: Arc::default(), thread: std::sync::Mutex::new(None) }), rx)
+    }
+
+    /// Closes the connection with no Leave: the server keeps our place for a while, and we
+    /// still show in the room meanwhile (a room switched away from, where we did nothing).
+    pub fn close_keeping_place(&self) {
+        self.keep_place.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn send(&self, m: ClientMsg) {

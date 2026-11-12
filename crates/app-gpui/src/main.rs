@@ -359,6 +359,7 @@ impl Shell {
     /// Takes a room off the saved list (the open one stays open).
     fn forget_room(&mut self, r: &Room) {
         self.rooms.retain(|x| !x.same(r));
+        core::leave_background(&self.core, &r.room);
         let mut state = core::state_load();
         state.insert("rooms".into(), serde_json::Value::Array(self.rooms.iter().map(Room::to_json).collect()));
         let _ = core::state_save(&serde_json::Value::Object(state).to_string());
@@ -371,6 +372,8 @@ impl Shell {
             return;
         }
         let next = Room { name: name.to_string(), ..r.clone() };
+        // Kept in the background under the old name: that place goes.
+        core::leave_background(&self.core, &r.room);
         for x in self.rooms.iter_mut().filter(|x| x.same(r)) {
             *x = next.clone();
         }
@@ -473,9 +476,13 @@ impl Shell {
         // Many rooms scroll; their buttons keep their size (flex_none) instead of squeezing.
         div().id("rail").w(px(72.)).h_full().flex_none().bg(rgb(color::RAIL)).overflow_y_scroll().flex().flex_col().items_center().gap_2().py_3().children(self.rooms.iter().enumerate().map(|(i, r)| {
             let on = current.as_ref().is_some_and(|c| c.same(r));
+            // Still connected in the background (watching or streaming there): a green dot.
+            let kept = !on && self.snap.background.iter().any(|b| *b == r.room);
             let room = r.clone();
             div()
                 .id(("room", i))
+                .relative()
+                .when(kept, |d| d.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(16.)).rounded_full().bg(rgb(color::RAIL)).flex().items_center().justify_center().child(div().size(px(10.)).rounded_full().bg(rgb(color::GREEN)))))
                 .size_12()
                 .flex_none()
                 .flex()
@@ -858,7 +865,7 @@ fn main() {
                     eprintln!("window: hidden in the tray");
                     return false;
                 }
-                core::leave_for_good(&close, Duration::from_millis(500));
+                core::leave_everything(&close, Duration::from_millis(500));
                 cx.quit();
                 true
             });

@@ -26,6 +26,10 @@ pub struct App {
     pub release: Mutex<Option<update::Release>>,
     /// Key of the open room in the saved places (`resume_key`).
     joined: Mutex<Option<String>>,
+    /// Rooms switched away from while watching or streaming there: still connected, their
+    /// video hidden, until opened again. By `resume_key`. Only one room watches or streams
+    /// at a time (`quiet_background`).
+    background: Mutex<Vec<(String, Arc<Session>)>>,
     /// The direct connection (beta) and our name in it, while there is one.
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
 }
@@ -126,6 +130,8 @@ pub struct Snapshot {
     pub direct: Option<&'static str>,
     /// The connection to the server broke and is being made again (our place is kept).
     pub reconnecting: bool,
+    /// Room codes of rooms kept connected in the background (watching or streaming there).
+    pub background: Vec<String>,
 }
 
 /// The watched streams only (no notices or links taken), for a quick refresh after a click.
@@ -138,7 +144,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, reconnecting: false };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, reconnecting: false, background: background_rooms(app) };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -157,6 +163,7 @@ pub fn snapshot(app: &App) -> Snapshot {
         notice,
         link,
         reconnecting: s.reconnecting(),
+        background: background_rooms(app),
         direct: s.direct.then(|| if app.direct.lock().unwrap().as_ref().is_some_and(|(c, _)| c.is_open()) { "connected" } else { "waiting" }),
     }
 }
@@ -365,7 +372,7 @@ pub fn install_update(app: &App) -> Result<bool, String> {
     eprintln!("update: downloaded and checked {}", path.display());
     update::run_installer(&path)?;
     if std::env::var_os("STREAMER_UPDATE_DRY").is_none() {
-        leave_for_good(app, std::time::Duration::from_millis(500));
+        leave_everything(app, std::time::Duration::from_millis(500));
         return Ok(true);
     }
     Ok(false)
@@ -399,8 +406,24 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     // both connections alive: the same person twice in the room.
     static JOINING: Mutex<()> = Mutex::new(());
     let _one = JOINING.lock().unwrap_or_else(|e| e.into_inner());
-    leave_for_good(app, std::time::Duration::from_millis(300));
     let key = resume_key(server, room, name);
+    if app.joined.lock().unwrap().as_deref() == Some(key.as_str()) && app.session.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    step_away(app);
+    // A room kept in the background opens again as it is: no new join.
+    let kept = {
+        let mut bg = app.background.lock().unwrap();
+        bg.iter().position(|(k, _)| *k == key).map(|i| bg.remove(i).1)
+    };
+    if let Some(s) = kept {
+        eprintln!("rooms: back to {room} (kept in the background)");
+        set_videos_hidden(&s, false);
+        *app.joined.lock().unwrap() = Some(key);
+        *app.session.lock().unwrap() = Some(s.clone());
+        app.sampler.attach(s);
+        return Ok(());
+    }
     let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
     save_place(&key, s.resume());
     *app.joined.lock().unwrap() = Some(key);
@@ -420,7 +443,20 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                 // A room left on purpose (another one opened) ends too. That is no news, and
                 // the open session is the new room's: taking it here left the new room and
                 // showed "Lost the connection". STREAMER_DEBUG_LOST_ANY_SESSION: the old way.
-                Event::Lost if !is_open_session(&a, &mine) && std::env::var_os("STREAMER_DEBUG_LOST_ANY_SESSION").is_none() => break,
+                Event::Lost if !is_open_session(&a, &mine) && std::env::var_os("STREAMER_DEBUG_LOST_ANY_SESSION").is_none() => {
+                    // A room kept in the background lost its connection: it ends.
+                    let gone = {
+                        let mut bg = a.background.lock().unwrap();
+                        let i = bg.iter().position(|(_, s)| mine.upgrade().is_some_and(|m| Arc::ptr_eq(s, &m)));
+                        i.map(|i| bg.remove(i))
+                    };
+                    if let Some((k, s)) = gone {
+                        eprintln!("rooms: a room in the background lost its connection");
+                        s.leave();
+                        save_place(&k, None);
+                    }
+                    break;
+                }
                 Event::Lost => {
                     a.notify("lost".into());
                     // Stop the stream and the watches first: dropping them while their
@@ -443,6 +479,78 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         }
     });
     Ok(())
+}
+
+/// Room codes of the rooms kept in the background.
+fn background_rooms(app: &App) -> Vec<String> {
+    app.background.lock().unwrap().iter().map(|(_, s)| s.room.clone()).collect()
+}
+
+/// Hides (or shows again) a room's video inside the main window. A video popped out into a
+/// window of its own is not touched by this (`present::place` ignores `hidden` for it).
+fn set_videos_hidden(s: &Session, hidden: bool) {
+    for w in s.watching() {
+        if let Some(win) = w.viewer.window {
+            win.set_hidden(hidden);
+        }
+    }
+}
+
+/// The open room steps aside for another: watching or streaming there, it stays connected
+/// in the background (its video hidden); otherwise its connection closes with no Leave, so
+/// the server keeps the place 20 s and coming back takes it again. A direct connection ends.
+/// STREAMER_DEBUG_LEAVE_ON_SWITCH: every room is left, as before.
+fn step_away(app: &App) {
+    if app.direct.lock().unwrap().is_some() || std::env::var_os("STREAMER_DEBUG_LEAVE_ON_SWITCH").is_some() {
+        leave_for_good(app, std::time::Duration::from_millis(300));
+        return;
+    }
+    let s = app.session.lock().unwrap().take();
+    let key = app.joined.lock().unwrap().take();
+    let (Some(s), Some(key)) = (s, key) else { return };
+    if s.busy() {
+        eprintln!("rooms: {} stays connected in the background", s.room);
+        set_videos_hidden(&s, true);
+        app.background.lock().unwrap().push((key, s));
+    } else {
+        eprintln!("rooms: {} closed, place kept", s.room);
+        s.close_keeping_place();
+    }
+}
+
+/// Watching or streaming in the open room ends it in the background rooms (one room at a
+/// time), which then close keeping their place.
+fn quiet_background(app: &App) {
+    let rooms: Vec<(String, Arc<Session>)> = std::mem::take(&mut *app.background.lock().unwrap());
+    for (_, s) in rooms {
+        eprintln!("rooms: {} stops in the background (now active here)", s.room);
+        s.leave_activity();
+        s.close_keeping_place();
+    }
+}
+
+/// Leaves a room kept in the background (taken off the list, renamed).
+pub fn leave_background(app: &App, room: &str) {
+    let gone: Vec<(String, Arc<Session>)> = {
+        let mut bg = app.background.lock().unwrap();
+        let (gone, keep) = std::mem::take(&mut *bg).into_iter().partition(|(_, s)| s.room == room);
+        *bg = keep;
+        gone
+    };
+    for (k, s) in gone {
+        s.leave_and_wait(std::time::Duration::from_millis(300));
+        save_place(&k, None);
+    }
+}
+
+/// The app quits: every room is left, the open one and those in the background.
+pub fn leave_everything(app: &App, wait: std::time::Duration) {
+    let rooms: Vec<(String, Arc<Session>)> = std::mem::take(&mut *app.background.lock().unwrap());
+    for (k, s) in rooms {
+        s.leave_and_wait(wait);
+        save_place(&k, None);
+    }
+    leave_for_good(app, wait);
 }
 
 /// Whether `mine` is the open session (not one left for another room).
@@ -616,6 +724,7 @@ fn live_config(req: &GoLive) -> Result<HostConfig, String> {
 /// Starts streaming in the open room. Blocks.
 pub fn go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    quiet_background(app);
     let cfg = live_config(&req)?;
     eprintln!("live: {}x{}@{} {} kbit/s {} audio {}", cfg.mode.width, cfg.mode.height, cfg.mode.fps, cfg.kbit, cfg.codec.short(), if !cfg.audio { "none" } else if cfg.audio_pid.is_some() { "app" } else { "system" });
     s.start_streaming(cfg).inspect_err(|e| eprintln!("go_live failed: {e}"))?;
@@ -641,6 +750,7 @@ pub fn end_live(app: &App) {
 /// video window inside the main window waits for that thread).
 pub fn watch(app: &App, streamer: u64, quality: Option<String>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    quiet_background(app);
     s.watch(streamer, ViewerConfig::default(), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
     Ok(())
 }
@@ -749,6 +859,14 @@ fn test_window_actions(w: Option<media::present::Window>) {
     // "embed": pop out at +6 s, back in at +12 s, fullscreen at +18 s, back at +24 s.
     // "fsloop": from +5 s, fullscreen on and off 30 times at uneven intervals while the main
     // thread keeps placing the video (as the UI does while it lays out), then stays embedded.
+    // "popout": out in a window of its own at +2 s, and stays there.
+    if mode == "popout" {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            w.set_popped(true);
+        });
+        return;
+    }
     if mode == "fsloop" {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));

@@ -214,6 +214,16 @@ impl Session {
     }
 
     /// Leaves and waits up to `wait` until the server is told: for an app about to exit.
+    /// Closes the room's connection with no Leave (see `ServerClient::close_keeping_place`).
+    pub fn close_keeping_place(&self) {
+        self.client.close_keeping_place();
+    }
+
+    /// Watching or streaming here.
+    pub fn busy(&self) -> bool {
+        !self.watching().is_empty() || self.host().is_some()
+    }
+
     pub fn leave_and_wait(&self, wait: Duration) {
         self.leave();
         self.client.leave_and_wait(wait);
@@ -339,6 +349,17 @@ impl Session {
             win.close();
         }
         let _ = self.events.send(Event::WatchEnded { streamer, reason: reason.into() });
+    }
+
+    /// Ends our watches and our stream here, staying in the room.
+    pub fn leave_activity(&self) {
+        let ids: Vec<PeerId> = self.state.lock().unwrap().watches.keys().copied().collect();
+        for id in ids {
+            self.end_watch(id, "left the room", true);
+        }
+        if self.host().is_some() {
+            self.stop_streaming();
+        }
     }
 
     /// Leaves the room: ends watches and our stream.
