@@ -329,8 +329,10 @@ impl Shell {
             self.open_room(known, cx);
             return;
         }
+        // The link's own server first (the invite page names it), then the settings'.
         let server = core::built_in()
             .map(String::from)
+            .or_else(|| join::parse_server(link))
             .or_else(|| settings().get("server").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(String::from))
             .or_else(|| self.current.as_ref().map(|c| c.server.clone()))
             .unwrap_or_else(|| self.join.server.read(cx).value().to_string());

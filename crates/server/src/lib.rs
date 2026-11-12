@@ -323,18 +323,31 @@ impl Server {
 /// The page behind an invite link (`/j/K7Q2-9XMB-4TQ1`). Messengers make https links
 /// clickable but not `backseat://` ones, so the link comes here and the page hands the
 /// code to the app. Self-contained: no scripts or styles from anywhere else.
-async fn invite_page(axum::extract::Path(code): axum::extract::Path<String>) -> axum::response::Response {
+async fn invite_page(headers: axum::http::HeaderMap, axum::extract::Path(code): axum::extract::Path<String>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let clean = clean_code(&code);
     if clean.len() != 12 {
         return (axum::http::StatusCode::NOT_FOUND, "no such invite").into_response();
     }
-    page(&clean, &clean, None, None)
+    let href = with_server(clean.clone(), &headers);
+    page(&href, &clean, None, None)
+}
+
+/// The app's link with this server's own address in it (`...?server=wss://host/ws`), so the
+/// room opens on this server whatever server the app has in its settings. From the request:
+/// a proxy in front says the outside scheme (X-Forwarded-Proto) and host.
+fn with_server(href: String, headers: &axum::http::HeaderMap) -> String {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or(v).trim().to_string());
+    let Some(host) = get("x-forwarded-host").or_else(|| get("host")).filter(|h| !h.is_empty() && !h.contains(['/', ' ', '"', '<', '>'])) else { return href };
+    let ws = if get("x-forwarded-proto").as_deref() == Some("https") { "wss" } else { "ws" };
+    let sep = if href.contains('?') { '&' } else { '?' };
+    format!("{href}{sep}server={}", percent_encode(&format!("{ws}://{host}/ws")))
 }
 
 /// A temporary room's invite (`/t/CODE?title=...`): the same page with its end time, or a
 /// note that it has ended. A code this server did not sign is no invite.
 async fn temp_invite_page(
+    headers: axum::http::HeaderMap,
     State(server): State<Arc<Server>>,
     axum::extract::Path(code): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
@@ -349,6 +362,7 @@ async fn temp_invite_page(
         Some(t) => format!("{clean}?title={}", percent_encode(t)),
         None => clean.clone(),
     };
+    let href = with_server(href, &headers);
     page(&href, &clean, Some(ends), title.as_deref())
 }
 

@@ -118,6 +118,43 @@ fn percent_encode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// The server a link names: `server=` in the app's link (the invite page puts its own
+/// address there), else the host of an invite page's link (`https://host/j/...` ->
+/// `wss://host/ws`). None for a bare code.
+pub fn parse_server(link: &str) -> Option<String> {
+    let link = link.trim();
+    if let Some(v) = query_value(link, "server") {
+        return (v.starts_with("ws://") || v.starts_with("wss://")).then_some(v);
+    }
+    let (scheme, rest) = link.split_once("://")?;
+    let ws = match scheme.to_ascii_lowercase().as_str() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return None,
+    };
+    let (host, path) = rest.split_once('/')?;
+    (!host.is_empty() && (path.starts_with("j/") || path.starts_with("t/"))).then(|| format!("{ws}://{host}/ws"))
+}
+
+/// One query parameter of a link, percent-decoded.
+fn query_value(link: &str, key: &str) -> Option<String> {
+    let q = link.split_once('?')?.1;
+    let v = q.split('&').find_map(|kv| kv.strip_prefix(key).and_then(|r| r.strip_prefix('=')))?;
+    let mut bytes = Vec::new();
+    let mut it = v.bytes();
+    while let Some(b) = it.next() {
+        match b {
+            b'%' => {
+                let h: String = it.by_ref().take(2).map(|c| c as char).collect();
+                bytes.push(u8::from_str_radix(&h, 16).ok()?);
+            }
+            b'+' => bytes.push(b' '),
+            b => bytes.push(b),
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// The room's name a temporary room's link carries (`...?title=Friday%20games`), if any.
 pub fn parse_title(link: &str) -> Option<String> {
     let v = link.split_once("title=")?.1.split('&').next()?;
@@ -308,7 +345,12 @@ impl Shell {
                 Room { server, room: new_code(), name, title: Some(title) }
             }
             Mode::Code => match parse_code(&self.field(&self.join.code.clone(), cx)) {
-                Some(code) => Room { server, room: code, name, title: None },
+                // A pasted link names its server: the room is on that one.
+                Some(code) => {
+                    let pasted = self.field(&self.join.code.clone(), cx);
+                    let server = core::built_in().map(String::from).or_else(|| parse_server(&pasted)).unwrap_or(server);
+                    Room { server, room: code, name, title: parse_title(&pasted) }
+                }
                 None => {
                     self.join.error = Some(t("join.bad_code").to_string());
                     cx.notify();
@@ -865,7 +907,7 @@ fn test_filled(window: &mut Window, cx: &mut Context<Shell>, len: usize, name: S
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's prelude brings its own `test` attribute.
-    use super::{invite_link, is_code, parse_code, parse_title, temp_over};
+    use super::{invite_link, is_code, parse_code, parse_server, parse_title, temp_over};
     use crate::Room;
 
     #[test]
@@ -879,6 +921,12 @@ mod tests {
         assert_eq!(parse_title("backseat://join/0H4N1NFBKRKKRY8Z3HVT"), None);
         // Ordinary codes still parse; 16 symbols are neither.
         assert_eq!(parse_code("https://x/j/8TJB-5QCW-EATF").as_deref(), Some("8TJB5QCWEATF"));
+        assert_eq!(parse_server("https://example.org/j/8TJB-5QCW-EATF").as_deref(), Some("wss://example.org/ws"));
+        assert_eq!(parse_server("http://127.0.0.1:7800/t/0H4N-1NFB-KRKK-RY8Z-3HVT?title=x").as_deref(), Some("ws://127.0.0.1:7800/ws"));
+        assert_eq!(parse_server("backseat://join/8TJB5QCWEATF?server=wss%3A%2F%2Fexample.org%2Fws").as_deref(), Some("wss://example.org/ws"));
+        assert_eq!(parse_server("backseat://join/8TJB5QCWEATF?server=javascript%3Ax"), None);
+        assert_eq!(parse_server("8TJB-5QCW-EATF"), None);
+        assert_eq!(parse_server("backseat://join/8TJB5QCWEATF"), None);
         assert_eq!(parse_code("8TJB-5QCW-EATF-0000"), None);
         let r = Room { server: "wss://example.org/ws".into(), room: code.into(), name: "n".into(), title: Some("Fri Ігри".into()) };
         let link = invite_link(&r);
