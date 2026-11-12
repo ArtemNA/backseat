@@ -281,6 +281,30 @@ unsafe fn controls_cursor(hwnd: HWND) -> bool {
     }
 }
 
+/// STREAMER_DEBUG_CONTROLS_TIMING: when the last input to the controls came, to report how
+/// long it took to show (`shown_input`).
+static INPUT_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn controls_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("STREAMER_DEBUG_CONTROLS_TIMING").is_some())
+}
+
+fn mark_input() {
+    if controls_timing() {
+        INPUT_AT.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+    }
+}
+
+/// A frame with a changed panel was just presented: how long since the input.
+fn shown_input() {
+    if controls_timing() {
+        if let Some(t) = INPUT_AT.lock().unwrap().take() {
+            eprintln!("controls: input to screen {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 /// Mouse input for the controls. True when it was theirs.
 unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     use crate::controls::Hit;
@@ -302,6 +326,7 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     let (size, scale) = client_and_scale(hwnd);
     match msg {
         WM_MOUSEWHEEL => {
+            mark_input();
             let notches = ((w.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
             let (_, v) = audio(None, None);
             audio(Some(false), Some(v + notches * 0.05));
@@ -933,6 +958,9 @@ unsafe fn run(
     let mut pending = ((0u32, 0u32), std::time::Instant::now());
     let mut overlay: Option<crate::overlay::Overlay> = None;
     let mut controls: Option<crate::controls::Controls> = None;
+    let mut drawn_look: Option<crate::controls::Look> = None;
+    // The last frame, kept while the controls show, to draw them again without a new frame.
+    let mut last: Option<ID3D11Texture2D> = None;
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -971,8 +999,41 @@ unsafe fn run(
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         };
-        // Latest frame wins: the appsink holds one buffer and drops older ones.
-        let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(20)) else { continue };
+        // Latest frame wins: the appsink holds one buffer and drops older ones. While the
+        // controls show, a short wait: the loop also takes the mouse and redraws them.
+        // STREAMER_DEBUG_CONTROLS_WITH_FRAMES: the old way (20 ms, drawn only with a frame).
+        let old_way = std::env::var_os("STREAMER_DEBUG_CONTROLS_WITH_FRAMES").is_some();
+        let active = controls_of(hwnd).is_some() || drawn_look.is_some();
+        let wait = if active && !old_way { 4 } else { 20 };
+        let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(wait)) else {
+            // No new frame, but the controls changed (a click, the volume, hiding): the last
+            // frame again with them. Drawn only with frames, they lagged a frame or more (30
+            // fps: p90 33 ms, max 59) and stood still while the stream did.
+            let look = controls_of(hwnd);
+            if !old_way && look != drawn_look {
+                if let (Some(sc), Some(prev)) = (&swapchain, &last) {
+                    let free = waitable.is_invalid() || windows::Win32::System::Threading::WaitForSingleObjectEx(waitable, 0, false) == windows::Win32::Foundation::WAIT_OBJECT_0;
+                    if free {
+                        let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
+                        pcontext.CopyResource(&back, prev);
+                        if let (Some((version, text)), Some(o)) = (overlay_of(hwnd), overlay.as_mut()) {
+                            o.draw(&pcontext, &back, size, version, &text);
+                        }
+                        if let (Some(l), Some(c)) = (look, controls.as_mut()) {
+                            c.draw(&pcontext, &back, size, l);
+                        }
+                        drop(back);
+                        if sc.Present(0, present_flags) != DXGI_ERROR_WAS_STILL_DRAWING {
+                            if look.is_some() {
+                                shown_input();
+                            }
+                            drawn_look = look;
+                        }
+                    }
+                }
+            }
+            continue;
+        };
         let (Some(buffer), Some(frame)) = (sample.buffer(), frame_size(&sample)) else { continue };
 
         if swapchain.is_none() || frame != size {
@@ -1055,6 +1116,23 @@ unsafe fn run(
         let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
         let _ = sh.km_present.AcquireSync(1, 100);
         pcontext.CopyResource(&back, &sh.present);
+        // Kept for redrawing the controls between frames (only while they show).
+        if controls_of(hwnd).is_some() {
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            sh.present.GetDesc(&mut d);
+            if last.as_ref().is_none_or(|t| {
+                let mut ld = D3D11_TEXTURE2D_DESC::default();
+                t.GetDesc(&mut ld);
+                (ld.Width, ld.Height) != (d.Width, d.Height)
+            }) {
+                d.MiscFlags = 0;
+                let mut t = None;
+                last = pdevice.CreateTexture2D(&d, None, Some(&mut t)).ok().and(t);
+            }
+            if let Some(t) = &last {
+                pcontext.CopyResource(t, &sh.present);
+            }
+        }
         let _ = sh.km_present.ReleaseSync(0);
         if let Some((version, text)) = overlay_of(hwnd) {
             let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
@@ -1068,7 +1146,8 @@ unsafe fn run(
                 o.draw(&pcontext, &back, size, version, &text);
             }
         }
-        if let Some(look) = controls_of(hwnd) {
+        let frame_look = controls_of(hwnd);
+        if let Some(look) = frame_look {
             let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
             if controls.as_ref().is_some_and(|c| c.scale() != scale) {
                 controls = None;
@@ -1084,6 +1163,12 @@ unsafe fn run(
 
         let presenting = std::time::Instant::now();
         let hr = sc.Present(0, present_flags);
+        if hr != DXGI_ERROR_WAS_STILL_DRAWING && frame_look != drawn_look {
+            if frame_look.is_some() {
+                shown_input();
+            }
+            drawn_look = frame_look;
+        }
         if !slow_in_lock && slow_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(slow_ms));
         }
