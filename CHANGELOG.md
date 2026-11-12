@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.4
+
+- The video window's volume bar and buttons respond at once: they were redrawn only with the next video frame (at 30 fps a click showed up to 35 ms later, and the bar jumped while dragging). Median from input to screen now about 6 ms.
+
 ## 0.2.3
 
 - Fullscreen opens on the monitor the app is on: from a monitor other than the primary one it went fullscreen on the primary monitor.
