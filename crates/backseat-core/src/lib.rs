@@ -124,6 +124,8 @@ pub struct Snapshot {
     pub link: Option<String>,
     /// A direct session (no server, beta): "connected" or "waiting".
     pub direct: Option<&'static str>,
+    /// The connection to the server broke and is being made again (our place is kept).
+    pub reconnecting: bool,
 }
 
 /// The watched streams only (no notices or links taken), for a quick refresh after a click.
@@ -136,7 +138,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, reconnecting: false };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -154,6 +156,7 @@ pub fn snapshot(app: &App) -> Snapshot {
         live: app.sampler.live(),
         notice,
         link,
+        reconnecting: s.reconnecting(),
         direct: s.direct.then(|| if app.direct.lock().unwrap().as_ref().is_some_and(|(c, _)| c.is_open()) { "connected" } else { "waiting" }),
     }
 }
@@ -162,6 +165,7 @@ pub fn snapshot(app: &App) -> Snapshot {
 fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &str, other: &str, inviter: bool) -> Result<(), String> {
     let (s, events) = Session::direct(control, name, other, inviter)?;
     *app.session.lock().unwrap() = Some(s.clone());
+    let mine = Arc::downgrade(&s);
     app.sampler.attach(s);
     let a = app.clone();
     std::thread::spawn(move || {
@@ -169,6 +173,8 @@ fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &s
             match e {
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
+                // Left on purpose (another room opened): no news, and not ours to close.
+                Event::Lost if !is_open_session(&a, &mine) => break,
                 Event::Lost => {
                     // The other person left or the connection broke: stop cleanly.
                     a.notify("direct_ended".into());
@@ -404,12 +410,17 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     }
     app.sampler.attach(s.clone());
     let a = app.clone();
+    let mine = Arc::downgrade(&s);
     std::thread::spawn(move || {
         while let Ok(e) = events.recv() {
             match e {
                 // Leaving the room on purpose ends its watches; that is no news.
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
+                // A room left on purpose (another one opened) ends too. That is no news, and
+                // the open session is the new room's: taking it here left the new room and
+                // showed "Lost the connection". STREAMER_DEBUG_LOST_ANY_SESSION: the old way.
+                Event::Lost if !is_open_session(&a, &mine) && std::env::var_os("STREAMER_DEBUG_LOST_ANY_SESSION").is_none() => break,
                 Event::Lost => {
                     a.notify("lost".into());
                     // Stop the stream and the watches first: dropping them while their
@@ -432,6 +443,12 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         }
     });
     Ok(())
+}
+
+/// Whether `mine` is the open session (not one left for another room).
+fn is_open_session(app: &App, mine: &std::sync::Weak<Session>) -> bool {
+    let Some(mine) = mine.upgrade() else { return false };
+    app.session.lock().unwrap().as_ref().is_some_and(|s| Arc::ptr_eq(s, &mine))
 }
 
 pub fn leave(app: &App) {

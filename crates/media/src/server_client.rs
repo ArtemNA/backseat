@@ -157,6 +157,8 @@ pub struct ServerClient {
     pub resume: Option<Resume>,
     /// The join took back a place kept from an earlier start (`join_resuming`).
     pub resumed: bool,
+    /// The connection broke and is being made again.
+    pub reconnecting: Arc<std::sync::atomic::AtomicBool>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -186,6 +188,8 @@ impl ServerClient {
         let (out_tx, out_rx) = mpsc::channel::<ClientMsg>();
         let (in_tx, in_rx) = mpsc::channel::<ServerMsg>();
         let url = url.to_string();
+        let reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let again_flag = reconnecting.clone();
         let mut break_at = std::env::var("STREAMER_DEBUG_SIGNALING_BREAK_AT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -202,6 +206,7 @@ impl ServerClient {
                 let ClientMsg::Join { room, name, title, .. } = join.clone() else { return };
                 let again = ClientMsg::Join { room, name, title, resume: Some(Resume { id, token }) };
                 let until = Instant::now() + RESUME_FOR;
+                again_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 let resumed = loop {
                     if Instant::now() >= until {
                         break None;
@@ -219,6 +224,7 @@ impl ServerClient {
                         Err(e) => eprintln!("signaling: reconnecting: {e}"),
                     }
                 };
+                again_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some((s, w)) = resumed else { return };
                 eprintln!("signaling: reconnected, still peer {id}");
                 ws = s;
@@ -229,14 +235,14 @@ impl ServerClient {
             })
             .unwrap();
         let resume = w.token.clone().map(|token| Resume { id, token });
-        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
+        Ok((Arc::new(Self { out: out_tx, id, peers: w.peers, title: w.title, resume, resumed, reconnecting, thread: std::sync::Mutex::new(Some(thread)) }), in_rx))
     }
 
     /// A client with no server, for a direct session: what it is asked to send comes out of
     /// the returned receiver, for the direct link to carry.
     pub fn local(id: PeerId, peers: Vec<PeerInfo>) -> (Arc<Self>, mpsc::Receiver<ClientMsg>) {
         let (out, rx) = mpsc::channel();
-        (Arc::new(Self { out, id, peers, title: None, resume: None, resumed: false, thread: std::sync::Mutex::new(None) }), rx)
+        (Arc::new(Self { out, id, peers, title: None, resume: None, resumed: false, reconnecting: Arc::default(), thread: std::sync::Mutex::new(None) }), rx)
     }
 
     pub fn send(&self, m: ClientMsg) {

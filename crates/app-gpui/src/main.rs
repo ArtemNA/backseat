@@ -692,7 +692,7 @@ impl Render for Shell {
         if let Some(code) = self.join.pending_code.take() {
             self.join.code.update(cx, |i, cx| i.set_value(code, window, cx));
         }
-        self.sync_videos_hidden();
+        self.sync_videos_hidden(cx);
         self.sync_tiles(window, cx);
         let dialog = self.render_dialog(cx);
         let menu = self.render_room_menu(cx);

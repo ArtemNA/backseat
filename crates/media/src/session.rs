@@ -204,6 +204,11 @@ impl Session {
     }
 
     /// What a later start of the app needs to take this place back.
+    /// The connection to the server broke and is being made again.
+    pub fn reconnecting(&self) -> bool {
+        self.client.reconnecting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn resume(&self) -> Option<Resume> {
         self.client.resume.clone()
     }

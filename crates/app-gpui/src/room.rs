@@ -7,7 +7,7 @@ use crate::{color, settings, Shell};
 use backseat_core::{self as core, sampler::{LiveStats, WatchStats}, PeerView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{Icon, IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -30,7 +30,14 @@ pub struct Tile {
     /// The rows we set last; a different selection means the viewer picked it.
     shown: (usize, usize),
     touched: bool,
+    /// A pick is applied once the pickers stay still for a moment (`APPLY_AFTER`): changing
+    /// both the size and the bitrate then restarts the streamer's encoder once, not twice.
+    picked: u64,
+    _subs: [Subscription; 2],
 }
+
+/// How long the pickers must stay still before a pick is asked for.
+const APPLY_AFTER: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 pub struct Room {
@@ -128,12 +135,31 @@ impl Shell {
         cx.notify();
     }
 
-    /// "Apply": asks the streamer for what the pickers say (one of the host's presets).
+    /// A picker changed: asks for it when no other change follows within `APPLY_AFTER`.
+    fn picker_changed(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(t) = self.room.tiles.get_mut(&id) else { return };
+        t.touched = true;
+        t.picked += 1;
+        let picked = t.picked;
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(APPLY_AFTER).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.room.tiles.get(&id).is_some_and(|t| t.picked == picked) {
+                    s.apply_quality(id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Asks the streamer for what the pickers say (one of the host's presets). "As streamed"
+    /// with no bitrate asks for the most: the streamer's own quality.
     pub fn apply_quality(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(t) = self.room.tiles.get_mut(&id) {
             t.touched = true;
         }
-        if let Some(q) = self.picked_request(id, cx) {
+        eprintln!("quality: asking {id} for {:?}", self.picked_request(id, cx));
+        if let Some(q) = self.picked_request(id, cx).or_else(|| Some("1440p60".to_string())) {
             if let Err(e) = core::set_quality(&self.core, id, &q) {
                 self.error = Some(e);
                 self.error_since = Some(std::time::Instant::now());
@@ -174,7 +200,14 @@ impl Shell {
                 let kbits: Vec<SharedString> = std::iter::once("—".into()).chain(PRESETS.iter().map(|k| SharedString::from(format!("{} {}", mbit(*k), t("unit.mbit"))))).collect();
                 let mode = cx.new(|cx| SelectState::new(modes, Some(IndexPath::new(m)), window, cx));
                 let kbit = cx.new(|cx| SelectState::new(kbits, Some(IndexPath::new(k)), window, cx));
-                self.room.tiles.insert(w.streamer, Tile { mode, kbit, shown: (m, k), touched: false });
+                let id = w.streamer;
+                let on_pick = move |s: &mut Shell, _: Picker, e: &SelectEvent<Vec<SharedString>>, cx: &mut Context<Shell>| {
+                    if let SelectEvent::Confirm(Some(_)) = e {
+                        s.picker_changed(id, cx);
+                    }
+                };
+                let _subs = [cx.subscribe(&mode, on_pick), cx.subscribe(&kbit, on_pick)];
+                self.room.tiles.insert(w.streamer, Tile { mode, kbit, shown: (m, k), touched: false, picked: 0, _subs });
                 continue;
             }
             let t = self.room.tiles.get_mut(&w.streamer).unwrap();
@@ -193,9 +226,12 @@ impl Shell {
         }
     }
 
-    /// Hides the video windows while the join form covers the room.
-    pub fn sync_videos_hidden(&mut self) {
-        let hide = self.join_shown() || self.dialog_open();
+    /// Hides the video windows while the join form covers the room, or a list is open: the
+    /// video windows sit above the main window, so a list opening over the video (the quality
+    /// pickers under it) was hidden behind it. STREAMER_DEBUG_LISTS_UNDER_VIDEO: the old way.
+    pub fn sync_videos_hidden(&mut self, cx: &App) {
+        let list_open = gpui_kit::component::GlobalState::is_in_deferred_context(cx) && std::env::var_os("STREAMER_DEBUG_LISTS_UNDER_VIDEO").is_none();
+        let hide = self.join_shown() || self.dialog_open() || list_open;
         if hide != self.room.videos_hidden {
             self.room.videos_hidden = hide;
             core::videos_hidden(&self.core, hide);
@@ -213,6 +249,8 @@ impl Shell {
             let name = self.snap.peers.iter().find(|p| p.id == w.streamer).map(|p| p.name.clone()).unwrap_or("?".into());
             tf("hint.background", &[("name", &name), ("shown", &w.shown_fps.round()), ("rx", &w.received_fps.round())]).to_string()
         });
+        // Reconnecting shows where a hint would (amber): the room is kept meanwhile.
+        let hint = if self.snap.reconnecting { Some(t("notice.reconnecting").to_string()) } else { hint };
         let notice = self.error.clone();
         let has_stage = stage.is_some();
         // The content goes in its own box: the scroll area holds only it and the scrollbar
@@ -382,7 +420,6 @@ impl Shell {
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone()))
                     .child(div().flex_1().text_xs().whitespace_nowrap().text_color(rgb(if throttled { 0xf0b232 } else { color::MUTED })).child(stat))
                     .when_some(tile, |d, t| d.child(div().w(px(150.)).cursor_pointer().child(Select::new(&t.mode).small())).child(div().w(px(110.)).cursor_pointer().child(Select::new(&t.kbit).small())))
-                    .child(Button::new(SharedString::from(format!("apply-{id}"))).cursor_pointer().small().label(t("card.apply")).on_click(cx.listener(move |s, _, _, cx| s.apply_quality(id, cx))))
                     .child(Button::new(SharedString::from(format!("mute-{id}"))).cursor_pointer().small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(t(if w.muted { "tile.unmute" } else { "tile.mute" })).on_click(cx.listener(move |s, _, _, cx| {
                         let _ = core::set_muted(&s.core, id, !w.muted);
                         s.tick(cx);
