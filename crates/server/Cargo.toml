@@ -3,6 +3,8 @@ name = "server"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# `cargo run` (as a hosting service may start it) runs the server, not maketemp.
+default-run = "server"
 
 [dependencies]
 protocol = { path = "../protocol" }
