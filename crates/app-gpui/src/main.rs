@@ -390,6 +390,7 @@ impl Shell {
     /// Takes a room off the saved list (the open one stays open).
     fn forget_room(&mut self, r: &Room) {
         self.rooms.retain(|x| !x.same(r));
+        core::leave_background(&self.core, &r.room);
         let mut state = core::state_load();
         state.insert("rooms".into(), serde_json::Value::Array(self.rooms.iter().map(Room::to_json).collect()));
         let _ = core::state_save(&serde_json::Value::Object(state).to_string());
@@ -402,6 +403,8 @@ impl Shell {
             return;
         }
         let next = Room { name: name.to_string(), ..r.clone() };
+        // Kept in the background under the old name: that place goes.
+        core::leave_background(&self.core, &r.room);
         for x in self.rooms.iter_mut().filter(|x| x.same(r)) {
             *x = next.clone();
         }
@@ -504,9 +507,13 @@ impl Shell {
         // Many rooms scroll; their buttons keep their size (flex_none) instead of squeezing.
         div().id("rail").w(px(72.)).h_full().flex_none().bg(rgb(color::RAIL)).overflow_y_scroll().flex().flex_col().items_center().gap_2().py_3().children(self.rooms.iter().enumerate().map(|(i, r)| {
             let on = current.as_ref().is_some_and(|c| c.same(r));
+            // Still connected in the background (watching or streaming there): a green dot.
+            let kept = !on && self.snap.background.iter().any(|b| *b == r.room);
             let room = r.clone();
             div()
                 .id(("room", i))
+                .relative()
+                .when(kept, |d| d.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(16.)).rounded_full().bg(rgb(color::RAIL)).flex().items_center().justify_center().child(div().size(px(10.)).rounded_full().bg(rgb(color::GREEN)))))
                 .size_12()
                 .flex_none()
                 .flex()
@@ -660,7 +667,7 @@ impl Shell {
                     })
                     .when(self.snap.connected, |d| d.child(section(tf("room.live", &[("n", &live.len())]).to_string())).children(live.iter().map(|p| person(p))).child(section(tf("room.here", &[("n", &rest.len())]).to_string())).children(rest.iter().map(|p| person(p))))
             })
-            .when(self.snap.connected && self.snap.voice.joined, |d| d.child(self.voice_bar(cx)))
+            .when(self.snap.connected && (self.snap.voice.joined || self.snap.voice.elsewhere.is_some()), |d| d.child(self.voice_bar(cx)))
             .child(
                 row()
                     .h(px(56.))
@@ -698,7 +705,19 @@ impl Shell {
             .bg(rgb(color::BAR))
             .border_b_1()
             .border_color(rgb(color::LINE))
-            .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::GREEN)).child(t("voice.connected")))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::GREEN)).child(t("voice.connected")))
+                    // In voice in a room kept in the background: which one, under it (as Discord).
+                    .when_some(v.elsewhere.clone(), |d, code| {
+                        let label = self.rooms.iter().find(|r| r.room == code).map(|r| r.label()).unwrap_or(code);
+                        d.child(div().truncate().text_xs().text_color(rgb(color::MUTED)).child(label))
+                    }),
+            )
             .child(
                 icon_button("voice-mic", if mic_off { "icons/mic-off.svg" } else { "icons/mic.svg" }, t(if mic_off { "voice.unmute" } else { "voice.mute" }), color::BRIGHT)
                     .when(mic_off, |d| d.text_color(rgb(color::LIVE)))
@@ -829,7 +848,7 @@ impl Render for Shell {
         if let Some(code) = self.join.pending_code.take() {
             self.join.code.update(cx, |i, cx| i.set_value(code, window, cx));
         }
-        self.sync_videos_hidden();
+        self.sync_videos_hidden(cx);
         self.sync_tiles(window, cx);
         let dialog = self.render_dialog(cx);
         let menu = self.render_room_menu(cx);
@@ -997,7 +1016,7 @@ fn main() {
                     eprintln!("window: hidden in the tray");
                     return false;
                 }
-                core::leave_for_good(&close, Duration::from_millis(500));
+                core::leave_everything(&close, Duration::from_millis(500));
                 cx.quit();
                 true
             });

@@ -46,7 +46,7 @@ pub fn start(core: Arc<Core>) -> Result<(), String> {
         "show" => crate::show_main_window(),
         "quit" => {
             // Tell the server first, then leave.
-            core::leave_for_good(&core, std::time::Duration::from_millis(500));
+            core::leave_everything(&core, std::time::Duration::from_millis(500));
             std::process::exit(0);
         }
         _ => {}

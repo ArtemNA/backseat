@@ -26,6 +26,10 @@ pub struct App {
     pub release: Mutex<Option<update::Release>>,
     /// Key of the open room in the saved places (`resume_key`).
     joined: Mutex<Option<String>>,
+    /// Rooms switched away from while watching, streaming or in voice there: still connected, their
+    /// video hidden, until opened again. By `resume_key`. Only one room watches or streams
+    /// at a time (`quiet_background`).
+    background: Mutex<Vec<(String, Arc<Session>)>>,
     /// The direct connection (beta) and our name in it, while there is one.
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
     /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
@@ -128,6 +132,10 @@ pub struct Snapshot {
     /// A direct session (no server, beta): "connected" or "waiting".
     pub direct: Option<&'static str>,
     pub voice: VoiceView,
+    /// The connection to the server broke and is being made again (our place is kept).
+    pub reconnecting: bool,
+    /// Room codes of rooms kept connected in the background (watching or streaming there).
+    pub background: Vec<String>,
 }
 
 /// The room's voice chat as the UI shows it.
@@ -147,6 +155,8 @@ pub struct VoiceView {
     /// Push-to-talk is on, and whether its key is down now.
     pub ptt: bool,
     pub talking: bool,
+    /// In voice in another room, kept in the background (its room code); `joined` is false.
+    pub elsewhere: Option<String>,
 }
 
 /// What the voice settings say (the UI keeps them in its settings).
@@ -171,6 +181,17 @@ pub struct VoiceSettings {
 const SPEAKING_DB: f64 = -50.0;
 
 /// The voice part of the snapshot; cheap, for the fast "who is speaking" refresh.
+/// The room whose voice we are in: the open one, or one kept in the background; else the
+/// open room. Voice controls act on it.
+fn voice_session(app: &App) -> Option<Arc<Session>> {
+    let open = app.session.lock().unwrap().clone();
+    if open.as_ref().is_some_and(|s| s.voice().is_some()) {
+        return open;
+    }
+    let bg = app.background.lock().unwrap().iter().find(|(_, s)| s.voice().is_some()).map(|(_, s)| s.clone());
+    bg.or(open)
+}
+
 pub fn voice_view(app: &App) -> VoiceView {
     let (mic_muted, deafened) = *app.voice_prefs.lock().unwrap();
     let ptt = app.voice_settings.lock().unwrap().ptt_key.is_some();
@@ -200,7 +221,9 @@ pub fn voice_view(app: &App) -> VoiceView {
     let mut deaf: Vec<u64> = states.iter().filter(|(_, st)| st.1).map(|(id, _)| *id).collect();
     muted.sort_unstable();
     deaf.sort_unstable();
-    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened, muted, deaf, ptt, talking }
+    let elsewhere = if voice.is_some() { None } else { voice_session(app).filter(|v| v.voice().is_some()).map(|v| v.room.clone()) };
+    let talking = talking || voice_session(app).and_then(|v| v.voice()).is_some_and(|v| v.transmitting());
+    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened, muted, deaf, ptt, talking, elsewhere }
 }
 
 fn cue(app: &App, c: media::sounds::Cue) {
@@ -215,6 +238,8 @@ fn cue(app: &App, c: media::sounds::Cue) {
 /// Joins the open room's voice chat. Opens the microphone: run it off the UI thread.
 pub fn join_voice(app: &Arc<App>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    // Voice, like watching and streaming, happens in one room at a time.
+    quiet_background(app);
     let mut cfg = media::voice::VoiceConfig { mic: app.voice_settings.lock().unwrap().mic.clone(), ..Default::default() };
     // Tests only: STREAMER_APP_TEST_VOICE=<Hz> sends a tone instead of the microphone and
     // plays nothing.
@@ -237,7 +262,7 @@ pub fn join_voice(app: &Arc<App>) -> Result<(), String> {
 }
 
 pub fn leave_voice(app: &App) {
-    let s = app.session.lock().unwrap().clone();
+    let s = voice_session(app);
     if let Some(s) = s {
         if s.voice().is_some() {
             s.leave_voice();
@@ -273,7 +298,7 @@ pub fn set_deafened(app: &App, on: bool) {
 }
 
 fn apply_voice_prefs(app: &App, mic: bool, deaf: bool) {
-    let s = app.session.lock().unwrap().clone();
+    let s = voice_session(app);
     if let Some(s) = s {
         s.set_voice_state(mic || deaf, deaf);
         if let Some(v) = s.voice() {
@@ -286,12 +311,12 @@ fn apply_voice_prefs(app: &App, mic: bool, deaf: bool) {
 
 /// The microphone's level before the threshold (dBFS), while in voice.
 pub fn mic_input_db(app: &App) -> Option<f64> {
-    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.input_db())
+    voice_session(app).and_then(|s| s.voice()).map(|v| v.input_db())
 }
 
 /// One member's loudness in voice, 0..2 (1: as they send it).
 pub fn set_peer_volume(app: &App, id: u64, v: f64) {
-    let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+    let voice = voice_session(app).and_then(|s| s.voice());
     if let Some(voice) = voice {
         voice.set_peer_volume(id, v);
     }
@@ -299,11 +324,11 @@ pub fn set_peer_volume(app: &App, id: u64, v: f64) {
 
 /// What each member in voice sounds like here now (dBFS over 100 ms, after their volume).
 pub fn voice_levels(app: &App) -> Vec<(u64, f64)> {
-    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.peer_db()).unwrap_or_default()
+    voice_session(app).and_then(|s| s.voice()).map(|v| v.peer_db()).unwrap_or_default()
 }
 
 pub fn peer_volume(app: &App, id: u64) -> f64 {
-    app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.peer_volume(id)).unwrap_or(1.0)
+    voice_session(app).and_then(|s| s.voice()).map(|v| v.peer_volume(id)).unwrap_or(1.0)
 }
 
 /// Microphones (`input`) or speakers to pick from. Listing them takes ~0.7 s each (measured),
@@ -346,7 +371,7 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
     if old.speakers != new.speakers {
         media::playback::set_device(new.speakers.clone());
     }
-    let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+    let voice = voice_session(app).and_then(|s| s.voice());
     if let Some(v) = &voice {
         if old.ptt_key != new.ptt_key {
             v.set_transmit(new.ptt_key.is_none());
@@ -356,7 +381,7 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
     }
     if old.mic != new.mic && voice.is_some() {
         eprintln!("voice: microphone changed, rejoining");
-        if let Some(s) = app.session.lock().unwrap().clone() {
+        if let Some(s) = voice_session(app) {
             s.leave_voice();
         }
         let a = app.clone();
@@ -388,13 +413,13 @@ fn start_ptt(app: &Arc<App>) {
                 // Every 2 s in voice: how loud the microphone is at each step (numbers only,
                 // no sound kept), to tell a quiet device from a closed threshold or mute.
                 if ticks % 200 == 0 {
-                    if let Some(v) = app.session.lock().unwrap().clone().and_then(|s| s.voice()) {
+                    if let Some(v) = voice_session(&app).and_then(|s| s.voice()) {
                         let (raw, processed, sent) = v.level_report();
                         eprintln!("voice levels: device {raw:.0} dB, processed {processed:.0} dB, sent {sent:.0} dB, sending {}", v.transmitting());
                     }
                 }
                 let key = app.voice_settings.lock().unwrap().ptt_key;
-                let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
+                let voice = voice_session(&app).and_then(|s| s.voice());
                 let (Some(key), Some(v)) = (key, voice) else {
                     down = false;
                     continue;
@@ -472,7 +497,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app) };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app), reconnecting: false, background: background_rooms(app) };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -490,6 +515,8 @@ pub fn snapshot(app: &App) -> Snapshot {
         live: app.sampler.live(),
         notice,
         link,
+        reconnecting: s.reconnecting(),
+        background: background_rooms(app),
         direct: s.direct.then(|| if app.direct.lock().unwrap().as_ref().is_some_and(|(c, _)| c.is_open()) { "connected" } else { "waiting" }),
         voice: voice_view(app),
     }
@@ -499,6 +526,7 @@ pub fn snapshot(app: &App) -> Snapshot {
 fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &str, other: &str, inviter: bool) -> Result<(), String> {
     let (s, events) = Session::direct(control, name, other, inviter)?;
     *app.session.lock().unwrap() = Some(s.clone());
+    let mine = Arc::downgrade(&s);
     app.sampler.attach(s);
     let a = app.clone();
     std::thread::spawn(move || {
@@ -508,6 +536,8 @@ fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &s
             match e {
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
+                // Left on purpose (another room opened): no news, and not ours to close.
+                Event::Lost if !is_open_session(&a, &mine) => break,
                 Event::Lost => {
                     // The other person left or the connection broke: stop cleanly.
                     a.notify("direct_ended".into());
@@ -698,7 +728,7 @@ pub fn install_update(app: &App) -> Result<bool, String> {
     eprintln!("update: downloaded and checked {}", path.display());
     update::run_installer(&path)?;
     if std::env::var_os("STREAMER_UPDATE_DRY").is_none() {
-        leave_for_good(app, std::time::Duration::from_millis(500));
+        leave_everything(app, std::time::Duration::from_millis(500));
         return Ok(true);
     }
     Ok(false)
@@ -732,8 +762,24 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     // both connections alive: the same person twice in the room.
     static JOINING: Mutex<()> = Mutex::new(());
     let _one = JOINING.lock().unwrap_or_else(|e| e.into_inner());
-    leave_for_good(app, std::time::Duration::from_millis(300));
     let key = resume_key(server, room, name);
+    if app.joined.lock().unwrap().as_deref() == Some(key.as_str()) && app.session.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    step_away(app);
+    // A room kept in the background opens again as it is: no new join.
+    let kept = {
+        let mut bg = app.background.lock().unwrap();
+        bg.iter().position(|(k, _)| *k == key).map(|i| bg.remove(i).1)
+    };
+    if let Some(s) = kept {
+        eprintln!("rooms: back to {room} (kept in the background)");
+        set_videos_hidden(&s, false);
+        *app.joined.lock().unwrap() = Some(key);
+        *app.session.lock().unwrap() = Some(s.clone());
+        app.sampler.attach(s);
+        return Ok(());
+    }
     let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
     save_place(&key, s.resume());
     *app.joined.lock().unwrap() = Some(key);
@@ -743,6 +789,7 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     }
     app.sampler.attach(s.clone());
     let a = app.clone();
+    let mine = Arc::downgrade(&s);
     std::thread::spawn(move || {
         let mut heard = Heard::default();
         while let Ok(e) = events.recv() {
@@ -751,6 +798,23 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                 // Leaving the room on purpose ends its watches; that is no news.
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
+                // A room left on purpose (another one opened) ends too. That is no news, and
+                // the open session is the new room's: taking it here left the new room and
+                // showed "Lost the connection". STREAMER_DEBUG_LOST_ANY_SESSION: the old way.
+                Event::Lost if !is_open_session(&a, &mine) && std::env::var_os("STREAMER_DEBUG_LOST_ANY_SESSION").is_none() => {
+                    // A room kept in the background lost its connection: it ends.
+                    let gone = {
+                        let mut bg = a.background.lock().unwrap();
+                        let i = bg.iter().position(|(_, s)| mine.upgrade().is_some_and(|m| Arc::ptr_eq(s, &m)));
+                        i.map(|i| bg.remove(i))
+                    };
+                    if let Some((k, s)) = gone {
+                        eprintln!("rooms: a room in the background lost its connection");
+                        s.leave();
+                        save_place(&k, None);
+                    }
+                    break;
+                }
                 Event::Lost => {
                     a.notify("lost".into());
                     // Stop the stream and the watches first: dropping them while their
@@ -773,6 +837,84 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         }
     });
     Ok(())
+}
+
+/// Room codes of the rooms kept in the background.
+fn background_rooms(app: &App) -> Vec<String> {
+    app.background.lock().unwrap().iter().map(|(_, s)| s.room.clone()).collect()
+}
+
+/// Hides (or shows again) a room's video inside the main window. A video popped out into a
+/// window of its own is not touched by this (`present::place` ignores `hidden` for it).
+fn set_videos_hidden(s: &Session, hidden: bool) {
+    for w in s.watching() {
+        if let Some(win) = w.viewer.window {
+            win.set_hidden(hidden);
+        }
+    }
+}
+
+/// The open room steps aside for another: watching or streaming there, it stays connected
+/// in the background (its video hidden); otherwise its connection closes with no Leave, so
+/// the server keeps the place 20 s and coming back takes it again. A direct connection ends.
+/// STREAMER_DEBUG_LEAVE_ON_SWITCH: every room is left, as before.
+fn step_away(app: &App) {
+    if app.direct.lock().unwrap().is_some() || std::env::var_os("STREAMER_DEBUG_LEAVE_ON_SWITCH").is_some() {
+        leave_for_good(app, std::time::Duration::from_millis(300));
+        return;
+    }
+    let s = app.session.lock().unwrap().take();
+    let key = app.joined.lock().unwrap().take();
+    let (Some(s), Some(key)) = (s, key) else { return };
+    if s.busy() {
+        eprintln!("rooms: {} stays connected in the background", s.room);
+        set_videos_hidden(&s, true);
+        app.background.lock().unwrap().push((key, s));
+    } else {
+        eprintln!("rooms: {} closed, place kept", s.room);
+        s.close_keeping_place();
+    }
+}
+
+/// Watching or streaming in the open room ends it in the background rooms (one room at a
+/// time), which then close keeping their place.
+fn quiet_background(app: &App) {
+    let rooms: Vec<(String, Arc<Session>)> = std::mem::take(&mut *app.background.lock().unwrap());
+    for (_, s) in rooms {
+        eprintln!("rooms: {} stops in the background (now active here)", s.room);
+        s.leave_activity();
+        s.close_keeping_place();
+    }
+}
+
+/// Leaves a room kept in the background (taken off the list, renamed).
+pub fn leave_background(app: &App, room: &str) {
+    let gone: Vec<(String, Arc<Session>)> = {
+        let mut bg = app.background.lock().unwrap();
+        let (gone, keep) = std::mem::take(&mut *bg).into_iter().partition(|(_, s)| s.room == room);
+        *bg = keep;
+        gone
+    };
+    for (k, s) in gone {
+        s.leave_and_wait(std::time::Duration::from_millis(300));
+        save_place(&k, None);
+    }
+}
+
+/// The app quits: every room is left, the open one and those in the background.
+pub fn leave_everything(app: &App, wait: std::time::Duration) {
+    let rooms: Vec<(String, Arc<Session>)> = std::mem::take(&mut *app.background.lock().unwrap());
+    for (k, s) in rooms {
+        s.leave_and_wait(wait);
+        save_place(&k, None);
+    }
+    leave_for_good(app, wait);
+}
+
+/// Whether `mine` is the open session (not one left for another room).
+fn is_open_session(app: &App, mine: &std::sync::Weak<Session>) -> bool {
+    let Some(mine) = mine.upgrade() else { return false };
+    app.session.lock().unwrap().as_ref().is_some_and(|s| Arc::ptr_eq(s, &mine))
 }
 
 pub fn leave(app: &App) {
@@ -940,6 +1082,7 @@ fn live_config(req: &GoLive) -> Result<HostConfig, String> {
 /// Starts streaming in the open room. Blocks.
 pub fn go_live(app: &Arc<App>, req: GoLive) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    quiet_background(app);
     let cfg = live_config(&req)?;
     eprintln!("live: {}x{}@{} {} kbit/s {} audio {}", cfg.mode.width, cfg.mode.height, cfg.mode.fps, cfg.kbit, cfg.codec.short(), if !cfg.audio { "none" } else if cfg.audio_pid.is_some() { "app" } else { "system" });
     s.start_streaming(cfg).inspect_err(|e| eprintln!("go_live failed: {e}"))?;
@@ -971,6 +1114,7 @@ fn viewer_config(app: &App) -> ViewerConfig {
 /// video window inside the main window waits for that thread).
 pub fn watch(app: &App, streamer: u64, quality: Option<String>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    quiet_background(app);
     s.watch(streamer, viewer_config(app), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
     Ok(())
 }
@@ -1086,6 +1230,14 @@ fn test_window_actions(w: Option<media::present::Window>) {
     // "embed": pop out at +6 s, back in at +12 s, fullscreen at +18 s, back at +24 s.
     // "fsloop": from +5 s, fullscreen on and off 30 times at uneven intervals while the main
     // thread keeps placing the video (as the UI does while it lays out), then stays embedded.
+    // "popout": out in a window of its own at +2 s, and stays there.
+    if mode == "popout" {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            w.set_popped(true);
+        });
+        return;
+    }
     if mode == "fsloop" {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
