@@ -126,6 +126,15 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
         }
         match ws.read() {
             Ok(Message::Text(t)) => match protocol::parse_server(&t) {
+                // A temporary room ended: the server drops us and keeps no place, so there
+                // is nothing to reconnect to.
+                Ok(ServerMsg::Error { message }) if message == protocol::temp::ENDED => {
+                    eprintln!("signaling: the temporary room ended");
+                    let _ = in_tx.send(ServerMsg::Error { message });
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return End::Left;
+                }
                 Ok(m) => {
                     if in_tx.send(m).is_err() {
                         return End::Gone;

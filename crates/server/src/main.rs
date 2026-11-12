@@ -33,7 +33,15 @@ async fn main() {
         .nth(1)
         .or_else(|| std::env::var("PORT").ok().map(|p| format!("0.0.0.0:{p}")))
         .unwrap_or_else(|| "127.0.0.1:7800".into());
-    let server = server::Server::new(server::Config::default());
+    let temp = match server::TempKey::from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("server: {e}; temporary rooms are off");
+            None
+        }
+    };
+    println!("server: temporary rooms {}", if temp.is_some() { "on" } else { "off (no STREAMER_TEMP_SECRET)" });
+    let server = server::Server::with_temp(server::Config::default(), temp);
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
