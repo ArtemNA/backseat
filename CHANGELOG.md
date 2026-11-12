@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.10
+
+- Invite links bring their server. A room you open from an invite link (clicked or pasted) is on the server that link came from, whatever server is in your settings. Before, a friend with another server in the settings (or none) could not get into the room. Each room keeps its own server.
+
 ## 0.2.9
 
 - A connection to the server that silently stops passing data (it happened through the hosting's proxy for ~25 s) is noticed within 6 s and made again, so your place in the room is kept. Before, the app learned of it only after the server had given the place away, and showed "Lost the connection to the server".
