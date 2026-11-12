@@ -42,6 +42,24 @@ pub enum Event {
     VoiceMembers(Vec<PeerId>),
 }
 
+/// STREAMER_DEBUG_VOICE_SIGNAL: logs each voice message's kind, sent and received.
+fn debug_voice_signal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("STREAMER_DEBUG_VOICE_SIGNAL").is_some())
+}
+
+struct Logged {
+    inner: Arc<dyn Outbox>,
+    to: PeerId,
+}
+
+impl Outbox for Logged {
+    fn send(&self, kind: &str, payload: &str) {
+        eprintln!("voice signal: to {} {kind}", self.to);
+        self.inner.send(kind, payload);
+    }
+}
+
 /// Prefixes every kind it sends with the sender's role.
 struct Tagged {
     inner: Arc<dyn Outbox>,
@@ -429,7 +447,11 @@ impl Session {
     }
 
     fn voice_link(&self, id: PeerId) -> Arc<dyn Outbox> {
-        Arc::new(Tagged { inner: self.client.to_peer(id), tag: VOICE })
+        let inner: Arc<dyn Outbox> = Arc::new(Tagged { inner: self.client.to_peer(id), tag: VOICE });
+        if debug_voice_signal() {
+            return Arc::new(Logged { inner, to: id });
+        }
+        inner
     }
 
     fn voice_connect(&self, voice: &Voice, id: PeerId) {
@@ -439,6 +461,9 @@ impl Session {
     }
 
     fn on_voice(&self, from: PeerId, kind: &str, payload: &str) {
+        if debug_voice_signal() {
+            eprintln!("voice signal: from {from} {kind} (in voice: {}, known peer: {})", self.voice().is_some(), self.voice().is_some_and(|v| v.has(from)));
+        }
         match kind {
             "hi" => {
                 let (new, voice) = {

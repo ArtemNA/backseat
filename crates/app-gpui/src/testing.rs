@@ -199,7 +199,9 @@ pub fn test_voice(window: &mut Window, cx: &mut Context<Shell>) {
                     return;
                 };
                 let since = tick - at;
-                if since == 8 || since == 12 {
+                // STREAMER_APP_TEST_VOICE_NO_MUTE: leave the microphone alone (a push-to-talk
+                // test, whose key window would overlap).
+                if (since == 8 || since == 12) && std::env::var_os("STREAMER_APP_TEST_VOICE_NO_MUTE").is_none() {
                     let off = since == 8;
                     core::set_mic_muted(&s.core, off);
                     s.snap.voice = core::voice_view(&s.core);

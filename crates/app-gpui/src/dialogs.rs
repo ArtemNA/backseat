@@ -653,6 +653,7 @@ impl Shell {
     }
 
     pub fn open_settings(&mut self, tab: SetTab, window: &mut Window, cx: &mut Context<Self>) {
+        let started = std::time::Instant::now();
         let server_now = settings().get("server").and_then(|v| v.as_str()).map(String::from).filter(|v| !v.is_empty()).unwrap_or_else(|| self.join.server.read(cx).value().to_string());
         let server = cx.new(|cx| InputState::new(window, cx).placeholder("wss://example.com/ws").default_value(core::built_in().map(String::from).unwrap_or(server_now)));
         let mut subs = vec![cx.subscribe_in(&server, window, |_, s, e: &InputEvent, _, cx| {
@@ -706,6 +707,7 @@ impl Shell {
         subs.push(sub);
         self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold });
         self.dialogs.open = Some(Open::Settings);
+        eprintln!("settings: opened in {} ms", started.elapsed().as_millis());
         cx.notify();
     }
 

@@ -127,6 +127,9 @@ fn sink_for(silent: bool, device: &Option<String>) -> Result<gst::Element, Strin
 impl Playback {
     fn new(silent: bool, device: Option<String>) -> Result<Arc<Self>, String> {
         let pipeline = gst::Pipeline::with_name("playback");
+        // One fixed clock: devices (speakers, a microphone added with voice) come and go while
+        // it plays, and each would otherwise offer its own clock.
+        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
         let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
         let filter = |c: gst::Caps| gst::ElementFactory::make("capsfilter").property("caps", c).build().unwrap();
         // Silence keeps the mixer (and the echo probe's timeline) running with nothing else in.
@@ -137,23 +140,56 @@ impl Playback {
             .build()
             .map_err(|e| e.to_string())?;
         let mixer = gst::ElementFactory::make("audiomixer").name("pmix").build().map_err(|e| e.to_string())?;
-        // Room for inputs that arrive a little late (pushed from other pipelines' threads).
-        mixer.set_property("latency", 20_000_000u64);
-        let probe = gst::ElementFactory::make("webrtcechoprobe").name(ECHO_PROBE).build().map_err(|e| format!("webrtcechoprobe: {e}"))?;
+        // Every input is stamped as it comes in (streams' sound, voices, sounds), so the mixer
+        // needs no room for late ones: what it would add is a stream's sound coming later than
+        // with its own sink. (5 ms pieces instead of 10 stopped the echo canceller's output.)
+        mixer.set_property("latency", 0u64);
         // The tee: what goes to the speakers, for `tap` (tests: a simulated room).
         let tee = gst::ElementFactory::make("tee").name("ptee").property("allow-not-linked", true).build().unwrap();
-        let chain = [silence, filter(caps()), mixer.clone(), filter(caps()), probe, tee, mk("audioconvert")?, mk("audioresample")?, sink_for(silent, &device)?];
+        // As in the voice mixer: a queue lets the silence be late, so inputs with more latency
+        // than 10 ms do not make the mixer's latency impossible.
+        let hold = gst::ElementFactory::make("queue").property("max-size-time", 1_000_000_000u64).property("max-size-buffers", 0u32).property("max-size-bytes", 0u32).build().unwrap();
+        // The echo probe, in the chain from the start: put in later while it played, it cancelled
+        // nothing (see `Voice::new`).
+        let pcaps = filter(caps());
+        pcaps.set_property("name", "pcaps");
+        let probe = gst::ElementFactory::make("webrtcechoprobe").name(ECHO_PROBE).build().map_err(|e| format!("webrtcechoprobe: {e}"))?;
+        let chain = [silence, filter(caps()), hold, mixer.clone(), pcaps, probe, tee, mk("audioconvert")?, mk("audioresample")?, sink_for(silent, &device)?];
         pipeline.add_many(&chain).map_err(|e| e.to_string())?;
-        gst::Element::link_many(&chain[..2]).map_err(|e| e.to_string())?;
-        chain[1].link(&mixer).map_err(|e| e.to_string())?;
-        gst::Element::link_many(&chain[2..]).map_err(|e| e.to_string())?;
+        gst::Element::link_many(&chain[..3]).map_err(|e| e.to_string())?;
+        chain[2].link(&mixer).map_err(|e| e.to_string())?;
+        gst::Element::link_many(&chain[3..]).map_err(|e| e.to_string())?;
         crate::drain_bus(&pipeline, "playback");
         pipeline.set_state(gst::State::Playing).map_err(|e| format!("cannot start the speakers: {e}"))?;
         eprintln!("playback: started{}", if silent { " (silent)" } else { "" });
         Ok(Arc::new(Self { pipeline, mixer, device: Mutex::new(device), silent }))
     }
 
-    /// A new input. It goes away when the returned handle is dropped.
+    /// The pipeline, for the voice chat that lives in it.
+    pub fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
+    /// How long after its running time a buffer reaches the speakers: the latency the
+    /// speakers' branch asks for. (`Pipeline::latency` is only a manual override, none here;
+    /// taking it for this placed a simulated echo before its sound.)
+    pub fn render_latency(&self) -> gst::ClockTime {
+        self.pipeline
+            .by_name("pout")
+            .and_then(|s| s.static_pad("sink"))
+            .and_then(|pad| {
+                let mut q = gst::query::Latency::new();
+                pad.peer_query(&mut q).then(|| q.result().1)
+            })
+            .unwrap_or(gst::ClockTime::ZERO)
+    }
+
+    /// The mixer before the echo probe and the speakers.
+    pub fn mixer(&self) -> &gst::Element {
+        &self.mixer
+    }
+
+    /// A new input, stamped on arrival. It goes away when the returned handle is dropped.
     pub fn input(self: &Arc<Self>, label: &str) -> Result<Input, String> {
         let src = gst::ElementFactory::make("appsrc").build().map_err(|e| e.to_string())?.downcast::<AppSrc>().unwrap();
         src.set_caps(Some(&caps()));
@@ -184,6 +220,7 @@ impl Playback {
         let tee = self.pipeline.by_name("ptee").ok_or("no tee")?;
         let q = gst::ElementFactory::make("queue").property_from_str("leaky", "downstream").build().unwrap();
         let sink = gst_app::AppSink::builder().sync(false).build();
+        sink.set_property("async", false);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
@@ -279,12 +316,18 @@ impl Drop for Input {
 
 /// An appsink that hands what it gets to a new input of the shared output, converting to
 /// its format first. Returns the elements to put at the end of a chain, and the input (keep
-/// it as long as the chain lives). `sync`: pace by the producing pipeline's clock.
-pub fn tail(label: &str, sync: bool) -> Result<(Vec<gst::Element>, Arc<Input>), String> {
+/// it as long as the chain lives).
+pub fn tail(label: &str) -> Result<(Vec<gst::Element>, Arc<Input>), String> {
     let input = Arc::new(get()?.input(label)?);
     let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
     let filter = gst::ElementFactory::make("capsfilter").property("caps", caps()).build().unwrap();
-    let sink = gst_app::AppSink::builder().sync(sync).max_buffers(10).drop(true).build();
+    // Not synced: the sound goes on as it comes and waits once, in the shared output. (Synced
+    // here as well it waited twice: a stream's sound came 50 ms later than with its own sink.
+    // Handing over the time to be heard at instead does not work either: the producing
+    // pipeline sets no latency, so 98% of the buffers are past that time when they come.)
+    let sink = gst_app::AppSink::builder().sync(false).max_buffers(10).drop(true).build();
+    // Added to a pipeline that already plays: it need not preroll there.
+    sink.set_property("async", false);
     sink.set_callbacks(input.sink_callbacks());
     Ok((vec![mk("audioconvert")?, mk("audioresample")?, filter, sink.upcast()], input))
 }

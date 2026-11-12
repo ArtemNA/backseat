@@ -646,7 +646,7 @@ fn add_audio(
     // If the shared output cannot start (a missing plugin, no device), the stream keeps its
     // sound through its own sink, as before.
     let shared_tail = if shared {
-        crate::playback::tail("stream", audio_sync).inspect_err(|e| eprintln!("viewer: shared sound output unavailable ({e}); own sink")).ok()
+        crate::playback::tail("stream").inspect_err(|e| eprintln!("viewer: shared sound output unavailable ({e}); own sink")).ok()
     } else {
         None
     };

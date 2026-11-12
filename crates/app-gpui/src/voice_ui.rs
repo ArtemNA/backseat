@@ -108,6 +108,7 @@ pub fn threshold_view(slider: &Entity<SliderState>, level: Option<f64>) -> Div {
 }
 
 pub fn apply_settings(c: &std::sync::Arc<core::App>) {
+    core::refresh_audio_devices();
     let s = saved();
     eprintln!("voice settings: mic {} speakers {} push-to-talk {:?} sounds {}/{}", if s.mic.is_some() { "chosen" } else { "default" }, if s.speakers.is_some() { "chosen" } else { "default" }, s.ptt_key, s.event_sounds, s.ptt_sounds);
     core::set_voice_settings(c, s);

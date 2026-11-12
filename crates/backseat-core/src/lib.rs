@@ -303,9 +303,37 @@ pub fn peer_volume(app: &App, id: u64) -> f64 {
     app.session.lock().unwrap().clone().and_then(|s| s.voice()).map(|v| v.peer_volume(id)).unwrap_or(1.0)
 }
 
-/// Microphones (`input`) or speakers to pick from.
+/// Microphones (`input`) or speakers to pick from. Listing them takes ~0.7 s each (measured),
+/// so the lists are kept: made in the background at start, renewed in the background each
+/// time they are asked for; only the very first ask waits.
 pub fn audio_devices(input: bool) -> Vec<media::playback::Device> {
-    media::playback::devices(input)
+    let cached = DEVICES.lock().unwrap().clone();
+    match cached {
+        Some((i, o)) => {
+            refresh_audio_devices();
+            if input { i } else { o }
+        }
+        None => {
+            let (i, o) = (media::playback::devices(true), media::playback::devices(false));
+            *DEVICES.lock().unwrap() = Some((i.clone(), o.clone()));
+            if input { i } else { o }
+        }
+    }
+}
+
+static DEVICES: Mutex<Option<(Vec<media::playback::Device>, Vec<media::playback::Device>)>> = Mutex::new(None);
+
+/// Lists the sound devices again off the calling thread (one listing at a time).
+pub fn refresh_audio_devices() {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let both = (media::playback::devices(true), media::playback::devices(false));
+        *DEVICES.lock().unwrap() = Some(both);
+        BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 /// Applies the voice settings: speakers at once, a new microphone by rejoining voice,
@@ -349,9 +377,19 @@ fn start_ptt(app: &Arc<App>) {
         .name("push-to-talk".into())
         .spawn(move || {
             let mut down = false;
+            let mut ticks = 0u32;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 let Some(app) = weak.upgrade() else { return };
+                ticks += 1;
+                // Every 2 s in voice: how loud the microphone is at each step (numbers only,
+                // no sound kept), to tell a quiet device from a closed threshold or mute.
+                if ticks % 200 == 0 {
+                    if let Some(v) = app.session.lock().unwrap().clone().and_then(|s| s.voice()) {
+                        let (raw, processed, sent) = v.level_report();
+                        eprintln!("voice levels: device {raw:.0} dB, processed {processed:.0} dB, sent {sent:.0} dB, sending {}", v.transmitting());
+                    }
+                }
                 let key = app.voice_settings.lock().unwrap().ptt_key;
                 let voice = app.session.lock().unwrap().clone().and_then(|s| s.voice());
                 let (Some(key), Some(v)) = (key, voice) else {

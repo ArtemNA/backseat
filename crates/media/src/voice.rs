@@ -121,22 +121,33 @@ struct Peer {
     /// Send side: queue and payloader, and the tee pad feeding them.
     send: Vec<gst::Element>,
     tee_pad: gst::Pad,
-    /// Receive side, made when the peer's audio arrives, and its mixer pad.
+    /// Receive side, made when the peer's audio arrives, and its pad on the shared mixer.
     recv: Arc<Mutex<Option<(Vec<gst::Element>, gst::Pad)>>>,
     level: Arc<Level>,
     link: Arc<dyn Outbox>,
 }
 
 pub struct Voice {
+    /// The process's shared output pipeline: the voice lives inside it (one clock, the
+    /// peers' sound straight into its mixer, the echo probe next to the canceller).
     pipeline: gst::Pipeline,
+    mixer: gst::Element,
+    /// The microphone and its echo canceller (a pipeline of their own).
+    mic_pipe: gst::Pipeline,
+    /// The send chain in the shared pipeline (encoder, fan-out), removed when the voice stops.
+    mic: Vec<gst::Element>,
+    mute: gst::Element,
+    tee: gst::Element,
+    /// Stops the test room's feeding thread.
+    room_stop: Arc<AtomicBool>,
     cfg: VoiceConfig,
     peers: Mutex<HashMap<PeerId, Peer>>,
     mic_level: Arc<Level>,
     /// The microphone before the echo canceller (gates: the echo is there to cancel).
     raw_level: Arc<Level>,
     stopped: AtomicBool,
-    /// Our input of the shared output, kept while the voice lives.
-    _output: Arc<crate::playback::Input>,
+    /// Sound off: every peer's volume element muted, now and for peers that come later.
+    deafened: Arc<AtomicBool>,
     /// Microphone off by the user, and whether we may send now (push-to-talk: the key is
     /// down; otherwise always). Sound goes out only when not muted and allowed.
     mic_muted: AtomicBool,
@@ -155,6 +166,8 @@ pub struct Gate {
     threshold: std::sync::atomic::AtomicU64,
     /// The level of each 10 ms before the gate, dBFS as bits (for the settings' meter).
     level: std::sync::atomic::AtomicU64,
+    /// The loudest 10 ms before the gate since `take_max`, as bits (0: none).
+    max: std::sync::atomic::AtomicU64,
     open_until: Mutex<Option<Instant>>,
 }
 
@@ -170,6 +183,10 @@ impl Gate {
         }
         let db = if n > 0 { 20.0 * (sum / n as f64).sqrt().max(1e-5).log10() } else { -100.0 };
         self.level.store(db.to_bits(), Ordering::Relaxed);
+        let m = self.max.load(Ordering::Relaxed);
+        if m == 0 || db > f64::from_bits(m) {
+            self.max.store(db.to_bits(), Ordering::Relaxed);
+        }
         let t = self.threshold.load(Ordering::Relaxed);
         if t == 0 {
             return;
@@ -202,54 +219,104 @@ fn mono_caps() -> gst::Element {
 
 impl Voice {
     pub fn new(cfg: VoiceConfig) -> Result<Arc<Self>, String> {
-        let pipeline = gst::Pipeline::with_name("voice");
-
-        // Out: silence keeps the mixer (and the echo probe) running with nobody talking.
-        let silence = gst::ElementFactory::make("audiotestsrc")
-            .property_from_str("wave", "silence")
-            .property("is-live", true)
-            .property("samplesperbuffer", 480i32)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mixer = gst::ElementFactory::make("audiomixer").name("vmix").build().map_err(|e| e.to_string())?;
-        let deafen = gst::ElementFactory::make("volume").name("vout").build().unwrap();
-        // To the speakers through the process's shared output, whose echo probe the
-        // canceller below listens to (it hears the streams we watch there too).
+        // The peers (their connections, the sound to the speakers) live in the shared output's
+        // pipeline: one clock, their sound straight into its mixer. The microphone with the
+        // echo canceller has a pipeline of its own and hands what it sends over: in the shared
+        // pipeline, behind the mixer, the canceller cancelled nothing (stream echo -34.9 dBFS
+        // left of -32), while in a pipeline of its own it does (-60..-85, the gate).
         if cfg.silent {
             crate::playback::set_silent();
         }
-        let (tail, output) = crate::playback::tail("voice", true)?;
-        let mut out = vec![silence.clone(), mono_caps(), mixer.clone(), mono_caps(), deafen];
-        out.extend(tail);
-        pipeline.add_many(&out).map_err(|e| e.to_string())?;
-        gst::Element::link_many(&out[..2]).map_err(|e| e.to_string())?;
-        out[1].link(&mixer).map_err(|e| e.to_string())?;
-        gst::Element::link_many(&out[2..]).map_err(|e| e.to_string())?;
+        let out = crate::playback::get()?;
+        let pipeline = out.pipeline().clone();
+        let mixer = out.mixer().clone();
+        let room_stop = Arc::new(AtomicBool::new(false));
+        let mic_pipe = gst::Pipeline::with_name("voice-mic");
+        mic_pipe.use_clock(Some(&gst::SystemClock::obtain()));
 
         // In.
         // Tests only: STREAMER_DEBUG_VOICE_ROOM makes the microphone hear what our speakers
         // play, 40 ms later and 6 dB down, as a room would (and nothing else). Timestamped as a
         // real microphone would be: when the sound reached it, 40 ms after it was played.
-        let room = std::env::var_os("STREAMER_DEBUG_VOICE_ROOM").is_some();
+        // "<delay ms>:<gain>" (default "40:0.5"); "1000:1" is an echo bot for a person to
+        // hear themselves.
+        let room_spec = std::env::var("STREAMER_DEBUG_VOICE_ROOM").ok();
+        let room = room_spec.is_some();
+        let (room_ms, room_gain) = room_spec
+            .as_deref()
+            .and_then(|v| v.split_once(':'))
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<f64>().ok()?)))
+            .unwrap_or((40, 0.5));
         let src = if room {
+            // What the speakers play, heard `room_ms` after it is played: a buffer plays at
+            // its running time plus the pipeline's latency (when the sink renders it), so the
+            // microphone hears it then plus the room's delay, stamped with that time, and is
+            // handed on when the clock gets there. (Stamping on arrival from the mixer made
+            // the echo come before its sound once the voice added latency to the pipeline.)
             let a = gst_app::AppSrc::builder().caps(&crate::playback::caps()).is_live(true).format(gst::Format::Time).min_latency(0).max_latency(1_000_000_000).build();
-            let (feed, pw) = (a.clone(), pipeline.downgrade());
-            crate::playback::get()?.tap(move |mut b| {
-                let (Some(p), Some(at)) = (pw.upgrade(), b.pts()) else { return };
-                let Some(base) = p.base_time() else { return };
-                let Some(rt) = (at + gst::ClockTime::from_mseconds(40)).checked_sub(base) else { return };
-                {
-                    let b = b.make_mut();
-                    b.set_pts(rt);
-                    b.set_dts(gst::ClockTime::NONE);
-                }
-                let _ = feed.push_buffer(b);
-            })?;
+            let line: Arc<Mutex<std::collections::VecDeque<gst::Buffer>>> = Arc::default();
+            let l = line.clone();
+            // `tap` gives clock time (running time + base time).
+            crate::playback::get()?.tap(move |b| l.lock().unwrap().push_back(b))?;
+            let (feed, stop, delay, pw, mw) = (a.clone(), room_stop.clone(), gst::ClockTime::from_mseconds(room_ms), pipeline.downgrade(), mic_pipe.downgrade());
+            std::thread::Builder::new()
+                .name("voice-room".into())
+                .spawn(move || {
+                    let (mut latency, mut asked) = (gst::ClockTime::ZERO, Instant::now() - Duration::from_secs(1));
+                    loop {
+                    std::thread::sleep(Duration::from_millis(1));
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let (Some(_p), Some(m)) = (pw.upgrade(), mw.upgrade()) else { return };
+                    // Played at the shared pipeline's running time + the speakers' latency;
+                    // stamped in the microphone pipeline's time (same clock, own base time).
+                    let (Some(clock), Some(base)) = (m.clock(), m.base_time()) else { continue };
+                    if asked.elapsed() > Duration::from_millis(500) {
+                        if let Ok(out) = crate::playback::get() {
+                            latency = out.render_latency();
+                        }
+                        asked = Instant::now();
+                    }
+                    let now = clock.time();
+                    loop {
+                        let due = {
+                            let mut q = line.lock().unwrap();
+                            match q.front().and_then(|b| b.pts()) {
+                                Some(at) if now >= at + latency + delay => q.pop_front(),
+                                Some(_) => None,
+                                // No stamp: cannot place it; dropped.
+                                None => {
+                                    q.pop_front();
+                                    None
+                                }
+                            }
+                        };
+                        match due {
+                            Some(mut b) => {
+                                // Stamped `delay` after the buffer's own stamp. (Adding the speakers'
+                                // latency, as a room hears it, the canceller cancelled nothing; the
+                                // real microphone is measured in the voice log instead: device vs
+                                // processed level.)
+                                let heard = b.pts().unwrap() + delay;
+                                let _ = latency;
+                                {
+                                    let b = b.make_mut();
+                                    b.set_pts(heard.checked_sub(base));
+                                    b.set_dts(gst::ClockTime::NONE);
+                                }
+                                let _ = feed.push_buffer(b);
+                            }
+                            None => break,
+                        }
+                    }
+                    }
+                })
+                .unwrap();
             let bin = gst::Bin::new();
-            let q = gst::ElementFactory::make("queue").property("max-size-time", 1_000_000_000u64).property("max-size-buffers", 0u32).property("max-size-bytes", 0u32).build().unwrap();
-            let v = gst::ElementFactory::make("volume").property("volume", 0.5f64).build().unwrap();
-            bin.add_many([a.upcast_ref(), &q, &v]).unwrap();
-            gst::Element::link_many([a.upcast_ref(), &q, &v]).unwrap();
+            let v = gst::ElementFactory::make("volume").property("volume", room_gain).build().unwrap();
+            bin.add_many([a.upcast_ref(), &v]).unwrap();
+            gst::Element::link_many([a.upcast_ref(), &v]).unwrap();
             bin.add_pad(&gst::GhostPad::with_target(&v.static_pad("src").unwrap()).unwrap()).unwrap();
             bin.upcast()
         } else {
@@ -281,17 +348,45 @@ impl Voice {
         dsp.set_property("noise-suppression", !tested);
         dsp.set_property("gain-control", !tested);
         dsp.set_property("high-pass-filter", true);
-        let mute = gst::ElementFactory::make("volume").name("vmic").build().unwrap();
+        let mute = gst::ElementFactory::make("volume").build().unwrap();
         let opus = make("opusenc")?;
         opus.set_property_from_str("audio-type", "voice");
         opus.set_property_from_str("frame-size", "20");
         opus.set_property("bitrate", (cfg.kbit * 1000) as i32);
         opus.set_property("inband-fec", true);
         opus.set_property("packet-loss-percentage", 10i32);
-        let tee = gst::ElementFactory::make("tee").name("vtee").property("allow-not-linked", true).build().unwrap();
-        let inp = [src, make("audioconvert")?, make("audioresample")?, mono_caps(), dsp, mute.clone(), opus, tee];
-        pipeline.add_many(&inp).map_err(|e| e.to_string())?;
+        let tee = gst::ElementFactory::make("tee").property("allow-not-linked", true).build().unwrap();
+        // Capture side, in its own pipeline, up to an appsink...
+        let handoff = gst_app::AppSink::builder().sync(false).build();
+        handoff.set_property("async", false);
+        let inp = [src, make("audioconvert")?, make("audioresample")?, mono_caps(), dsp, mute.clone(), handoff.clone().upcast()];
+        mic_pipe.add_many(&inp).map_err(|e| e.to_string())?;
         gst::Element::link_many(&inp).map_err(|e| e.to_string())?;
+        // ...and on in the shared pipeline: encoder and the fan-out to the peers.
+        let mono = gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
+        let send_src = gst_app::AppSrc::builder().caps(&mono).is_live(true).format(gst::Format::Time).do_timestamp(true).min_latency(0).max_latency(1_000_000_000).build();
+        send_src.set_property("block", false);
+        send_src.set_property_from_str("leaky-type", "downstream");
+        send_src.set_max_bytes((RATE * 2 / 5) as u64); // 200 ms
+        let feed = send_src.clone();
+        handoff.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    if let Some(mut b) = sink.pull_sample().ok().and_then(|s| s.buffer_owned()) {
+                        {
+                            let b = b.make_mut();
+                            b.set_pts(gst::ClockTime::NONE);
+                            b.set_dts(gst::ClockTime::NONE);
+                        }
+                        let _ = feed.push_buffer(b);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        let send = [send_src.upcast(), opus, tee.clone()];
+        pipeline.add_many(&send).map_err(|e| e.to_string())?;
+        gst::Element::link_many(&send).map_err(|e| e.to_string())?;
         let mic_level = Arc::new(Level::default());
         mic_level.watch(&mute.static_pad("src").unwrap());
         // The voice activity gate, between the canceller (its noise suppression) and mute.
@@ -309,9 +404,24 @@ impl Voice {
         let raw_level = Arc::new(Level::default());
         raw_level.watch(&inp[4].static_pad("sink").unwrap());
 
-        bus(&pipeline);
-        pipeline.set_state(gst::State::Playing).map_err(|e| format!("cannot start voice (microphone or speakers): {e}"))?;
-        Ok(Arc::new(Self { pipeline, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), _output: output, mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate }))
+        // The echo probe is in the output from its start (`Playback::new`). A probe put in only
+        // for the voice (to avoid the backlog below) cancelled nothing in the gate, cause not
+        // found. Known, open: after watching a while before joining voice the probe is behind
+        // and nothing is cancelled (gate -VoiceAfter 20: -34.9 dBFS left of -32).
+        // The shared pipeline already plays: start the send chain downstream first.
+        for e in send.iter().rev() {
+            let _ = e.sync_state_with_parent();
+        }
+        if let Err(e) = mic_pipe.set_state(gst::State::Playing) {
+            let _ = mic_pipe.set_state(gst::State::Null);
+            for e in &send {
+                let _ = e.set_state(gst::State::Null);
+                let _ = pipeline.remove(e);
+            }
+            return Err(format!("cannot open the microphone: {e}"));
+        }
+        crate::drain_bus(&mic_pipe, "voice-mic");
+        Ok(Arc::new(Self { pipeline, mixer, mic_pipe, mic: send.to_vec(), mute, tee, room_stop, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), deafened: Arc::default(), mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate }))
     }
 
     pub fn has(&self, id: PeerId) -> bool {
@@ -333,6 +443,18 @@ impl Voice {
         let webrtc = gst::ElementFactory::make("webrtcbin").name(format!("voice-{id}")).build().map_err(|e| e.to_string())?;
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
         webrtc.set_property("latency", self.cfg.latency_ms);
+        // The jitter buffers kept rtpbin's own 200 ms whatever webrtcbin was told, and in the
+        // shared output that latency is everyone's: a watched stream's sound came 170 ms later
+        // while anyone was in voice (output latency 210 ms against 40). Set on each one.
+        if let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) {
+            let ms = self.cfg.latency_ms;
+            rtpbin.connect("new-jitterbuffer", false, move |v| {
+                if let Ok(jb) = v[1].get::<gst::Element>() {
+                    jb.set_property("latency", ms);
+                }
+                None
+            });
+        }
         crate::ice::configure(&webrtc, &self.cfg.ice);
         crate::ice::watch(&webrtc, format!("voice {id}"), self.cfg.ice.turn.is_some(), || {});
         let l = link.clone();
@@ -362,14 +484,14 @@ impl Voice {
         }
         let level = Arc::new(Level::default());
         let recv: Arc<Mutex<Option<(Vec<gst::Element>, gst::Pad)>>> = Arc::default();
-        let (pw, r, lv, vols) = (self.pipeline.downgrade(), recv.clone(), level.clone(), self.volumes.clone());
+        let (pw, mixer, r, lv, vols, deaf) = (self.pipeline.downgrade(), self.mixer.clone(), recv.clone(), level.clone(), self.volumes.clone(), self.deafened.clone());
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
             }
             let Some(p) = pw.upgrade() else { return };
             let volume = vols.lock().unwrap().get(&id).copied().unwrap_or(1.0);
-            match receive(&p, pad, id, &lv, volume) {
+            match receive(&p, &mixer, pad, id, &lv, volume, deaf.load(Ordering::SeqCst)) {
                 Ok(chain) => *r.lock().unwrap() = Some(chain),
                 Err(e) => eprintln!("voice: cannot play {id}: {e}"),
             }
@@ -386,11 +508,22 @@ impl Voice {
         pay.set_property("pt", VOICE_PT);
         self.pipeline.add_many([&webrtc, &queue, &pay]).map_err(|e| e.to_string())?;
         gst::Element::link_many([&queue, &pay, &webrtc]).map_err(|e| e.to_string())?;
+        // The format up front: webrtcbin offers only once it knows what the pad carries, and
+        // waiting for the first sound lost the offer now and then (a microphone that is slow
+        // to open, the echo bot's delay): the two sides never connected.
+        let rtp_caps = gst::Caps::builder("application/x-rtp")
+            .field("media", "audio")
+            .field("encoding-name", "OPUS")
+            .field("clock-rate", 48000i32)
+            .field("payload", VOICE_PT as i32)
+            .build();
+        if let Some(t) = pay.static_pad("src").and_then(|p| p.peer()).and_then(|p| p.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")) {
+            t.set_property("codec-preferences", &rtp_caps);
+        }
         for e in [&webrtc, &pay, &queue] {
             e.sync_state_with_parent().map_err(|e| e.to_string())?;
         }
-        let tee = self.pipeline.by_name("vtee").unwrap();
-        let tee_pad = tee.request_pad_simple("src_%u").unwrap();
+        let tee_pad = self.tee.request_pad_simple("src_%u").unwrap();
         // Spoiled variant for the gate: nothing is sent.
         if std::env::var_os("STREAMER_DEBUG_VOICE_NO_SEND").is_none() {
             tee_pad.link(&queue.static_pad("sink").unwrap()).map_err(|e| format!("voice {id}: {e:?}"))?;
@@ -403,7 +536,7 @@ impl Voice {
     /// Closes the connection to `id`.
     pub fn remove_peer(&self, id: PeerId) {
         let Some(p) = self.peers.lock().unwrap().remove(&id) else { return };
-        let tee = self.pipeline.by_name("vtee").unwrap();
+        let tee = &self.tee;
         // Unlink the tee pad between buffers.
         if let Some(peer) = p.tee_pad.peer() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -428,9 +561,7 @@ impl Voice {
                 let _ = e.set_state(gst::State::Null);
                 let _ = self.pipeline.remove(e);
             }
-            if let Some(m) = self.pipeline.by_name("vmix") {
-                m.release_request_pad(&mix_pad);
-            }
+            self.mixer.release_request_pad(&mix_pad);
         }
         eprintln!("voice: {id} gone");
     }
@@ -483,20 +614,32 @@ impl Voice {
         self.gate.level_db()
     }
 
+    /// For the log: the loudest moments since the last call of what the device gave, of it
+    /// after echo/noise/gain processing, and of what was sent (after threshold and mute);
+    /// dBFS, -100 for nothing.
+    pub fn level_report(&self) -> (f64, f64, f64) {
+        let g = match self.gate.max.swap(0, Ordering::Relaxed) {
+            0 => -100.0,
+            b => f64::from_bits(b),
+        };
+        (self.raw_level.take_max(), g, self.mic_level.take_max())
+    }
+
     pub fn transmitting(&self) -> bool {
         self.transmit.load(Ordering::SeqCst) && !self.mic_muted.load(Ordering::SeqCst)
     }
 
     fn apply_mic(&self) {
-        if let Some(v) = self.pipeline.by_name("vmic") {
-            v.set_property("mute", !self.transmitting());
-        }
+        self.mute.set_property("mute", !self.transmitting());
     }
 
     /// Nobody heard (and, as in other voice apps, the microphone stays as it is).
     pub fn set_deafened(&self, on: bool) {
-        if let Some(v) = self.pipeline.by_name("vout") {
-            v.set_property("mute", on);
+        self.deafened.store(on, Ordering::SeqCst);
+        for id in self.peer_ids() {
+            if let Some(v) = self.pipeline.by_name(&format!("vvol-{id}")) {
+                v.set_property("mute", on);
+            }
         }
     }
 
@@ -533,65 +676,96 @@ impl Voice {
         self.peers.lock().unwrap().iter().map(|(id, p)| (*id, p.level.db())).collect()
     }
 
+    /// Leaves voice: the peers' connections and the microphone chain go out of the shared
+    /// pipeline (which keeps playing the streams and sounds).
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
         for id in self.peer_ids() {
             self.remove_peer(id);
         }
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.room_stop.store(true, Ordering::SeqCst);
+        let _ = self.mic_pipe.set_state(gst::State::Null);
+        for e in &self.mic {
+            let _ = e.set_state(gst::State::Null);
+        }
+        for e in &self.mic {
+            let _ = self.pipeline.remove(e);
+        }
     }
 }
 
 impl Drop for Voice {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.stop();
     }
 }
 
-/// A peer's audio: depay -> decode -> its volume -> the mixer.
-fn receive(pipeline: &gst::Pipeline, pad: &gst::Pad, id: PeerId, level: &Arc<Level>, volume: f64) -> Result<(Vec<gst::Element>, gst::Pad), String> {
+/// A peer's audio: depay -> decode -> its volume -> the shared mixer (same pipeline).
+fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: PeerId, level: &Arc<Level>, volume: f64, deaf: bool) -> Result<(Vec<gst::Element>, gst::Pad), String> {
     let dec = make("opusdec")?;
     dec.set_property("plc", true);
-    dec.set_property("use-inband-fec", true);
-    let vol = gst::ElementFactory::make("volume").name(format!("vvol-{id}")).property("volume", volume).build().unwrap();
-    let chain = vec![make("rtpopusdepay")?, dec, make("audioconvert")?, make("audioresample")?, mono_caps(), vol.clone()];
+    // No in-band FEC: to use it the decoder waits for the next packet and reports 120 ms for
+    // that (measured: 60 ms after the jitter buffer, 180 after the decoder), and in the shared
+    // output every input waits for the slowest: a watched stream's sound came 170 ms later
+    // while anyone was in voice. Loss concealment (plc) stays, as for a stream's sound.
+    dec.set_property("use-inband-fec", false);
+    let vol = gst::ElementFactory::make("volume").name(format!("vvol-{id}")).property("volume", volume).property("mute", deaf).build().unwrap();
+    let to_mix = gst::ElementFactory::make("capsfilter").property("caps", crate::playback::caps()).build().unwrap();
+    let chain = vec![make("rtpopusdepay")?, dec, make("audioconvert")?, make("audioresample")?, mono_caps(), vol.clone(), make("audioconvert")?, to_mix.clone()];
     pipeline.add_many(&chain).map_err(|e| e.to_string())?;
     gst::Element::link_many(&chain).map_err(|e| e.to_string())?;
     level.watch(&vol.static_pad("src").unwrap());
-    let mixer = pipeline.by_name("vmix").ok_or("no mixer")?;
+    // Into the mixer as it comes, stamped then, with no latency of its own: the mixer waits
+    // for its slowest input, and with the voice's jitter buffer (60 ms) as that, a watched
+    // stream's sound came that much later while anyone was in voice. The jitter buffer still
+    // evens out the network before this point. STREAMER_DEBUG_VOICE_OWN_LATENCY: the old way.
+    if std::env::var_os("STREAMER_DEBUG_VOICE_OWN_LATENCY").is_none() {
+        let out = to_mix.static_pad("src").unwrap();
+        let pw = pipeline.downgrade();
+        out.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(p) = pw.upgrade() else { return gst::PadProbeReturn::Ok };
+            let (Some(clock), Some(base)) = (p.clock(), p.base_time()) else { return gst::PadProbeReturn::Ok };
+            if let Some(gst::PadProbeData::Buffer(ref mut b)) = info.data {
+                if let Some(now) = clock.time().checked_sub(base) {
+                    let b = b.make_mut();
+                    b.set_pts(now);
+                    b.set_dts(gst::ClockTime::NONE);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        out.add_probe(gst::PadProbeType::QUERY_UPSTREAM | gst::PadProbeType::PULL, |_, info| {
+            if let Some(gst::PadProbeData::Query(ref mut q)) = info.data {
+                if let gst::QueryViewMut::Latency(l) = q.view_mut() {
+                    let (live, _min, max) = l.result();
+                    l.set(live, gst::ClockTime::ZERO, max);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
     let mix_pad = mixer.request_pad_simple("sink_%u").ok_or("no mixer pad")?;
-    vol.static_pad("src").unwrap().link(&mix_pad).map_err(|e| format!("{e:?}"))?;
+    to_mix.static_pad("src").unwrap().link(&mix_pad).map_err(|e| format!("{e:?}"))?;
     pad.link(&chain[0].static_pad("sink").unwrap()).map_err(|e| format!("{e:?}"))?;
     for e in chain.iter().rev() {
         e.sync_state_with_parent().map_err(|e| e.to_string())?;
     }
     eprintln!("voice: hearing {id}");
-    Ok((chain, mix_pad))
-}
-
-/// Errors and latency changes (a new peer's branch changes it).
-fn bus(pipeline: &gst::Pipeline) {
-    let bus = pipeline.bus().unwrap();
-    let weak = pipeline.downgrade();
-    std::thread::Builder::new()
-        .name("voice-bus".into())
-        .spawn(move || {
-            for msg in bus.iter_timed(gst::ClockTime::NONE) {
-                match msg.view() {
-                    gst::MessageView::Latency(_) => {
-                        if let Some(p) = weak.upgrade() {
-                            let _ = p.recalculate_latency();
-                        }
-                    }
-                    gst::MessageView::Error(e) => {
-                        eprintln!("voice: error from {}: {}", e.src().map(|s| s.name().to_string()).unwrap_or_default(), e.error());
-                    }
-                    _ => {}
-                }
-                if weak.upgrade().is_none() {
-                    return;
-                }
+    // STREAMER_DEBUG_VOICE_LATENCY: the latency each step of the receive chain reports.
+    if std::env::var_os("STREAMER_DEBUG_VOICE_LATENCY").is_some() {
+        let steps: Vec<(String, gst::Pad)> = std::iter::once(("webrtcbin".to_string(), pad.clone()))
+            .chain(chain.iter().filter_map(|e| e.static_pad("src").map(|p| (e.factory().map(|f| f.name().to_string()).unwrap_or_default(), p))))
+            .collect();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            for (name, p) in steps {
+                let mut q = gst::query::Latency::new();
+                let ok = p.query(&mut q);
+                eprintln!("voice latency after {name}: ok {ok} min {} ms", q.result().1.mseconds());
             }
-        })
-        .unwrap();
+        });
+    }
+    Ok((chain, mix_pad))
 }
