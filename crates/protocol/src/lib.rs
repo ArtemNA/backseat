@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub type PeerId = u64;
 
+/// Limits in characters (not bytes).
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_ROOM_LEN: usize = 64;
 /// A room's display name; the room itself is its code (or, in older clients, its name).

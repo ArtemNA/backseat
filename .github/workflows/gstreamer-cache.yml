@@ -1,0 +1,54 @@
+# Keeps the GStreamer installer in a cache of the default branch, where every release tag
+# can restore it. A cache saved by a tag run is visible to that tag only, so each release
+# downloaded the 540 MB installer again (and the server sometimes drops it midway). GitHub
+# evicts a cache after 7 days without use: a run every 5 days keeps it.
+name: gstreamer-cache
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/**']
+  schedule:
+    - cron: '17 3 */5 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The same as in release.yml: the cache key and path must match exactly.
+  GST_VERSION: 1.28.8
+  GST_SHA256: e4c41ee6ee9c6c32a45d198463ec08d79bac3bd5fa58adc93d13fe4a08abc9d9
+
+jobs:
+  warm:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Cache GStreamer installer
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\gst-download
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}
+
+      - name: Download when not cached
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        run: |
+          $exe = "C:\gst-download\gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+          New-Item -ItemType Directory C:\gst-download -Force | Out-Null
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+          for ($try = 1; $try -le 8; $try++) {
+            curl.exe -fsSL --retry 3 --retry-all-errors -C - -o $exe $url
+            if (-not $LASTEXITCODE) { break }
+            "download attempt $try stopped (curl $LASTEXITCODE) at $((Get-Item $exe -ErrorAction SilentlyContinue).Length) bytes"
+            Start-Sleep -Seconds 5
+          }
+          if ($LASTEXITCODE) { throw "download failed: $url" }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # A wrong file must not be cached: fail before the cache is saved.
+          if ($hash -ne $env:GST_SHA256) { Remove-Item $exe; throw "GStreamer installer hash $hash, expected $env:GST_SHA256" }
+          "cached for the release tags: $((Get-Item $exe).Length) bytes"
