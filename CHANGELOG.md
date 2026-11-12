@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## Unreleased
+
+- Names and room names are limited to 32 characters, not 32 bytes: a Cyrillic name over 16 letters was refused (needs the updated signaling server).
+
 ## 0.2.2
 
 - The window list for going live no longer shows hidden windows of suspended Windows apps (Settings, Windows Input Experience, ApplicationFrameHost).

@@ -15,6 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Keep GST_VERSION and GST_SHA256 the same in gstreamer-cache.yml, which keeps the
+  # installer in a cache this workflow can restore on a tag.
   GST_VERSION: 1.28.8
   # SHA-256 of gstreamer-1.0-msvc-x86_64-1.28.8.exe (the .sha256sum published next to it).
   GST_SHA256: e4c41ee6ee9c6c32a45d198463ec08d79bac3bd5fa58adc93d13fe4a08abc9d9

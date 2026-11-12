@@ -300,3 +300,22 @@ async fn leave_drops_at_once_and_a_wrong_token_gets_a_new_id() {
     let (c, _) = Client::join_as(&url, "r", "b", Some(protocol::Resume { id, token: "guess".into() })).await;
     assert_ne!(c.id, id, "a wrong token does not take a place");
 }
+/// Names are limited in characters: a 32-letter Cyrillic name (64 bytes) joins, 33 letters do
+/// not.
+#[tokio::test]
+async fn long_cyrillic_name_joins() {
+    let url = start(cfg()).await;
+    let name: String = "Олександр".chars().cycle().take(32).collect();
+    assert_eq!(name.len(), 64);
+    let (a, peers) = Client::join(&url, "names", &name).await;
+    assert!(peers.is_empty());
+    let (_b, peers) = Client::join(&url, "names", "Bob").await;
+    assert_eq!(peers.iter().find(|p| p.id == a.id).map(|p| p.name.clone()), Some(name.clone()));
+
+    let too_long: String = "Олександр".chars().cycle().take(33).collect();
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.unwrap();
+    let join = ClientMsg::Join { room: "names".into(), name: too_long, title: None, resume: None };
+    ws.send(Message::Text(join.to_json().into())).await.unwrap();
+    let mut c = Client { ws, id: 0, token: None };
+    assert!(matches!(c.next().await, ServerMsg::Error { .. }), "a 33-letter name must be refused");
+}

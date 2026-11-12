@@ -186,7 +186,9 @@ impl Server {
     /// Joins `room`, or takes back a kept place with `resume`. Returns the peer id and the
     /// connection number that now holds it.
     fn join(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
-        if room.is_empty() || room.len() > MAX_ROOM_LEN || name.is_empty() || name.len() > MAX_NAME_LEN {
+        // Counted in characters, not bytes: a Cyrillic letter is two bytes, so a 17-letter
+        // Ukrainian name was refused as too long.
+        if room.is_empty() || room.chars().count() > MAX_ROOM_LEN || name.is_empty() || name.chars().count() > MAX_NAME_LEN {
             return Err("room or name is empty or too long".into());
         }
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
