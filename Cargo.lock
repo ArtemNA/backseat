@@ -211,6 +211,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "media",
+ "protocol",
  "raw-window-handle",
  "serde_json",
  "tauri-winres",
@@ -7572,7 +7573,9 @@ version = "0.2.7"
 dependencies = [
  "axum",
  "futures-util",
+ "hmac",
  "protocol",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "ureq",

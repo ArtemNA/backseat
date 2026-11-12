@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+pub mod temp;
+pub use temp::TempKey;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// How often the server pings each client.
@@ -60,6 +63,8 @@ struct Rooms {
     peers: HashMap<PeerId, Peer>,
     /// Display names of rooms that have members; dropped with the last one.
     titles: HashMap<String, String>,
+    /// Temporary rooms whose end is scheduled.
+    temp_ends: HashSet<String>,
 }
 
 impl Rooms {
@@ -103,6 +108,8 @@ impl Rooms {
 
 pub struct Server {
     cfg: Config,
+    /// Signs and checks temporary rooms' codes; None: such rooms are refused.
+    temp: Option<TempKey>,
     rooms: Mutex<Rooms>,
     next_id: AtomicU64,
     next_conn: AtomicU64,
@@ -112,7 +119,12 @@ pub struct Server {
 
 impl Server {
     pub fn new(cfg: Config) -> Arc<Self> {
-        Arc::new(Self { cfg, rooms: Mutex::default(), next_id: AtomicU64::new(1), next_conn: AtomicU64::new(1), bytes_in: AtomicU64::new(0) })
+        Self::with_temp(cfg, None)
+    }
+
+    /// Like `new`, also taking temporary rooms signed with `temp`.
+    pub fn with_temp(cfg: Config, temp: Option<TempKey>) -> Arc<Self> {
+        Arc::new(Self { cfg, temp, rooms: Mutex::default(), next_id: AtomicU64::new(1), next_conn: AtomicU64::new(1), bytes_in: AtomicU64::new(0) })
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -122,6 +134,8 @@ impl Server {
             .route("/live", get(|| async { "ok" }))
             // Invite links: a page that opens the app on that room, or shows the code.
             .route("/j/{code}", get(invite_page))
+            // A temporary room's invite: the same page, with its end time.
+            .route("/t/{code}", get(temp_invite_page))
             .with_state(self.clone())
     }
 
@@ -185,12 +199,70 @@ impl Server {
 
     /// Joins `room`, or takes back a kept place with `resume`. Returns the peer id and the
     /// connection number that now holds it.
-    fn join(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
+    fn join(self: &Arc<Self>, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
         // Counted in characters, not bytes: a Cyrillic letter is two bytes, so a 17-letter
         // Ukrainian name was refused as too long.
         if room.is_empty() || room.chars().count() > MAX_ROOM_LEN || name.is_empty() || name.chars().count() > MAX_NAME_LEN {
             return Err("room or name is empty or too long".into());
         }
+        let ends = self.temp_ends(&room)?;
+        let joined = self.join_checked(room.clone(), name, title, resume, tx)?;
+        if let Some(ends) = ends {
+            self.schedule_end(room, ends);
+        }
+        Ok(joined)
+    }
+
+    /// For a temporary room's code: its end time, or why it cannot be joined. None for any
+    /// other room.
+    fn temp_ends(&self, room: &str) -> Result<Option<u64>, String> {
+        if !protocol::temp::looks_temp(room) {
+            return Ok(None);
+        }
+        let key = self.temp.as_ref().ok_or(protocol::temp::OFF)?;
+        let ends = key.check(room).ok_or(protocol::temp::INVALID)?;
+        if protocol::temp::now() >= ends {
+            return Err(protocol::temp::ENDED.into());
+        }
+        Ok(Some(ends))
+    }
+
+    /// Once per temporary room while it has members: at its end everyone in it is told and
+    /// dropped, with no place kept. STREAMER_DEBUG_TEMP_NO_EXPIRY: nobody is (the spoiled
+    /// variant for the gates).
+    fn schedule_end(self: &Arc<Self>, room: String, ends: u64) {
+        if std::env::var_os("STREAMER_DEBUG_TEMP_NO_EXPIRY").is_some() || !self.rooms.lock().unwrap().temp_ends.insert(room.clone()) {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            // Unix time, not the monotonic clock: the end is a moment on the wall clock.
+            loop {
+                let left = (ends * 1000).saturating_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0));
+                if left == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(left)).await;
+            }
+            me.end_room(&room);
+        });
+    }
+
+    fn end_room(&self, room: &str) {
+        let mut rooms = self.rooms.lock().unwrap();
+        rooms.temp_ends.remove(room);
+        let ids: Vec<PeerId> = rooms.peers.iter().filter(|(_, p)| p.room == room).map(|(k, _)| *k).collect();
+        // Told first; the connection closes after this message (see `session`).
+        for id in &ids {
+            rooms.send(*id, ServerMsg::Error { message: protocol::temp::ENDED.into() });
+        }
+        for id in ids {
+            rooms.remove(id);
+        }
+        println!("server: a temporary room ended");
+    }
+
+    fn join_checked(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let mut rooms = self.rooms.lock().unwrap();
         if let Some(r) = resume {
@@ -253,12 +325,58 @@ impl Server {
 /// code to the app. Self-contained: no scripts or styles from anywhere else.
 async fn invite_page(axum::extract::Path(code): axum::extract::Path<String>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let clean: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect();
+    let clean = clean_code(&code);
     if clean.len() != 12 {
         return (axum::http::StatusCode::NOT_FOUND, "no such invite").into_response();
     }
-    let shown = format!("{}-{}-{}", &clean[0..4], &clean[4..8], &clean[8..12]);
-    let html = INVITE_PAGE.replace("{CODE}", &clean).replace("{SHOWN}", &shown);
+    page(&clean, &clean, None, None)
+}
+
+/// A temporary room's invite (`/t/CODE?title=...`): the same page with its end time, or a
+/// note that it has ended. A code this server did not sign is no invite.
+async fn temp_invite_page(
+    State(server): State<Arc<Server>>,
+    axum::extract::Path(code): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let clean = clean_code(&code);
+    let Some(ends) = server.temp.as_ref().and_then(|k| k.check(&clean)) else {
+        return (axum::http::StatusCode::NOT_FOUND, "no such invite").into_response();
+    };
+    let title = q.get("title").map(|t| t.trim().chars().take(MAX_TITLE_LEN).collect::<String>()).filter(|t| !t.is_empty());
+    let href = match &title {
+        Some(t) => format!("{clean}?title={}", percent_encode(t)),
+        None => clean.clone(),
+    };
+    page(&href, &clean, Some(ends), title.as_deref())
+}
+
+/// Upper case letters and digits only, with the look-alike letters Crockford base32 reads
+/// as digits.
+fn clean_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            'U' => 'V',
+            c => c,
+        })
+        .collect()
+}
+
+fn page(href: &str, code: &str, ends: Option<u64>, title: Option<&str>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let shown = code.as_bytes().chunks(4).map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join("-");
+    let ended = ends.is_some_and(|e| protocol::temp::now() >= e);
+    let html = INVITE_PAGE
+        .replace("{ENDS}", &ends.unwrap_or(0).to_string())
+        .replace("{ENDED}", if ended { "1" } else { "0" })
+        .replace("{HREF}", href)
+        .replace("{SHOWN}", &shown)
+        // Last: a title is the one value that could hold a placeholder's text.
+        .replace("{TITLE}", &html_escape(title.unwrap_or("Backseat")));
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -270,9 +388,27 @@ async fn invite_page(axum::extract::Path(code): axum::extract::Path<String>) -> 
         .into_response()
 }
 
+fn html_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '<' => "&lt;".into(),
+            '>' => "&gt;".into(),
+            '&' => "&amp;".into(),
+            '"' => "&quot;".into(),
+            '\'' => "&#39;".into(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// For a query value: everything but unreserved ASCII as %XX of its UTF-8 bytes.
+pub fn percent_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 const INVITE_PAGE: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Backseat</title>
+<title>{TITLE}</title>
 <style>
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#1e1f22;color:#dbdee1;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
 main{max-width:420px;margin:16px;background:#313338;border-radius:12px;padding:28px;text-align:center}
@@ -282,18 +418,23 @@ code{display:inline-block;margin-top:6px;padding:6px 10px;border-radius:6px;back
 p{margin:6px 0;color:#b5bac1}
 </style></head>
 <body><main>
-<h1 id="h">Backseat</h1>
+<h1 id="h">{TITLE}</h1>
 <p id="lead">You are invited to a room.</p>
-<a class="btn" id="open" href="backseat://join/{CODE}">Open in Backseat</a>
+<p id="until"></p>
+<a class="btn" id="open" href="backseat://join/{HREF}">Open in Backseat</a>
 <p id="manual">No app or nothing happens? In Backseat press “+”, choose “I have an invite” and enter:</p>
-<code>{SHOWN}</code>
+<code id="code">{SHOWN}</code>
 </main>
 <script>
-var L={uk:["Вас запрошують у кімнату.","Відкрити в Backseat","Немає застосунку або нічого не сталося? У Backseat натисніть «+», виберіть «Маю запрошення» і введіть:"],
-ru:["Вас приглашают в комнату.","Открыть в Backseat","Нет приложения или ничего не произошло? В Backseat нажмите «+», выберите «Есть приглашение» и введите:"]};
-var l=L[(navigator.language||"").slice(0,2)];
-if(l){document.getElementById("lead").textContent=l[0];document.getElementById("open").textContent=l[1];document.getElementById("manual").textContent=l[2];}
-setTimeout(function(){location.href="backseat://join/{CODE}"},300);
+var ENDS={ENDS},ENDED={ENDED};
+var L={en:["You are invited to a room.","Open in Backseat","No app or nothing happens? In Backseat press “+”, choose “I have an invite” and enter:","A temporary room, open until ","This temporary room has ended."],
+uk:["Вас запрошують у кімнату.","Відкрити в Backseat","Немає застосунку або нічого не сталося? У Backseat натисніть «+», виберіть «Маю запрошення» і введіть:","Тимчасова кімната, відкрита до ","Ця тимчасова кімната завершилася."],
+ru:["Вас приглашают в комнату.","Открыть в Backseat","Нет приложения или ничего не произошло? В Backseat нажмите «+», выберите «Есть приглашение» и введите:","Временная комната, открыта до ","Эта временная комната завершилась."]};
+var lang=(navigator.language||"").slice(0,2),l=L[lang]||L.en,$=function(i){return document.getElementById(i)};
+$("lead").textContent=l[0];$("open").textContent=l[1];$("manual").textContent=l[2];
+if(ENDS){$("until").textContent=l[3]+new Date(ENDS*1000).toLocaleString(navigator.language||undefined,{dateStyle:"medium",timeStyle:"short"});}
+if(ENDED){$("lead").textContent=l[4];["until","open","manual","code"].forEach(function(i){$(i).style.display="none"});}
+else setTimeout(function(){location.href="backseat://join/{HREF}"},300);
 </script>
 </body></html>
 "#;
@@ -315,7 +456,13 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(m) => if sink.send(Message::Text(m.to_json().into())).await.is_err() { break },
+                    Some(m) => {
+                        // A temporary room ended (or was refused for it): nothing more comes.
+                        let last = matches!(&m, ServerMsg::Error { message } if message == protocol::temp::ENDED);
+                        if sink.send(Message::Text(m.to_json().into())).await.is_err() || last {
+                            break;
+                        }
+                    }
                     None => break,
                 },
                 _ = ping.tick() => if sink.send(Message::Ping(Vec::new().into())).await.is_err() { break },

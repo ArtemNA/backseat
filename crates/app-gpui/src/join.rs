@@ -96,16 +96,50 @@ pub fn new_code() -> String {
     b.iter().map(|x| CODE_ABC[(x & 31) as usize] as char).collect()
 }
 
+/// An invite code: 12 symbols, or 20 for a temporary room (`protocol::temp`).
 pub fn is_code(room: &str) -> bool {
-    room.len() == 12 && room.bytes().all(|c| CODE_ABC.contains(&c))
+    (room.len() == 12 && room.bytes().all(|c| CODE_ABC.contains(&c))) || protocol::temp::looks_temp(room)
 }
 
 /// The https page for a room's invite, on the room's own server (ws -> http, wss -> https).
+/// A temporary room's page (`/t/`) also shows when it ends, and names it.
 pub fn invite_link(r: &Room) -> String {
     let rest = r.server.strip_prefix("ws").unwrap_or(&r.server);
     let host = rest.split("://").nth(1).unwrap_or_default().split('/').next().unwrap_or_default();
     let proto = rest.split("://").next().unwrap_or_default();
+    if protocol::temp::looks_temp(&r.room) {
+        let title = r.title.as_deref().map(|t| format!("?title={}", percent_encode(t))).unwrap_or_default();
+        return format!("http{proto}://{host}/t/{}{title}", fmt_code(&r.room));
+    }
     format!("http{proto}://{host}/j/{}", fmt_code(&r.room))
+}
+
+fn percent_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// The room's name a temporary room's link carries (`...?title=Friday%20games`), if any.
+pub fn parse_title(link: &str) -> Option<String> {
+    let v = link.split_once("title=")?.1.split('&').next()?;
+    let mut bytes = Vec::new();
+    let mut it = v.bytes();
+    while let Some(b) = it.next() {
+        match b {
+            b'%' => {
+                let h: String = it.by_ref().take(2).map(|c| c as char).collect();
+                bytes.push(u8::from_str_radix(&h, 16).ok()?);
+            }
+            b'+' => bytes.push(b' '),
+            b => bytes.push(b),
+        }
+    }
+    let t: String = String::from_utf8(bytes).ok()?.trim().chars().take(protocol::MAX_TITLE_LEN).collect();
+    (!t.is_empty()).then_some(t)
+}
+
+/// A temporary room whose end has passed by this computer's clock.
+pub fn temp_over(room: &str) -> bool {
+    protocol::temp::ends(room).is_some_and(|e| protocol::temp::now() >= e)
 }
 
 pub fn fmt_code(c: &str) -> String {
@@ -115,7 +149,7 @@ pub fn fmt_code(c: &str) -> String {
 /// A code or a link carrying one, as typed or pasted; None if it is neither.
 pub fn parse_code(text: &str) -> Option<String> {
     let mut v = text.trim().to_string();
-    for key in ["/j/", "join/"] {
+    for key in ["/j/", "/t/", "join/"] {
         if let Some(i) = v.find(key) {
             v = v[i + key.len()..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
             break;
@@ -310,7 +344,7 @@ impl Shell {
                         s.join.open = false;
                         s.error = None;
                     }
-                    Err(e) => s.join.error = Some(e),
+                    Err(e) => s.join.error = Some(s.join_error(&r.room, &e)),
                 }
                 s.tick(cx);
             });
@@ -826,4 +860,30 @@ fn test_filled(window: &mut Window, cx: &mut Context<Shell>, len: usize, name: S
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's prelude brings its own `test` attribute.
+    use super::{invite_link, is_code, parse_code, parse_title, temp_over};
+    use crate::Room;
+
+    #[test]
+    fn temp_links_and_codes_parse() {
+        let code = "0H4N1NFBKRKKRY8Z3HVT";
+        assert!(is_code(code));
+        assert_eq!(parse_code("https://streamer-signaling.onrender.com/t/0H4N-1NFB-KRKK-RY8Z-3HVT?title=Fri%20%D0%86%D0%B3%D1%80%D0%B8").as_deref(), Some(code));
+        assert_eq!(parse_code("backseat://join/0H4N-1NFB-KRKK-RY8Z-3HVT?title=x").as_deref(), Some(code));
+        assert_eq!(parse_code("0h4n-1nfb-krkk-ry8z-3hvt").as_deref(), Some(code));
+        assert_eq!(parse_title("backseat://join/0H4N1NFBKRKKRY8Z3HVT?title=Fri%20%D0%86%D0%B3%D1%80%D0%B8").as_deref(), Some("Fri Ігри"));
+        assert_eq!(parse_title("backseat://join/0H4N1NFBKRKKRY8Z3HVT"), None);
+        // Ordinary codes still parse; 16 symbols are neither.
+        assert_eq!(parse_code("https://x/j/8TJB-5QCW-EATF").as_deref(), Some("8TJB5QCWEATF"));
+        assert_eq!(parse_code("8TJB-5QCW-EATF-0000"), None);
+        let r = Room { server: "wss://example.org/ws".into(), room: code.into(), name: "n".into(), title: Some("Fri Ігри".into()) };
+        let link = invite_link(&r);
+        assert_eq!(link, "https://example.org/t/0H4N-1NFB-KRKK-RY8Z-3HVT?title=Fri%20%D0%86%D0%B3%D1%80%D0%B8");
+        assert_eq!(parse_title(&link).as_deref(), Some("Fri Ігри"));
+        assert!(!temp_over(code) || protocol::temp::ends(code).unwrap() <= protocol::temp::now());
+    }
 }

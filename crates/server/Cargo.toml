@@ -10,6 +10,10 @@ axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 ureq = "3"
+# Signatures of temporary rooms (already in the workspace lock through other crates).
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
+tokio = { version = "1", features = ["io-util"] }

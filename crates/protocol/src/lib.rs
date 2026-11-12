@@ -112,6 +112,72 @@ pub fn parse_server(s: &str) -> Result<ServerMsg, String> {
     serde_json::from_str(s).map_err(|e| e.to_string())
 }
 
+/// Temporary rooms. Their code is a token that carries the room's end time and a signature
+/// only the server (and the owner's link maker) can make, so the server needs no storage:
+/// it survives a restart. 20 symbols of Crockford base32 (100 bits): a 20-bit nonce, the
+/// end as 35-bit unix seconds and a 45-bit truncated HMAC-SHA256. Ordinary codes have 12.
+pub mod temp {
+    pub const ABC: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    pub const LEN: usize = 20;
+    pub const NONCE_BITS: u32 = 20;
+    pub const END_BITS: u32 = 35;
+    pub const MAC_BITS: u32 = 45;
+
+    /// Error texts the server sends, which the app recognises (`ServerMsg::Error`).
+    pub const ENDED: &str = "temporary room ended";
+    pub const INVALID: &str = "invalid temporary room link";
+    pub const OFF: &str = "temporary rooms are off on this server";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Parts {
+        pub nonce: u32,
+        /// Unix seconds.
+        pub ends: u64,
+        pub mac: u64,
+    }
+
+    /// Shaped like a temporary room's code (the signature is not checked).
+    pub fn looks_temp(room: &str) -> bool {
+        room.len() == LEN && room.bytes().all(|c| ABC.contains(&c))
+    }
+
+    pub fn decode(room: &str) -> Option<Parts> {
+        if !looks_temp(room) {
+            return None;
+        }
+        let v = room.bytes().fold(0u128, |v, c| (v << 5) | ABC.iter().position(|x| *x == c).unwrap() as u128);
+        let mask = |bits: u32| (1u128 << bits) - 1;
+        Some(Parts {
+            nonce: ((v >> (END_BITS + MAC_BITS)) & mask(NONCE_BITS)) as u32,
+            ends: ((v >> MAC_BITS) & mask(END_BITS)) as u64,
+            mac: (v & mask(MAC_BITS)) as u64,
+        })
+    }
+
+    pub fn encode(p: Parts) -> String {
+        let mask = |bits: u32| (1u128 << bits) - 1;
+        let v = ((p.nonce as u128 & mask(NONCE_BITS)) << (END_BITS + MAC_BITS)) | ((p.ends as u128 & mask(END_BITS)) << MAC_BITS) | (p.mac as u128 & mask(MAC_BITS));
+        (0..LEN).rev().map(|i| ABC[((v >> (5 * i)) & 31) as usize] as char).collect()
+    }
+
+    /// What the signature covers.
+    pub fn signed_bytes(nonce: u32, ends: u64) -> Vec<u8> {
+        let mut b = b"backseat-temp-v1:".to_vec();
+        b.extend_from_slice(&nonce.to_be_bytes());
+        b.extend_from_slice(&ends.to_be_bytes());
+        b
+    }
+
+    /// When a temporary room ends (unix seconds), or None for any other room.
+    pub fn ends(room: &str) -> Option<u64> {
+        decode(room).map(|p| p.ends)
+    }
+
+    pub fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +203,17 @@ mod tests {
             ClientMsg::Join { room: "r".into(), name: "n".into(), title: None, resume: None }
         );
         assert!(matches!(parse_server(r#"{"type":"welcome","id":1,"room":"r","peers":[]}"#).unwrap(), ServerMsg::Welcome { title: None, .. }));
+    }
+
+    #[test]
+    fn temp_code_round_trip() {
+        let p = temp::Parts { nonce: 0xABCDE, ends: 1_800_000_000, mac: (1 << 45) - 3 };
+        let c = temp::encode(p);
+        assert_eq!(c.len(), 20);
+        assert!(temp::looks_temp(&c));
+        assert_eq!(temp::decode(&c), Some(p));
+        assert_eq!(temp::ends(&c), Some(1_800_000_000));
+        // An ordinary 12-symbol code is not one.
+        assert_eq!(temp::ends("8TJB5QCWEATF"), None);
     }
 }

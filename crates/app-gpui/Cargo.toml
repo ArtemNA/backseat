@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 backseat-core = { path = "../backseat-core" }
+protocol = { path = "../protocol" }
 media.workspace = true
 gpui-kit = "=0.9.1"
 raw-window-handle = "0.6"
