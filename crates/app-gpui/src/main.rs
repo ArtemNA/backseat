@@ -687,12 +687,21 @@ impl Shell {
                     let (id, name, me) = (p.id, p.name.clone(), p.me);
                     let muted = if p.me { v.mic_muted || v.deafened } else { v.muted.contains(&p.id) };
                     let deaf = if p.me { v.deafened } else { v.deaf.contains(&p.id) };
+                    let left_name = name.clone();
                     row()
+                        .id(SharedString::from(format!("voice-member-{id}")))
                         .py_1()
-                        // Right click: this member's volume (not for ourselves).
+                        // A click, left or right: this member's volume (not for ourselves). The
+                        // hand cursor and the highlight show it can be clicked.
+                        .when(!me, |d| d.cursor_pointer().rounded_md().hover(|s| s.bg(rgb(0x35373c))))
                         .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                             if !me {
                                 this.open_voice_menu(id, name.clone(), e.position, window, cx);
+                            }
+                        }))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                            if !me {
+                                this.open_voice_menu(id, left_name.clone(), e.position, window, cx);
                             }
                         }))
                         .child(voice_avatar(&p.name, v.speaking.contains(&p.id)))
