@@ -108,6 +108,10 @@ struct Shell {
     volumes_for: Vec<u64>,
     /// A newer release found by the update check.
     update: Option<core::update::Release>,
+    /// The version being downloaded and installed now (the bar at the top says so).
+    pub(crate) installing: Option<String>,
+    /// The "version X is available" bar was closed (this run).
+    update_hidden: bool,
     /// Temporary rooms that ended while this app ran: never put back on the rail.
     ended: Vec<String>,
 }
@@ -142,8 +146,15 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, voice_menu: None, volumes_for: vec![], ended: vec![] };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, installing: None, update_hidden: false, voice_menu: None, volumes_for: vec![], ended: vec![] };
         voice_ui::apply_settings(&shell.core);
+        // Tests only: STREAMER_APP_TEST_UPDATE_BAR=installing|available shows that bar with a
+        // made-up version (no download).
+        match std::env::var("STREAMER_APP_TEST_UPDATE_BAR").as_deref() {
+            Ok("installing") => shell.installing = Some("9.9.9".into()),
+            Ok("available") => shell.update = Some(core::update::Release::for_test("9.9.9")),
+            _ => {}
+        }
         // Started by an invite link: that room. The first snapshot took the link, so the
         // refresh never saw it and a link that started the app opened nothing.
         // STREAMER_DEBUG_IGNORE_START_LINK: the old way, the spoiled variant.
@@ -498,7 +509,13 @@ impl Shell {
                     cx.notify();
                 });
                 if newer && install {
-                    let Ok(core) = this.update(cx, |s, _| s.core.clone()) else { return };
+                    let Ok(core) = this.update(cx, |s, cx| {
+                        s.installing = s.update.as_ref().map(|u| u.latest.clone());
+                        cx.notify();
+                        s.core.clone()
+                    }) else {
+                        return;
+                    };
                     let quit = ex.spawn(async move { core::install_update(&core) }).await;
                     match quit {
                         Ok(true) => {
@@ -508,6 +525,10 @@ impl Shell {
                         Ok(false) => {}
                         Err(e) => eprintln!("update: {e}"),
                     }
+                    let _ = this.update(cx, |s, cx| {
+                        s.installing = None;
+                        cx.notify();
+                    });
                 }
                 first = false;
                 ex.timer(Duration::from_secs(6 * 3600)).await;
@@ -611,26 +632,6 @@ impl Shell {
                 .child(gpui_kit::component::Icon::default().path("icons/plus.svg").size_6())
                 .on_click(cx.listener(|this, _, _, cx| this.open_join(cx))),
         )
-        .when_some(self.update.clone(), |d, u| {
-            d.child(
-                div()
-                    .id("update")
-                    .size_12()
-                .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(24.))
-                    .bg(rgb(color::MAIN))
-                    .text_color(rgb(color::GREEN))
-                    .text_size(px(22.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(color::GREEN)).text_color(rgb(color::BRIGHT)).rounded(px(16.)))
-                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tf("set.available", &[("v", &u.latest)])).build(window, cx))
-                    .child("↓")
-                    .on_click(cx.listener(|this, _, w, cx| this.open_settings(dialogs::SetTab::Updates, w, cx))),
-            )
-        })
     }
 
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -851,9 +852,77 @@ impl Shell {
         cx.notify();
     }
 
+    /// Across the top of the window: an update being downloaded (with a moving bar, as the
+    /// download has no progress to show), or a newer version to install.
+    fn update_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui_kit::component::button::Button;
+        let bar = || div().flex_none().flex().items_center().gap_3().px_4().h(px(36.)).text_color(rgb(color::BRIGHT));
+        if let Some(v) = &self.installing {
+            let track = div().absolute().left_0().right_0().bottom_0().h(px(3.)).bg(rgb(0x2b4f9e)).overflow_hidden().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .w(relative(0.3))
+                    .bg(rgb(0xffffff))
+                    .with_animation("update-progress", Animation::new(Duration::from_millis(1400)).repeat(), |d, t| d.left(relative(t * 1.3 - 0.3))),
+            );
+            return Some(bar().relative().bg(rgb(0x3b6fd8)).child(tf("update.installing", &[("v", v)])).child(track).into_any_element());
+        }
+        let u = self.update.clone().filter(|_| !self.update_hidden)?;
+        Some(
+            bar()
+                .bg(rgb(0x2f6b3f))
+                .child(div().flex_1().min_w_0().truncate().child(tf("set.available", &[("v", &u.latest)])))
+                .child(Button::new("update-install").cursor_pointer().small().label(t("set.install")).on_click(cx.listener(|s, _, _, cx| s.install_update_now(cx))))
+                .child(
+                    div()
+                        .id("update-hide")
+                        .cursor_pointer()
+                        .px_1()
+                        .text_color(rgb(0xd7f5df))
+                        .hover(|d| d.text_color(rgb(0xffffff)))
+                        .child("✕")
+                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new(t("update.later")).build(window, cx))
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.update_hidden = true;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// "Update now" from the bar at the top.
+    fn install_update_now(&mut self, cx: &mut Context<Self>) {
+        self.installing = self.update.as_ref().map(|u| u.latest.clone());
+        let core = self.core.clone();
+        let task = cx.background_executor().spawn(async move { core::install_update(&core) });
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            let r = task.await;
+            let _ = this.update(cx, |s, cx| {
+                match r {
+                    Ok(true) => cx.quit(),
+                    Ok(false) => s.installing = None,
+                    Err(e) => {
+                        s.installing = None;
+                        s.error = Some(tf("set.failed", &[("e", &e)]).to_string());
+                        s.error_since = Some(std::time::Instant::now());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn main(&self) -> impl IntoElement {
         let status = if self.joining {
             t("direct.connecting").to_string()
+        } else if self.snap.reconnecting {
+            // The server lost our place; the room is being joined again.
+            t("notice.reconnecting").to_string()
         } else if let Some(e) = &self.error {
             // A temporary room's end says it all by itself.
             if ["notice.temp_ended", "notice.temp_invalid", "notice.temp_off"].iter().any(|k| t(k).as_ref() == e.as_str()) {
@@ -932,14 +1001,22 @@ impl Render for Shell {
         div()
             .relative()
             .flex()
+            .flex_col()
             .size_full()
             .font_family("Segoe UI")
             .text_size(px(14.))
             .text_color(rgb(color::TEXT))
             .bg(rgb(color::MAIN))
-            .child(self.rail(cx))
-            .child(self.side(cx))
-            .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() })
+            .children(self.update_bar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.rail(cx))
+                    .child(self.side(cx))
+                    .child(if self.snap.connected && !self.joining { self.render_room(cx) } else { self.main().into_any_element() }),
+            )
             .children(menu)
             .children(voice_menu)
             .children(dialog)

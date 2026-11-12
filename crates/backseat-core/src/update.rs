@@ -10,7 +10,7 @@ use std::io::Read;
 const LATEST: &str = "https://api.github.com/repos/ArtemNA/backseat/releases/latest";
 const AGENT: &str = concat!("Backseat/", env!("CARGO_PKG_VERSION"));
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Release {
     pub current: String,
     pub latest: String,
@@ -21,6 +21,13 @@ pub struct Release {
     installer: Option<(String, String)>,
     #[serde(skip)]
     sums: Option<String>,
+}
+
+impl Release {
+    /// Tests only: a newer release with nothing to download.
+    pub fn for_test(latest: &str) -> Self {
+        Self { latest: latest.into(), newer: true, ..Default::default() }
+    }
 }
 
 /// "v0.1.10" -> [0, 1, 10]

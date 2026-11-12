@@ -758,6 +758,7 @@ impl Shell {
     fn install_update(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = self.dialogs.settings.as_mut() {
             s.status = t("set.installing").to_string();
+            self.installing = s.update.as_ref().map(|u| u.latest.clone());
         }
         let core = self.core.clone();
         let task = cx.background_executor().spawn(async move { core::install_update(&core) });

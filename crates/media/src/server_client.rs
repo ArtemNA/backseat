@@ -74,9 +74,36 @@ enum End {
 }
 
 /// Moves messages both ways until the connection ends.
-fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<ServerMsg>, break_at: &mut Option<Instant>, keep_place: &std::sync::atomic::AtomicBool) -> End {
+/// Nothing from the server (it pings every 2 s) this long: the link is dead even if the
+/// socket says nothing. A proxy once passed nothing for ~25 s while the socket stayed open;
+/// the server freed our place after its 20 s and we learned of it only then.
+const SILENT_FOR: Duration = Duration::from_secs(6);
+
+fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<ServerMsg>, break_at: &mut Option<Instant>, keep_place: &std::sync::atomic::AtomicBool, stall: &mut Option<(Instant, Instant)>) -> End {
     let mut alive = Instant::now() - Duration::from_secs(1);
+    let mut heard = Instant::now();
+    let watchdog = std::env::var_os("STREAMER_DEBUG_NO_WATCHDOG").is_none();
     loop {
+        if watchdog && heard.elapsed() >= SILENT_FOR {
+            eprintln!("signaling: nothing from the server for {} s, reconnecting", SILENT_FOR.as_secs());
+            *stall = None;
+            if let Some(s) = tcp(ws.get_mut()) {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            return End::Broken;
+        }
+        // Test only: STREAMER_DEBUG_SIGNALING_STALL_AT=<s> (STALL_FOR, default 25 s): the link
+        // passes nothing either way while the socket stays open, as that proxy did.
+        if let Some((from, to)) = *stall {
+            let now = Instant::now();
+            if now >= to {
+                *stall = None;
+                eprintln!("signaling: test: the link passes again");
+            } else if now >= from {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        }
         // Closed with no Leave: the server keeps our place for its grace (20 s), so coming
         // back soon takes it again (`close_keeping_place`).
         if keep_place.load(std::sync::atomic::Ordering::SeqCst) {
@@ -125,7 +152,7 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
             }
         }
         match ws.read() {
-            Ok(Message::Text(t)) => match protocol::parse_server(&t) {
+            Ok(Message::Text(t)) => match { heard = Instant::now(); protocol::parse_server(&t) } {
                 // A temporary room ended: the server drops us and keeps no place, so there
                 // is nothing to reconnect to.
                 Ok(ServerMsg::Error { message }) if message == protocol::temp::ENDED => {
@@ -146,7 +173,8 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
                 eprintln!("signaling: server closed the connection: {f:?}");
                 return End::Broken;
             }
-            Ok(_) => {}
+            // Pings from the server: it is there.
+            Ok(_) => heard = Instant::now(),
             // On Windows a read that times out can also report ERROR_IO_PENDING (997);
             // treating it as a lost connection dropped a host after ~5 min of churn.
             Err(tungstenite::Error::Io(e))
@@ -214,10 +242,15 @@ impl ServerClient {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|s| Instant::now() + Duration::from_secs(s));
+        let mut stall = std::env::var("STREAMER_DEBUG_SIGNALING_STALL_AT").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| {
+            let from = Instant::now() + Duration::from_secs(s);
+            let secs = std::env::var("STREAMER_DEBUG_SIGNALING_STALL_FOR").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+            (from, from + Duration::from_secs(secs))
+        });
         let thread = std::thread::Builder::new()
             .name("signaling".into())
             .spawn(move || loop {
-                match pump(&mut ws, &out_rx, &in_tx, &mut break_at, &keep) {
+                match pump(&mut ws, &out_rx, &in_tx, &mut break_at, &keep, &mut stall) {
                     End::Left | End::Gone => return,
                     End::Broken => {}
                 }

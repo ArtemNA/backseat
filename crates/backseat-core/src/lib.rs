@@ -30,6 +30,9 @@ pub struct App {
     /// video hidden, until opened again. By `resume_key`. Only one room watches or streams
     /// at a time (`quiet_background`).
     background: Mutex<Vec<(String, Arc<Session>)>>,
+    /// The server lost our place (its connection broke for longer than it keeps one): we
+    /// join the same room again (`rejoin`).
+    rejoining: std::sync::atomic::AtomicBool,
     /// The direct connection (beta) and our name in it, while there is one.
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
     /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
@@ -497,7 +500,7 @@ pub fn snapshot(app: &App) -> Snapshot {
     let notice = app.notice.lock().unwrap().take();
     let link = app.link.lock().unwrap().take();
     let Some(s) = s else {
-        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app), reconnecting: false, background: background_rooms(app) };
+        return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app), reconnecting: app.rejoining.load(std::sync::atomic::Ordering::SeqCst), background: background_rooms(app) };
     };
     let watching: Vec<u64> = s.watching().iter().map(|w| w.streamer).collect();
     let peers = s
@@ -823,7 +826,10 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                     break;
                 }
                 Event::Lost => {
-                    if !ended {
+                    // The place is gone, not the room: join it again as a new member, unless
+                    // the room ended. STREAMER_DEBUG_NO_REJOIN: give up, as before.
+                    let again = !ended && std::env::var_os("STREAMER_DEBUG_NO_REJOIN").is_none();
+                    if !ended && !again {
                         a.notify("lost".into());
                     }
                     // Stop the stream and the watches first: dropping them while their
@@ -838,6 +844,9 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                     }
                     if let Some(k) = a.joined.lock().unwrap().take() {
                         save_place(&k, None);
+                        if again {
+                            rejoin(&a, k);
+                        }
                     }
                     break;
                 }
@@ -846,6 +855,40 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         }
     });
     Ok(())
+}
+
+/// Joins the room of `key` (`resume_key`) again after the server lost our place: every 2 s
+/// for up to a minute, unless another room is opened meanwhile. Watches, our stream and voice
+/// do not come back (everyone's ids changed with the place). Gives up with "lost".
+fn rejoin(app: &Arc<App>, key: String) {
+    let mut parts = key.splitn(3, '|');
+    let (Some(server), Some(room), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
+    let (server, room, name) = (server.to_string(), room.to_string(), name.to_string());
+    let a = app.clone();
+    a.rejoining.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let mut ok = false;
+        for attempt in 1..=30 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if a.session.lock().unwrap().is_some() || a.joined.lock().unwrap().is_some() {
+                eprintln!("rooms: another room was opened; not rejoining {room}");
+                a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            match do_connect(&a, &server, &room, &name, None) {
+                Ok(()) => {
+                    eprintln!("rooms: rejoined {room} as a new member (attempt {attempt})");
+                    ok = true;
+                    break;
+                }
+                Err(e) => eprintln!("rooms: rejoining {room}: {e}"),
+            }
+        }
+        a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
+        if !ok {
+            a.notify("lost".into());
+        }
+    });
 }
 
 /// Room codes of the rooms kept in the background.

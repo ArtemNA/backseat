@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.9
+
+- A connection to the server that silently stops passing data (it happened through the hosting's proxy for ~25 s) is noticed within 6 s and made again, so your place in the room is kept. Before, the app learned of it only after the server had given the place away, and showed "Lost the connection to the server".
+- If the server did give your place away, Backseat joins the room again by itself ("Reconnecting…") instead of stopping with an error. A stream you watched, your own stream and voice do not come back by themselves in that case.
+- Updates show across the top of the window: "Downloading Backseat X…" with a moving bar while it downloads (it restarts by itself), or "Version X is available" with *Update now*. The arrow in the rooms list is gone.
+
 ## 0.2.8
 
 - **Voice chat.** Every room has a voice chat: press *Join voice* in the list on the left. Echo cancelling and noise suppression let you talk over speakers, no headset needed. The voice goes directly between you, as the video does.
