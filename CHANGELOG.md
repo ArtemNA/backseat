@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.7
+
+- **Rooms keep going in the background.** Switching to another room while you watch or stream keeps the room you left connected: your stream goes on for your viewers, and the stream you watch is there again as it was when you come back, with no new join. Such a room has a green dot on the left. A video popped out into its own window stays open.
+- A room where you did nothing closes when you switch away, but the server keeps your place for 20 seconds: coming back within that time takes it again.
+- Watching and streaming happen in one room at a time: starting either in another room stops it in the room left in the background.
+
 ## 0.2.6
 
 - Switching rooms no longer drops you out of the room you switch to: the room you left was taken for a lost connection, which closed the new room and showed "Lost the connection to the server".
