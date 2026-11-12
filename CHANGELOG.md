@@ -2,9 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
-## Unreleased
+## 0.2.3
 
-- Names and room names are limited to 32 characters, not 32 bytes: a Cyrillic name over 16 letters was refused (needs the updated signaling server).
+- Fullscreen opens on the monitor the app is on: from a monitor other than the primary one it went fullscreen on the primary monitor.
+- The sound and fullscreen buttons inside the video window show the hand cursor.
 
 ## 0.2.2
 
