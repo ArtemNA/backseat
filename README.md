@@ -23,7 +23,8 @@
 
 Backseat is a Windows app for watching each other play. It looks and feels like a small
 Discord server: rooms on the left, the people in the open room, and their streams in the
-middle. Anyone in a room can go live, and anyone can watch, several streams at once.
+middle. Anyone in a room can go live, anyone can watch, several streams at once, and
+everyone can talk in the room's voice chat.
 
 The video goes **directly** from the streamer's computer to each viewer. Nothing in
 between stores or re-encodes it, which keeps the delay low (tens of milliseconds on a
@@ -33,6 +34,13 @@ good connection) and the picture as sharp as your upload allows.
 
 - **Rooms by invite.** Create a room, send the invite link or code. Only people with the
   invite get in. Your rooms stay in the list on the left.
+- **Voice chat** in every room: echo cancelling and noise suppression (speakers work, no
+  headset needed), voice activity or push-to-talk, a volume for each person, your
+  microphone and speakers in the settings. The voice goes directly between you, as the
+  video does.
+- **Rooms keep going in the background.** Switch to another room while you watch, stream
+  or talk: your stream, the video you watch and the voice go on, and are there as they
+  were when you come back. Such a room has a green dot on the left.
 - **Sharp and smooth.** 720p, 1080p or 1440p at 30 or 60 fps, 2 to 50 Mbit/s, encoded on
   your graphics card (NVIDIA, AMD or Intel) in AV1, H.265 or H.264.
 - **Each viewer chooses.** Viewers can ask for less than you stream (for a slow
@@ -41,7 +49,8 @@ good connection) and the picture as sharp as your upload allows.
 - **Change the stream while live:** another window, resolution, frame rate or bitrate, and
   nobody has to reconnect.
 - **Comfortable to watch:** video inside the app or in its own window, fullscreen,
-  volume and mute right on the video, stats with F3.
+  volume and mute right on the video, a quality badge (F3) and detailed stats
+  (Shift+F3).
 - **Light:** a native window drawn on the graphics card, one process and no browser engine
   inside; it needs nothing else installed.
 - **Stays out of the way:** closing the window keeps Backseat in the tray. It updates
@@ -118,8 +127,12 @@ Good to know before you use it:
 - **Default settings:** *Settings → Streaming* sets what the go-live dialog picks each
   time; *Settings → Watching* sets the most you want to receive (handy on slow internet:
   a 50 Mbit/s stream then comes to you at your limit right away).
-- **Keys on the video:** double click or F11 for fullscreen, Esc to leave it, F3 for stats,
-  the mouse wheel for volume.
+- **Keys:** double click or F11 for fullscreen, Esc to leave it, F3 for the quality badge,
+  Shift+F3 for the stats, the mouse wheel on the video for volume. They work anywhere in
+  the window.
+- **Voice:** *Settings → Voice* has the microphone, the speakers, voice activity or a
+  push-to-talk key, and the threshold above which you are heard (with a live meter).
+  Click a person in voice to set their volume.
 - **Upload limit:** in the go-live dialog, enter your upload speed; Backseat warns when
   one more viewer would not fit.
 - **Logs** for bug reports: *Settings → General → Open the log folder*
@@ -142,6 +155,20 @@ Any service that runs a Rust web service from a repository will do:
    - *Health check path*: `/live`
 3. The service sets `PORT`; the server then listens on `0.0.0.0:$PORT`.
 4. In Backseat, the server address is `wss://YOUR-SERVICE-ADDRESS/ws`.
+
+### Temporary rooms
+
+A server can also hand out rooms that end by themselves: when the time is up nobody new
+gets in and everyone inside is taken out. Set the environment variable
+`STREAMER_TEMP_SECRET` on the server to a secret of at least 16 characters, then make a link
+with the same secret:
+
+```sh
+cargo run --release -p server --bin maketemp -- --hours 24 --title "Friday games" --base https://YOUR-SERVICE-ADDRESS
+```
+
+It prints a link like `https://YOUR-SERVICE-ADDRESS/t/XXXX-XXXX-XXXX-XXXX-XXXX` that opens
+like any invite. The server keeps no list: the end time and a signature are in the code.
 
 ### On your own computer or server
 

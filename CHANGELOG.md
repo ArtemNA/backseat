@@ -2,9 +2,14 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
-## Unreleased
+## 0.2.8
 
+- **Voice chat.** Every room has a voice chat: press *Join voice* in the list on the left. Echo cancelling and noise suppression let you talk over speakers, no headset needed. The voice goes directly between you, as the video does.
+- In voice: your microphone and sound off and on (others see it), who is speaking, a volume for each person (click or right click them), and sounds when someone joins, goes live or starts watching (can be turned off).
+- *Settings → Voice*: the microphone and the speakers, voice activity or a push-to-talk key, and the threshold above which you are heard, with a live meter. *Keep streams' sound out of my microphone* is there too, for speakers without headphones (off by default: stream sound then comes about 20 ms later, and it applies to streams opened after turning it on).
+- Voice also keeps a room going in the background, like watching and streaming: switch rooms and the call goes on; the bar at the bottom left says which room it is in. Voice, watching and streaming happen in one room at a time.
 - **Temporary rooms.** A room can come from a link that carries its own end time (`…/t/XXXX-XXXX-XXXX-XXXX-XXXX`, a 20-symbol code). Opening or pasting it joins like any invite, and the room takes its name from the link. When the time is up, nobody new gets in and everyone still inside is taken out with "This temporary room has ended."; the room then leaves the list on the left (also when the app was closed at that moment). Such links are made by the server's owner; the server keeps no list of them.
+- People in voice show the hand cursor and light up under the mouse.
 
 ## 0.2.7
 
