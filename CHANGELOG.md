@@ -2,6 +2,13 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.6
+
+- Switching rooms no longer drops you out of the room you switch to: the room you left was taken for a lost connection, which closed the new room and showed "Lost the connection to the server".
+- While the connection to the server is being restored, a line says so ("Reconnecting…"); your place in the room is kept meanwhile.
+- The quality lists under the video show above it: opening upwards they were hidden behind the video. While a list is open the video steps aside.
+- No Apply button: a picked quality is asked for by itself 1.5 s after the last change (changing both the size and the bitrate restarts the streamer's encoder once). Picking "As streamed" again now goes back to the streamer's own quality.
+
 ## 0.2.5
 
 - **Stream badge.** A small badge in the top right corner of the video shows the quality, bitrate and codec (`1080p60 · 12.4 Mbit/s · AV1`). Its dot is green while frames come as they should and amber when fewer come (the frame rate is then shown as a number) or packets are lost. **F3** shows or hides it; **Shift+F3** opens the detailed stats as F3 did before.
