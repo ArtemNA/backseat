@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## Unreleased
+
+- **Temporary rooms.** A room can come from a link that carries its own end time (`…/t/XXXX-XXXX-XXXX-XXXX-XXXX`, a 20-symbol code). Opening or pasting it joins like any invite, and the room takes its name from the link. When the time is up, nobody new gets in and everyone still inside is taken out with "This temporary room has ended."; the room then leaves the list on the left (also when the app was closed at that moment). Such links are made by the server's owner; the server keeps no list of them.
+
 ## 0.2.7
 
 - **Rooms keep going in the background.** Switching to another room while you watch or stream keeps the room you left connected: your stream goes on for your viewers, and the stream you watch is there again as it was when you come back, with no new join. Such a room has a green dot on the left. A video popped out into its own window stays open.

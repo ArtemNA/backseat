@@ -790,13 +790,20 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     app.sampler.attach(s.clone());
     let a = app.clone();
     let mine = Arc::downgrade(&s);
+    let room = room.to_string();
     std::thread::spawn(move || {
         let mut heard = Heard::default();
+        // A temporary room ended: that is the news, not the lost connection after it.
+        let mut ended = false;
         while let Ok(e) = events.recv() {
             event_cue(&a, &e, &mut heard);
             match e {
                 // Leaving the room on purpose ends its watches; that is no news.
                 Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
+                Event::Error(m) if m == protocol::temp::ENDED => {
+                    ended = true;
+                    a.notify(format!("temp_ended:{room}"));
+                }
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 // A room left on purpose (another one opened) ends too. That is no news, and
                 // the open session is the new room's: taking it here left the new room and
@@ -816,9 +823,11 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                     break;
                 }
                 Event::Lost => {
-                    a.notify("lost".into());
+                    if !ended {
+                        a.notify("lost".into());
+                    }
                     // Stop the stream and the watches first: dropping them while their
-                    // pipelines played crashed the app (0xC0000005) when Render's TLS
+                    // pipelines played crashed the app (0xC0000005) when the hosting's TLS
                     // connection broke during a stream. STREAMER_DEBUG_DROP_ON_LOST keeps
                     // the old drop, the spoiled variant for the gate.
                     let s = a.session.lock().unwrap().take();

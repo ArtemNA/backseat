@@ -131,20 +131,17 @@ The server is small (`crates/server` in this repository) and needs no special ha
 it passes a few short messages per connection and no video. The same server works for
 any number of rooms.
 
-### On Render (free, no own computer needed)
+### On a hosting service
 
-1. Sign in at [render.com](https://render.com) and choose *New → Web Service*.
-2. Connect this repository (or your fork of it).
-3. Settings:
-   - *Runtime*: Rust
+Any service that runs a Rust web service from a repository will do:
+
+1. Connect this repository (or your fork of it).
+2. Settings:
    - *Build command*: `cargo build --release -p server`
    - *Start command*: `./target/release/server`
    - *Health check path*: `/live`
-4. After the first deploy, add the environment variable `STREAMER_KEEP_ALIVE_URL` with
-   your service address plus `/live` (for example
-   `https://my-backseat.onrender.com/live`): free services sleep when idle, and this keeps
-   it awake.
-5. In Backseat, the server address is `wss://my-backseat.onrender.com/ws`.
+3. The service sets `PORT`; the server then listens on `0.0.0.0:$PORT`.
+4. In Backseat, the server address is `wss://YOUR-SERVICE-ADDRESS/ws`.
 
 ### On your own computer or server
 

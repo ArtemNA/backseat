@@ -4,7 +4,7 @@
 //! A broken connection is not the end: the thread reconnects for a while and takes our place
 //! back with the token from Welcome (`Join::resume`), so our id stays and nobody in the room
 //! is told we left. Direct streams never pass through the server and go on meanwhile; a
-//! friend's stream ended (and the app crashed) when Render's TLS connection broke once.
+//! friend's stream ended (and the app crashed) when the hosting's TLS connection broke once.
 
 use crate::signal::Outbox;
 use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg};
@@ -126,6 +126,15 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
         }
         match ws.read() {
             Ok(Message::Text(t)) => match protocol::parse_server(&t) {
+                // A temporary room ended: the server drops us and keeps no place, so there
+                // is nothing to reconnect to.
+                Ok(ServerMsg::Error { message }) if message == protocol::temp::ENDED => {
+                    eprintln!("signaling: the temporary room ended");
+                    let _ = in_tx.send(ServerMsg::Error { message });
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return End::Left;
+                }
                 Ok(m) => {
                     if in_tx.send(m).is_err() {
                         return End::Gone;

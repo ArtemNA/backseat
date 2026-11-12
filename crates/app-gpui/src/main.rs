@@ -108,6 +108,8 @@ struct Shell {
     volumes_for: Vec<u64>,
     /// A newer release found by the update check.
     update: Option<core::update::Release>,
+    /// Temporary rooms that ended while this app ran: never put back on the rail.
+    ended: Vec<String>,
 }
 
 /// One value of the state file.
@@ -140,10 +142,16 @@ impl Shell {
         let last = state.get("lastRoom").and_then(Room::from_json);
         let snap = core::snapshot(&core);
         let join = join::Join::new(window, cx);
-        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, voice_menu: None, volumes_for: vec![] };
+        let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, voice_menu: None, volumes_for: vec![], ended: vec![] };
         voice_ui::apply_settings(&shell.core);
+        // Started by an invite link: that room. The first snapshot took the link, so the
+        // refresh never saw it and a link that started the app opened nothing.
+        // STREAMER_DEBUG_IGNORE_START_LINK: the old way, the spoiled variant.
+        let start_link = shell.snap.link.take().filter(|_| std::env::var_os("STREAMER_DEBUG_IGNORE_START_LINK").is_none());
+        if let Some(link) = start_link {
+            shell.handle_link(&link, cx);
         // With a saved room, start in the last one opened. Not when a test joins by itself.
-        if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none() || (*k == "STREAMER_APP_TEST_FORM" && std::env::var(k).is_ok_and(|v| v.starts_with("show")))) {
+        } else if ["STREAMER_APP_AUTOJOIN", "STREAMER_APP_TEST_DIRECT", "STREAMER_APP_TEST_FORM"].iter().all(|k| std::env::var_os(k).is_none() || (*k == "STREAMER_APP_TEST_FORM" && std::env::var(k).is_ok_and(|v| v.starts_with("show")))) {
             let start = last.as_ref().and_then(|l| shell.rooms.iter().find(|r| r.same(l))).or(shell.rooms.last()).cloned();
             if let Some(r) = start {
                 shell.open_room(r, cx);
@@ -215,6 +223,21 @@ impl Shell {
             self.error = Some(match kind {
                 "direct_ended" => t("notice.direct_ended").to_string(),
                 "lost" => t("notice.lost").to_string(),
+                "temp_ended" => {
+                    // It is gone for good: off the rail too.
+                    self.ended.push(rest.to_string());
+                    if let Some(r) = self.rooms.iter().find(|r| r.room == rest).cloned() {
+                        self.forget_room(&r);
+                    }
+                    if self.current.as_ref().is_some_and(|c| c.room == rest) {
+                        self.current = None;
+                    }
+                    // With no room left the join form covers the window: say it there.
+                    if self.rooms.is_empty() {
+                        self.join.error = Some(t("notice.temp_ended").to_string());
+                    }
+                    t("notice.temp_ended").to_string()
+                }
                 "watch_ended" => tf("notice.watch_ended", &[("reason", &rest)]).to_string(),
                 _ => tf("notice.error", &[("msg", &rest)]).to_string(),
             });
@@ -227,6 +250,7 @@ impl Shell {
         if let Some(link) = self.snap.link.clone() {
             self.handle_link(&link, cx);
         }
+        self.drop_ended_rooms();
         self.expire_codes();
         // A direct connection that ended: its form starts over. One that connected: the
         // form closes.
@@ -245,7 +269,7 @@ impl Shell {
             return;
         }
         // Joined some other way (tests): remember what we are in.
-        if self.snap.connected && !self.joining && !self.join.busy && self.current.as_ref().is_none_or(|c| c.room != self.snap.room) {
+        if self.snap.connected && !self.joining && !self.join.busy && self.current.as_ref().is_none_or(|c| c.room != self.snap.room) && !self.ended.contains(&self.snap.room) {
             let me = self.snap.peers.iter().find(|p| p.me).map(|p| p.name.clone()).unwrap_or_default();
             let server = std::env::var("STREAMER_APP_AUTOJOIN").ok().and_then(|j| j.split(';').next().map(String::from)).unwrap_or_default();
             let r = Room { server, room: self.snap.room.clone(), name: me, title: self.snap.title.clone() };
@@ -267,13 +291,14 @@ impl Shell {
         self.error = None;
         self.remember(&r);
         let core = self.core.clone();
+        let r_room = r.room.clone();
         let task = cx.background_executor().spawn(async move { core::connect(&core, &r.server, &r.room, &r.name, r.title.as_deref()) });
         cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 s.joining = false;
                 if let Err(e) = result {
-                    s.error = Some(e);
+                    s.error = Some(s.join_error(&r_room, &e));
                 }
                 s.tick(cx);
             });
@@ -285,6 +310,7 @@ impl Shell {
     /// An invite link from a click (backseat://join/CODE): go there, or ask for a name.
     fn handle_link(&mut self, link: &str, cx: &mut Context<Self>) {
         let Some(code) = join::parse_code(link) else { return };
+        let title = join::parse_title(link);
         if self.current.as_ref().is_some_and(|c| c.room == code) {
             return;
         }
@@ -299,7 +325,7 @@ impl Shell {
             .unwrap_or_else(|| self.join.server.read(cx).value().to_string());
         let name = self.current.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| self.join.name.read(cx).value().trim().to_string());
         if !name.is_empty() {
-            self.open_room(Room { server, room: code, name, title: None }, cx);
+            self.open_room(Room { server, room: code, name, title }, cx);
             return;
         }
         // First time: ask for a name; the code goes into the form.
@@ -385,6 +411,38 @@ impl Shell {
         self.error = Some(tf(if join::is_code(&r.room) { "room.copied" } else { "room.copied_plain" }, &[("code", &code)]).to_string());
         self.error_since = Some(std::time::Instant::now());
         cx.notify();
+    }
+
+    /// A temporary room's join error in the user's language, and an ended or forged one off
+    /// the rail; any other error as it is.
+    pub(crate) fn join_error(&mut self, room: &str, e: &str) -> String {
+        use protocol::temp;
+        let key = if e.ends_with(temp::ENDED) {
+            "notice.temp_ended"
+        } else if e.ends_with(temp::INVALID) {
+            "notice.temp_invalid"
+        } else if e.ends_with(temp::OFF) {
+            "notice.temp_off"
+        } else {
+            return e.to_string();
+        };
+        if key != "notice.temp_off" {
+            if let Some(r) = self.rooms.iter().find(|r| r.room == room).cloned() {
+                self.forget_room(&r);
+            }
+        }
+        t(key).to_string()
+    }
+
+    /// Temporary rooms past their end (by this computer's clock) leave the rail, unless
+    /// connected: the server says when those end.
+    fn drop_ended_rooms(&mut self) {
+        let connected = |r: &Room| (self.snap.connected && self.snap.room == r.room) || self.snap.background.contains(&r.room);
+        let over: Vec<Room> = self.rooms.iter().filter(|r| join::temp_over(&r.room) && !connected(r)).cloned().collect();
+        for r in over {
+            eprintln!("rooms: a temporary room is over, off the rail");
+            self.forget_room(&r);
+        }
     }
 
     /// Takes a room off the saved list (the open one stays open).
@@ -486,7 +544,7 @@ impl Shell {
         let rail: Vec<String> = self.rooms.iter().map(|r| format!("{}={}", r.initials(), r.room)).collect();
         let peers: Vec<String> = self.snap.peers.iter().map(|p| format!("{}{}{}", p.name, if p.streaming { "(live)" } else { "" }, if p.me { "(me)" } else { "" })).collect();
         let line = format!(
-            "rail [{}]; current {}; connected {}; room {}; peers {}; visible {}; join {}; error {}",
+            "rail [{}]; current {}; connected {}; room {}; peers {}; visible {}; join {}; error {}; form error {}",
             rail.join(", "),
             self.current.as_ref().map(|c| c.room.as_str()).unwrap_or("-"),
             self.snap.connected,
@@ -494,7 +552,8 @@ impl Shell {
             peers.join(","),
             window_visible(),
             self.join_shown(),
-            self.error.as_deref().unwrap_or("-")
+            self.error.as_deref().unwrap_or("-"),
+            self.join.error.as_deref().unwrap_or("-")
         );
         if line != self.reported {
             eprintln!("test: {line}");
@@ -787,7 +846,12 @@ impl Shell {
         let status = if self.joining {
             t("direct.connecting").to_string()
         } else if let Some(e) = &self.error {
-            tf("join.failed", &[("e", e)]).to_string()
+            // A temporary room's end says it all by itself.
+            if ["notice.temp_ended", "notice.temp_invalid", "notice.temp_off"].iter().any(|k| t(k).as_ref() == e.as_str()) {
+                e.clone()
+            } else {
+                tf("join.failed", &[("e", e)]).to_string()
+            }
         } else if self.rooms.is_empty() {
             t("lobby.pick").to_string()
         } else {

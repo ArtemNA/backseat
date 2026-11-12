@@ -1,11 +1,10 @@
 //! Signaling server binary. Listens on localhost by default; pass another address to expose
-//! it on a network. A host such as Render sets PORT: then it listens on 0.0.0.0:PORT.
+//! it on a network. A hosting service that sets PORT: then it listens on 0.0.0.0:PORT.
 
 use std::time::Duration;
 
-/// The server's own public address, requested every few minutes so a free host that
-/// sleeps when idle (Render) keeps it awake. The request goes out through the internet like
-/// any visitor's would. Empty: off. STREAMER_KEEP_ALIVE_URL overrides it.
+/// An address requested every few minutes (optional, for the deployment's own needs).
+/// Empty: off. STREAMER_KEEP_ALIVE_URL overrides it.
 const KEEP_ALIVE_URL: &str = "";
 const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(4 * 60);
 
@@ -33,7 +32,15 @@ async fn main() {
         .nth(1)
         .or_else(|| std::env::var("PORT").ok().map(|p| format!("0.0.0.0:{p}")))
         .unwrap_or_else(|| "127.0.0.1:7800".into());
-    let server = server::Server::new(server::Config::default());
+    let temp = match server::TempKey::from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("server: {e}; temporary rooms are off");
+            None
+        }
+    };
+    println!("server: temporary rooms {}", if temp.is_some() { "on" } else { "off (no STREAMER_TEMP_SECRET)" });
+    let server = server::Server::with_temp(server::Config::default(), temp);
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
