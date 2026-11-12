@@ -50,7 +50,7 @@ pub enum ClientMsg {
     Unsubscribe { streamer: PeerId },
     /// Opaque message to one peer in the same room: offer, answer, ice, ping, pong.
     Signal { to: PeerId, kind: String, payload: String },
-    /// Sent every second after joining. A reverse proxy (Render) answers the server's
+    /// Sent every second after joining. A reverse proxy in front of the server answers its
     /// WebSocket pings itself and keeps a dead client's connection open, which left ghosts
     /// in rooms; a client that sends this is dropped when it stops.
     Alive,

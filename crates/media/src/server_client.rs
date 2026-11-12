@@ -4,7 +4,7 @@
 //! A broken connection is not the end: the thread reconnects for a while and takes our place
 //! back with the token from Welcome (`Join::resume`), so our id stays and nobody in the room
 //! is told we left. Direct streams never pass through the server and go on meanwhile; a
-//! friend's stream ended (and the app crashed) when Render's TLS connection broke once.
+//! friend's stream ended (and the app crashed) when the hosting's TLS connection broke once.
 
 use crate::signal::Outbox;
 use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg};

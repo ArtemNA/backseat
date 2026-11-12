@@ -460,7 +460,7 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                 Event::Lost => {
                     a.notify("lost".into());
                     // Stop the stream and the watches first: dropping them while their
-                    // pipelines played crashed the app (0xC0000005) when Render's TLS
+                    // pipelines played crashed the app (0xC0000005) when the hosting's TLS
                     // connection broke during a stream. STREAMER_DEBUG_DROP_ON_LOST keeps
                     // the old drop, the spoiled variant for the gate.
                     let s = a.session.lock().unwrap().take();
