@@ -212,7 +212,7 @@ impl Viewer {
                     }
                     add_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, tail)
                 }
-                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, &audio2),
+                "audio" if cfg2.audio => add_audio(&pipeline, pad, &clock, &stats2, started, cfg2.audio_sync, cfg2.shared_audio, &audio2),
                 _ => add_fakesink(&pipeline, pad),
             };
             if let Err(e) = result {
@@ -592,6 +592,7 @@ fn add_audio(
     stats: &ViewerStats,
     started: Instant,
     audio_sync: bool,
+    shared_audio: bool,
     audio: &Audio,
 ) -> Result<(), String> {
     let depay = make("rtpopusdepay")?;
@@ -639,10 +640,10 @@ fn add_audio(
             gst::PadProbeReturn::Ok
         });
     }
-    // Windows: to the speakers through the process's shared output, so a voice chat's echo
-    // canceller hears the stream too. The appsink keeps the stream's pacing (sync).
-    // STREAMER_DEBUG_OWN_SINK keeps the viewer's own sink (the old way).
-    let shared = cfg!(windows) && !debug_level && std::env::var_os("STREAMER_DEBUG_OWN_SINK").is_none();
+    // Only when asked (`ViewerConfig::shared_audio`, Windows): to the speakers through the
+    // process's shared output, so a voice chat's echo canceller hears the stream too, at
+    // ~20 ms more delay. Otherwise the stream's own sink, exactly as before voice chat.
+    let shared = shared_audio && cfg!(windows) && !debug_level;
     // If the shared output cannot start (a missing plugin, no device), the stream keeps its
     // sound through its own sink, as before.
     let shared_tail = if shared {

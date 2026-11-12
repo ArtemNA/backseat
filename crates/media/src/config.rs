@@ -202,6 +202,10 @@ pub struct ViewerConfig {
     pub debug_never_answer: bool,
     /// Tests only: neither send nor accept ICE candidates, so no path can exist.
     pub debug_no_ice: bool,
+    /// The stream's sound to the speakers through the shared output (with the voices), so
+    /// a voice chat's echo canceller hears it too; ~20 ms later than through its own sink.
+    /// Off: its own sink, as before voice chat existed.
+    pub shared_audio: bool,
 }
 
 impl Default for ViewerConfig {
@@ -217,6 +221,7 @@ impl Default for ViewerConfig {
             ice: IceConfig::default(),
             debug_never_answer: false,
             debug_no_ice: false,
+            shared_audio: false,
         }
     }
 }

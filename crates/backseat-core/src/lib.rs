@@ -162,6 +162,9 @@ pub struct VoiceSettings {
     pub ptt_sounds: bool,
     /// Voice activity threshold, dBFS; None sends all the time (noise suppression only).
     pub threshold: Option<f64>,
+    /// Streams' sound through the shared output, for the echo canceller (~20 ms later).
+    /// Takes effect for streams watched from then on.
+    pub stream_echo: bool,
 }
 
 /// Sound above this (dBFS over 100 ms) counts as speaking.
@@ -951,11 +954,17 @@ pub fn end_live(app: &App) {
     }
 }
 
+/// A watch's settings: the stream's sound through the shared output only if asked
+/// (`VoiceSettings::stream_echo`).
+fn viewer_config(app: &App) -> ViewerConfig {
+    ViewerConfig { shared_audio: app.voice_settings.lock().unwrap().stream_echo, ..Default::default() }
+}
+
 /// Watches a streamer in the open room. Blocks: run it off the UI thread (creating the
 /// video window inside the main window waits for that thread).
 pub fn watch(app: &App, streamer: u64, quality: Option<String>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
-    s.watch(streamer, ViewerConfig::default(), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
+    s.watch(streamer, viewer_config(app), quality).inspect_err(|e| eprintln!("watch failed: {e}"))?;
     Ok(())
 }
 
@@ -1033,7 +1042,7 @@ pub fn automate(app: &Arc<App>) {
                 if let Some(s) = s {
                     todo.retain(|(name, quality)| {
                         let Some(p) = s.peers().into_iter().find(|p| p.streaming && &p.name == name && p.id != s.id) else { return true };
-                        match s.watch(p.id, ViewerConfig::default(), quality.clone()) {
+                        match s.watch(p.id, viewer_config(&app), quality.clone()) {
                             Ok(w) => {
                                 test_window_actions(w.viewer.window);
                                 // Tests only: STREAMER_APP_TEST_MUTE mutes at +8 s and unmutes at +14 s.

@@ -41,6 +41,8 @@ pub fn saved() -> core::VoiceSettings {
         event_sounds: flag("voiceSounds"),
         ptt_sounds: flag("pttSounds"),
         threshold: threshold(),
+        // Off unless chosen: the stream's sound stays exactly as without voice chat.
+        stream_echo: settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true),
     }
 }
 

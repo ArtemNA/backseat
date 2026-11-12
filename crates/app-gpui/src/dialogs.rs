@@ -870,6 +870,12 @@ impl Shell {
                         crate::voice_ui::apply_settings(&s.core);
                         cx.notify();
                     })))
+                    .child(Checkbox::new("set-stream-echo").cursor_pointer().label(t("voice.stream_echo")).checked(settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true)).on_click(cx.listener(|s, v: &bool, _, cx| {
+                        set_setting("voiceStreamEcho", serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    })))
+                    .child(small(t("voice.stream_echo_hint")))
                     .child(Checkbox::new("set-ptt-sounds").cursor_pointer().label(t("voice.ptt_sounds")).checked(ptt_sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
                         set_setting("pttSounds", serde_json::Value::Bool(*v));
                         crate::voice_ui::apply_settings(&s.core);

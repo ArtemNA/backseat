@@ -17,6 +17,7 @@ fn main() {
     let mut watch = None::<String>;
     // Watch for this many seconds before joining voice (the echo probe has played that long).
     let mut voice_after = 0u64;
+    let mut stream_echo = false;
     // Voice activity threshold, dBFS.
     let mut threshold = None::<f64>;
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +40,12 @@ fn main() {
                 println!("{} devices: {} in {} ms", if input { "input" } else { "output" }, d.len(), t.elapsed().as_millis());
             }
             return;
+        }
+        // The watched stream's sound through the shared output (for the echo canceller).
+        if key == "--stream-echo" {
+            stream_echo = true;
+            i += 1;
+            continue;
         }
         if key == "--silent" {
             cfg.silent = true;
@@ -85,7 +92,7 @@ fn main() {
                     if cfg.silent {
                         media::playback::set_silent();
                     }
-                    let vc = media::config::ViewerConfig { headless: true, ..Default::default() };
+                    let vc = media::config::ViewerConfig { headless: true, shared_audio: stream_echo, ..Default::default() };
                     match session.watch(p.id, vc, None) {
                         Ok(_) => println!("voice: watching {w} before voice"),
                         Err(e) => eprintln!("voice: cannot watch {w}: {e}"),
@@ -133,7 +140,7 @@ fn main() {
         let peers = session.peers();
         if let (Some(w), false) = (&watch, watching) {
             if let Some(p) = peers.iter().find(|p| p.streaming && &p.name == w) {
-                let cfg = media::config::ViewerConfig { headless: true, ..Default::default() };
+                let cfg = media::config::ViewerConfig { headless: true, shared_audio: stream_echo, ..Default::default() };
                 match session.watch(p.id, cfg, None) {
                     Ok(_) => println!("voice: watching {w}"),
                     Err(e) => eprintln!("voice: cannot watch {w}: {e}"),
