@@ -157,11 +157,98 @@ fn video_source(cfg: &HostConfig) -> String {
     }
 }
 
+/// The whole system's sound, one program at a time (`crate::audio_apps`): each program that
+/// has sound is captured on its own and mixed, leaving out Backseat, sound routers (they play
+/// our voice chat over again as their own) and the programs the user excludes. Checked again
+/// every 2 s, so programs that start or end their sound mid-stream come and go.
+#[cfg(windows)]
+fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
+    let bin = gst::Bin::with_name("audiosrc");
+    let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
+    let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48_000i32).field("channels", 2i32).build();
+    // Silence keeps the mixer running when no program plays.
+    let silence = gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "silence").property("is-live", true).property("samplesperbuffer", 480i32).build().map_err(|e| e.to_string())?;
+    let scaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
+    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", 20_000_000u64).build().map_err(|e| e.to_string())?;
+    bin.add_many([&silence, &scaps, &mixer]).unwrap();
+    gst::Element::link_many([&silence, &scaps, &mixer]).map_err(|e| e.to_string())?;
+    bin.add_pad(&gst::GhostPad::with_target(&mixer.static_pad("src").unwrap()).unwrap()).unwrap();
+    let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
+    let add = move |bin: &gst::Bin, app: &crate::audio_apps::AudioApp| -> Result<(), String> {
+        let src = mk("wasapi2src")?;
+        src.set_property("loopback", true);
+        src.set_property("low-latency", true);
+        src.set_property("loopback-target-pid", app.pid);
+        src.set_property_from_str("loopback-mode", "include-process-tree");
+        let conv = mk("audioconvert")?;
+        let res = mk("audioresample")?;
+        let cf = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
+        let branch = gst::Bin::with_name(&format!("app{}", app.pid));
+        branch.add_many([&src, &conv, &res, &cf]).unwrap();
+        gst::Element::link_many([&src, &conv, &res, &cf]).map_err(|e| e.to_string())?;
+        branch.add_pad(&gst::GhostPad::with_target(&cf.static_pad("src").unwrap()).unwrap()).unwrap();
+        bin.add(&branch).map_err(|e| e.to_string())?;
+        let mixer = bin.by_name("sysmix").unwrap();
+        let pad = mixer.request_pad_simple("sink_%u").ok_or("mixer pad")?;
+        branch.static_pad("src").unwrap().link(&pad).map_err(|e| e.to_string())?;
+        branch.sync_state_with_parent().map_err(|e| e.to_string())?;
+        Ok(())
+    };
+    let wanted = move || -> Vec<crate::audio_apps::AudioApp> {
+        crate::audio_apps::to_capture(&crate::audio_apps::audio_apps()).into_iter().filter(|a| !exclude.contains(&a.exe.to_ascii_lowercase())).collect()
+    };
+    let first = wanted();
+    eprintln!("host: system sound from {}", first.iter().map(|a| a.exe.as_str()).collect::<Vec<_>>().join(", "));
+    for a in &first {
+        if let Err(e) = add(&bin, a) {
+            eprintln!("host: sound of {}: {e}", a.exe);
+        }
+    }
+    let weak = bin.downgrade();
+    std::thread::Builder::new()
+        .name("system-sound".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let Some(bin) = weak.upgrade() else { return };
+            if bin.parent().is_none() && bin.current_state() == gst::State::Null {
+                return;
+            }
+            let now = wanted();
+            for a in &now {
+                if bin.by_name(&format!("app{}", a.pid)).is_none() {
+                    eprintln!("host: system sound adds {}", a.exe);
+                    if let Err(e) = add(&bin, a) {
+                        eprintln!("host: sound of {}: {e}", a.exe);
+                    }
+                }
+            }
+            // A program gone (or now excluded): its branch leaves.
+            for el in bin.children() {
+                let name = el.name();
+                let Some(pid) = name.strip_prefix("app").and_then(|p| p.parse::<u32>().ok()) else { continue };
+                if now.iter().any(|a| a.pid == pid) {
+                    continue;
+                }
+                eprintln!("host: system sound drops a program ({pid})");
+                let peer = el.static_pad("src").and_then(|p| p.peer());
+                let _ = el.set_state(gst::State::Null);
+                if let (Some(peer), Some(mixer)) = (peer, bin.by_name("sysmix")) {
+                    let _ = el.static_pad("src").unwrap().unlink(&peer);
+                    mixer.release_request_pad(&peer);
+                }
+                let _ = bin.remove(&el);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(bin.upcast())
+}
+
 fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
     match cfg.source {
         // Tests only: STREAMER_DEBUG_TEST_AUDIO=<audiotestsrc wave> instead of ticks (the
         // echo gate needs sound all the time, as speech or a game has).
         Source::Bars | Source::Noise => gst::ElementFactory::make("audiotestsrc")
+            .name("audiosrc")
             .property("is-live", true)
             .property_from_str("wave", &std::env::var("STREAMER_DEBUG_TEST_AUDIO").unwrap_or_else(|_| "ticks".into()))
             .property("volume", 0.3f64)
@@ -169,6 +256,7 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
             .map_err(|e| e.to_string()),
         Source::Capture { .. } | Source::Monitor { .. } | Source::Window { .. } => {
             let src = gst::ElementFactory::make("wasapi2src")
+                .name("audiosrc")
                 .property("loopback", true)
                 .property("low-latency", true)
                 .build()
@@ -186,7 +274,11 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
                     src.set_property_from_str("loopback-mode", "include-process-tree");
                     src.set_property("loopback-target-pid", pid);
                 }
-                // Everything but our own playback, so a host who also watches does not echo it.
+                // Everything but our own playback, one program at a time (sound routers would
+                // bring ours back). STREAMER_DEBUG_SYSTEM_EXCLUDE_SELF: one capture of all but
+                // our process, as before (a router's copy of our sound gets in).
+                #[cfg(windows)]
+                None if std::env::var_os("STREAMER_DEBUG_SYSTEM_EXCLUDE_SELF").is_none() => return system_sound(&cfg.audio_exclude),
                 None => {
                     src.set_property_from_str("loopback-mode", "exclude-process-tree");
                     src.set_property("loopback-target-pid", std::process::id());
@@ -275,7 +367,7 @@ impl Host {
             self.swap_video_source(&new)?;
             self.source_changed.store(new.source != old.source, Ordering::SeqCst);
         }
-        if new.audio && new.audio_pid != old.audio_pid {
+        if new.audio && (new.audio_pid != old.audio_pid || new.audio_exclude != old.audio_exclude) {
             self.swap_audio_source(&new)?;
         }
         let ceiling = Quality::new(new.mode, new.kbit);
@@ -331,7 +423,7 @@ impl Host {
 
     /// Replaces the sound capture (whole system or one program).
     fn swap_audio_source(&self, cfg: &HostConfig) -> Result<(), String> {
-        let src = self.pipeline.iterate_sources().into_iter().flatten().find(|e| e.factory().is_some_and(|f| f.name() == "wasapi2src")).ok_or("no sound capture")?;
+        let src = self.pipeline.by_name("audiosrc").ok_or("no sound capture")?;
         let next = src.static_pad("src").and_then(|p| p.peer()).ok_or("sound capture not linked")?;
         let new = audio_source(cfg)?;
         let _ = src.set_state(gst::State::Null);

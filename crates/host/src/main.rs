@@ -35,7 +35,7 @@ fn parse() -> Result<Args, String> {
         codec: Codec::H265,
         keyframe_secs: 2,
         audio: true,
-        audio_pid: None,
+        audio_pid: None, audio_exclude: Vec::new(),
         source: Source::Capture { monitor: -1 },
         ice: IceConfig::default(),
     };

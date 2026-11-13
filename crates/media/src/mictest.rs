@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 pub struct MicTest {
     pipeline: gst::Pipeline,
+    /// Our input of the shared sound output, while the test plays there.
+    _out: Option<Arc<crate::playback::Input>>,
     /// dBFS of the last 100 ms (after processing), as bits.
     level: Arc<AtomicU64>,
 }
@@ -45,42 +47,47 @@ impl MicTest {
         let proc = make("webrtcdsp")?;
         proc.set_property("echo-cancel", false);
         dsp.apply(&proc, tone.is_some());
-        let level = make("level")?;
-        level.set_property("interval", 100_000_000u64);
-        level.set_property("post-messages", true);
-        let conv2 = make("audioconvert")?;
-        let res2 = make("audioresample")?;
-        let sink = if silent {
-            gst::ElementFactory::make("fakesink").property("sync", true).build().map_err(|e| e.to_string())?
+        // Played through the app's shared sound output, where voices and streams are heard (a
+        // sink of its own went elsewhere with sound routers, and the test was silent).
+        let (tail, out) = if silent {
+            (vec![gst::ElementFactory::make("fakesink").property("sync", true).build().map_err(|e| e.to_string())?], None)
         } else {
-            let s = make("wasapi2sink")?;
-            if s.has_property("low-latency") {
-                s.set_property("low-latency", true);
-            }
-            if let (Some(d), true) = (&speakers, s.has_property("device")) {
-                s.set_property("device", d);
-            }
-            s
+            let _ = &speakers;
+            let (t, input) = crate::playback::tail("mic test")?;
+            (t, Some(input))
         };
-        let all = [&src, &conv, &res, &caps, &proc, &level, &conv2, &res2, &sink];
-        pipeline.add_many(all).map_err(|e| e.to_string())?;
-        gst::Element::link_many(all).map_err(|e| e.to_string())?;
+        let mut all: Vec<&gst::Element> = vec![&src, &conv, &res, &caps, &proc];
+        all.extend(tail.iter());
+        pipeline.add_many(all.iter().copied()).map_err(|e| e.to_string())?;
+        gst::Element::link_many(all.iter().copied()).map_err(|e| e.to_string())?;
+        // The level of every 100 ms after processing, from the samples themselves: the
+        // "level" plugin is not among the ones the installer ships (0.2.12 had no meter and
+        // the test did not start).
         let store = Arc::new(AtomicU64::new((-100f64).to_bits()));
         let st = store.clone();
-        pipeline.bus().unwrap().set_sync_handler(move |_, msg| {
-            if let gst::MessageView::Element(e) = msg.view() {
-                if let Some(s) = e.structure().filter(|s| s.name() == "level") {
-                    if let Ok(rms) = s.get::<gst::glib::ValueArray>("rms") {
-                        let db = rms.iter().filter_map(|v| v.get::<f64>().ok()).fold(-100f64, f64::max);
+        let acc = std::sync::Mutex::new((0f64, 0usize));
+        proc.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(buf) = info.buffer() {
+                if let Ok(map) = buf.map_readable() {
+                    let mut a = acc.lock().unwrap();
+                    for c in map.as_slice().chunks_exact(2) {
+                        let v = i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0;
+                        a.0 += v * v;
+                        a.1 += 1;
+                    }
+                    if a.1 >= 4800 {
+                        let db = if a.0 > 0.0 { 10.0 * (a.0 / a.1 as f64).log10() } else { -100.0 };
                         st.store(db.max(-100.0).to_bits(), Ordering::Relaxed);
+                        *a = (0.0, 0);
                     }
                 }
             }
-            gst::BusSyncReply::Drop
+            gst::PadProbeReturn::Ok
         });
+        crate::drain_bus(&pipeline, "mic test");
         pipeline.set_state(gst::State::Playing).map_err(|e| format!("microphone test: {e}"))?;
         eprintln!("mic test: on");
-        Ok(Self { pipeline, level: store })
+        Ok(Self { pipeline, _out: out, level: store })
     }
 
     /// The processed microphone's level now, dBFS.

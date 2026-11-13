@@ -178,6 +178,8 @@ pub struct HostConfig {
     pub audio: bool,
     /// Capture only this process's audio (and its children) instead of the whole system.
     pub audio_pid: Option<u32>,
+    /// The whole system's sound leaves out these programs (executable names, any case).
+    pub audio_exclude: Vec<String>,
     pub source: Source,
     pub ice: IceConfig,
 }

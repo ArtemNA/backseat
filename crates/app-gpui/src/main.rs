@@ -193,6 +193,13 @@ impl Shell {
         cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| loop {
             cx.background_executor().timer(Duration::from_millis(150)).await;
             let alive = this.update_in(cx, |s, _, cx| {
+                // The voice tab's meter moves with the microphone: redrawn while in voice or
+                // while the microphone test runs (outside voice it stood still until the mouse
+                // moved).
+                let voice_tab = s.dialogs.settings.as_ref().is_some_and(|d| d.tab == dialogs::SetTab::Voice);
+                if voice_tab && core::mic_test_on(&s.core) {
+                    cx.notify();
+                }
                 if !s.snap.connected {
                     return;
                 }

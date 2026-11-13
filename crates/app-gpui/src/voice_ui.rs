@@ -119,6 +119,13 @@ pub fn threshold_view(slider: &Entity<SliderState>, level: Option<f64>) -> Div {
         .child(div().text_xs().text_color(rgb(color::MUTED)).child(if level.is_some() { t("voice.threshold_hint") } else { t("voice.threshold_join") }))
 }
 
+/// The microphone's level alone (push-to-talk has no threshold to show it against).
+pub fn level_meter(level: Option<f64>) -> Option<Div> {
+    let db = level?;
+    let frac = ((db as f32 - THRESHOLD_OFF) / (-20.0 - THRESHOLD_OFF)).clamp(0.0, 1.0);
+    Some(div().h(px(6.)).w_full().rounded_full().bg(rgb(color::RAIL)).child(div().h_full().rounded_full().w(relative(frac)).bg(rgb(color::GREEN))))
+}
+
 pub fn apply_settings(c: &std::sync::Arc<core::App>) {
     core::refresh_audio_devices();
     let s = saved();

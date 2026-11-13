@@ -18,7 +18,7 @@ fn main() {
         codec: Codec::H264,
         keyframe_secs: 2,
         audio: true,
-        audio_pid: None,
+        audio_pid: None, audio_exclude: Vec::new(),
         source: Source::Bars,
         ice: IceConfig::default(),
     };

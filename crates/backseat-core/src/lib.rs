@@ -340,9 +340,25 @@ pub fn set_mic_test(app: &App, on: bool) -> Result<(), String> {
         (st.mic.clone(), st.speakers.clone(), st.dsp.clone())
     };
     let tone = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok());
-    let t = media::mictest::MicTest::start(mic, speakers, &dsp, tone, tone.is_some())?;
+    // STREAMER_APP_TEST_MICTEST_AUDIBLE: the tone is played (to measure what reaches the speakers).
+    let silent = tone.is_some() && std::env::var_os("STREAMER_APP_TEST_MICTEST_AUDIBLE").is_none();
+    let t = media::mictest::MicTest::start(mic, speakers, &dsp, tone, silent)?;
     *app.mic_test.lock().unwrap() = Some(t);
     Ok(())
+}
+
+/// Programs playing sound now that a stream of the whole system's sound would take in (not
+/// Backseat, not sound routers), by executable name: what the settings offer to exclude.
+pub fn sounding_programs() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let mut v: Vec<String> = media::audio_apps::to_capture(&media::audio_apps::audio_apps()).into_iter().map(|a| a.exe).filter(|e| !e.is_empty()).collect();
+        v.sort_by_key(|e| e.to_ascii_lowercase());
+        v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        v
+    }
+    #[cfg(not(windows))]
+    vec![]
 }
 
 pub fn mic_test_on(app: &App) -> bool {
@@ -1143,6 +1159,9 @@ pub struct GoLive {
     /// "system", "app" or "none".
     pub audio: String,
     pub audio_pid: Option<u32>,
+    /// The whole system's sound leaves out these programs (executable names).
+    #[serde(default)]
+    pub audio_exclude: Vec<String>,
     /// "1440p60" etc.
     pub mode: String,
     pub kbit: u32,
@@ -1164,6 +1183,7 @@ fn live_config(req: &GoLive) -> Result<HostConfig, String> {
         keyframe_secs: 2,
         audio: req.audio != "none",
         audio_pid: if req.audio == "app" { req.audio_pid } else { None },
+        audio_exclude: req.audio_exclude.clone(),
         source,
         ice: IceConfig::default(),
     })
@@ -1267,7 +1287,7 @@ pub fn automate(app: &Arc<App>) {
                 }
                 0
             };
-            let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, mode: mode.into(), kbit: kbit.parse().unwrap_or(8000), codec: p.get(3).map(|c| c.to_string()) };
+            let req = GoLive { kind: "monitor".into(), id, audio: "system".into(), audio_pid: None, audio_exclude: Vec::new(), mode: mode.into(), kbit: kbit.parse().unwrap_or(8000), codec: p.get(3).map(|c| c.to_string()) };
             if let Err(e) = go_live(&app, req) {
                 app.notify(format!("error:{e}"));
             }

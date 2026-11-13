@@ -106,6 +106,8 @@ pub struct SettingsState {
     _subs: Vec<Subscription>,
     /// Voice activity threshold slider.
     pub threshold: Entity<gpui_kit::component::slider::SliderState>,
+    /// Programs playing sound when the settings opened (to exclude from streams).
+    sounding: Vec<String>,
 }
 
 #[derive(Default)]
@@ -198,6 +200,19 @@ fn seg(id: impl Into<ElementId>, label: impl Into<SharedString>, on: bool, disab
 
 fn legend(text: SharedString) -> Div {
     div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(text)
+}
+
+/// Programs whose sound never goes into a stream of the whole system's sound (executable
+/// names). Discord until the user takes it out: its voices are a call, not the stream.
+pub fn audio_exclude() -> Vec<String> {
+    match settings().get("audioExclude").and_then(|v| v.as_array()) {
+        Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        None => vec!["Discord.exe".into()],
+    }
+}
+
+fn set_audio_exclude(list: &[String]) {
+    set_setting("audioExclude", serde_json::Value::Array(list.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
 }
 
 fn small(t: impl Into<SharedString>) -> Div {
@@ -398,7 +413,7 @@ impl Shell {
             cx.notify();
             return;
         };
-        let req = GoLive { kind: if g.screen { "monitor".into() } else { "window".into() }, id: pick.id, audio: g.audio.key().into(), audio_pid: pick.pid, mode: format!("{}p{}", g.res, g.fps), kbit: g.kbit, codec: Some(g.codec.clone()) };
+        let req = GoLive { kind: if g.screen { "monitor".into() } else { "window".into() }, id: pick.id, audio: g.audio.key().into(), audio_pid: pick.pid, audio_exclude: audio_exclude(), mode: format!("{}p{}", g.res, g.fps), kbit: g.kbit, codec: Some(g.codec.clone()) };
         let editing = g.editing;
         let audio_none = g.audio == Audio::None;
         g.busy = true;
@@ -710,7 +725,7 @@ impl Shell {
         let update = self.update.clone().or_else(|| self.dialogs.settings.as_ref().and_then(|s| s.update.clone()));
         let (threshold, sub) = self.threshold_slider(window, cx);
         subs.push(sub);
-        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold });
+        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold, sounding: core::sounding_programs() });
         self.dialogs.open = Some(Open::Settings);
         eprintln!("settings: opened in {} ms", started.elapsed().as_millis());
         cx.notify();
@@ -848,6 +863,55 @@ impl Shell {
                 .child(field(tu("golive.bitrate"), pick(Some("stream"), "kbit")))
                 .child(field(tu("golive.codec"), pick(Some("stream"), "codec")))
                 .child(field(tu("golive.audio"), pick(Some("stream"), "audio")))
+                .child({
+                    // Programs left out of a stream of the whole system's sound.
+                    let ex = audio_exclude();
+                    let chip = |name: String, i: usize, cx: &mut Context<Self>| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pl_2p5()
+                            .pr_1()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(rgb(0x3f4147))
+                            .text_color(rgb(color::BRIGHT))
+                            .child(name.clone())
+                            .child(
+                                div()
+                                    .id(("ex-del", i))
+                                    .cursor_pointer()
+                                    .px_1()
+                                    .text_color(rgb(color::MUTED))
+                                    .hover(|d| d.text_color(rgb(color::BRIGHT)))
+                                    .child("✕")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        let list: Vec<String> = audio_exclude().into_iter().filter(|e| !e.eq_ignore_ascii_case(&name)).collect();
+                                        set_audio_exclude(&list);
+                                        cx.notify();
+                                    })),
+                            )
+                    };
+                    let offer: Vec<String> = st.sounding.iter().filter(|p| !ex.iter().any(|e| e.eq_ignore_ascii_case(p))).cloned().collect();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color::MUTED)).child(tu("set.exclude")))
+                        .child(small(t("set.exclude_hint")))
+                        .child(if ex.is_empty() { div().text_color(rgb(color::MUTED)).child(t("set.exclude_none")) } else { div().flex().flex_wrap().gap_1p5().children(ex.iter().enumerate().map(|(i, n)| chip(n.clone(), i, cx))) })
+                        .when(!offer.is_empty(), |d| {
+                            d.child(small(t("set.exclude_add"))).child(div().flex().flex_wrap().gap_1p5().children(offer.into_iter().enumerate().map(|(i, n)| {
+                                Button::new(("ex-add", i)).cursor_pointer().small().label(format!("+ {n}")).on_click(cx.listener(move |_, _, _, cx| {
+                                    let mut list = audio_exclude();
+                                    list.push(n.clone());
+                                    set_audio_exclude(&list);
+                                    cx.notify();
+                                }))
+                            })))
+                        })
+                })
                 .into_any_element(),
             SetTab::Watch => div()
                 .flex()
@@ -861,65 +925,84 @@ impl Shell {
             SetTab::Voice => {
                 let (sounds, ptt_sounds) = (settings().get("voiceSounds").and_then(|v| v.as_bool()) != Some(false), settings().get("pttSounds").and_then(|v| v.as_bool()) != Some(false));
                 let ptt = pref("voice", "mode") == "ptt";
-                div()
+                let on = core::mic_test_on(&self.core);
+                // Two columns side by side, each as wide as the other.
+                let two = |a: AnyElement, b: AnyElement| div().flex().gap_5().child(div().flex_1().min_w_0().child(a)).child(div().flex_1().min_w_0().child(b));
+                let group = |title: SharedString| div().pt_1().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(rgb(color::BRIGHT)).child(title);
+                let check = |id: &'static str, label: SharedString, key: &'static str, default: bool, cx: &mut Context<Self>| {
+                    let checked = settings().get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+                    Checkbox::new(id).cursor_pointer().label(label).checked(checked).on_click(cx.listener(move |s, v: &bool, _, cx| {
+                        set_setting(key, serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    }))
+                };
+                let test = div()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .child(small(t("voice.settings_hint")))
-                    .child(field(tu("voice.mic"), pick(Some("voice"), "mic")))
-                    .child(field(tu("voice.speakers"), pick(Some("voice"), "out")))
-                    .child(field(tu("voice.mode"), pick(Some("voice"), "mode")))
-                    .when(ptt, |d| d.child(field(tu("voice.key"), pick(Some("voice"), "key"))).child(small(t("voice.key_hint"))))
-                    .when(!ptt, |d| d.child(crate::voice_ui::threshold_view(&st.threshold, core::mic_input_db(&self.core))))
-                    .child({
-                        let on = core::mic_test_on(&self.core);
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x2b2d31))
+                    .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_center()
+                            .gap_3()
                             .child(
                                 Button::new("voice-test")
                                     .cursor_pointer()
                                     .when(on, |b| b.primary())
                                     .label(t(if on { "voice.test_stop" } else { "voice.test" }))
                                     .on_click(cx.listener(move |s, _, _, cx| {
-                                        if let Err(e) = core::set_mic_test(&s.core, !on) {
-                                            if let Some(st) = s.dialogs.settings.as_mut() {
-                                                st.status = e;
-                                            }
+                                        let r = core::set_mic_test(&s.core, !on);
+                                        if let Some(st) = s.dialogs.settings.as_mut() {
+                                            st.status = r.err().map(|e| tf("voice.test_failed", &[("e", &e)]).to_string()).unwrap_or_default();
                                         }
                                         cx.notify();
                                     })),
                             )
-                            .child(small(t("voice.test_hint")))
-                    })
+                            .child(div().flex_1().min_w_0().child(small(t("voice.test_hint")))),
+                    )
+                    .when(!st.status.is_empty(), |d| d.child(div().text_xs().text_color(rgb(0xff8a8f)).child(st.status.clone())))
+                    .when(!ptt, |d| d.child(crate::voice_ui::threshold_view(&st.threshold, core::mic_input_db(&self.core))))
+                    .when(ptt, |d| d.children(crate::voice_ui::level_meter(core::mic_input_db(&self.core))));
+                let mode = div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(field(tu("voice.mode"), pick(Some("voice"), "mode")))
+                    .when(ptt, |d| d.child(field(tu("voice.key"), pick(Some("voice"), "key"))).child(small(t("voice.key_hint"))));
+                let processing = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .child(field(tu("voice.noise"), pick(Some("voice"), "noise")))
-                    .child(Checkbox::new("set-voice-echo").cursor_pointer().label(t("voice.echo")).checked(settings().get("voiceEcho").and_then(|v| v.as_bool()) != Some(false)).on_click(cx.listener(|s, v: &bool, _, cx| {
-                        set_setting("voiceEcho", serde_json::Value::Bool(*v));
-                        crate::voice_ui::apply_settings(&s.core);
-                        cx.notify();
-                    })))
-                    .child(Checkbox::new("set-voice-gain").cursor_pointer().label(t("voice.gain")).checked(settings().get("voiceGain").and_then(|v| v.as_bool()) != Some(false)).on_click(cx.listener(|s, v: &bool, _, cx| {
-                        set_setting("voiceGain", serde_json::Value::Bool(*v));
-                        crate::voice_ui::apply_settings(&s.core);
-                        cx.notify();
-                    })))
-                    .child(Checkbox::new("set-voice-sounds").cursor_pointer().label(t("voice.sounds")).checked(sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
-                        set_setting("voiceSounds", serde_json::Value::Bool(*v));
-                        crate::voice_ui::apply_settings(&s.core);
-                        cx.notify();
-                    })))
-                    .child(Checkbox::new("set-stream-echo").cursor_pointer().label(t("voice.stream_echo")).checked(settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true)).on_click(cx.listener(|s, v: &bool, _, cx| {
-                        set_setting("voiceStreamEcho", serde_json::Value::Bool(*v));
-                        crate::voice_ui::apply_settings(&s.core);
-                        cx.notify();
-                    })))
-                    .child(small(t("voice.stream_echo_hint")))
-                    .child(Checkbox::new("set-ptt-sounds").cursor_pointer().label(t("voice.ptt_sounds")).checked(ptt_sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
-                        set_setting("pttSounds", serde_json::Value::Bool(*v));
-                        crate::voice_ui::apply_settings(&s.core);
-                        cx.notify();
-                    })))
+                    .child(check("set-voice-echo", t("voice.echo"), "voiceEcho", true, cx))
+                    .child(check("set-voice-gain", t("voice.gain"), "voiceGain", true, cx));
+                let sounds_col = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(check("set-voice-sounds", t("voice.sounds"), "voiceSounds", sounds, cx))
+                    .child(check("set-ptt-sounds", t("voice.ptt_sounds"), "pttSounds", ptt_sounds, cx));
+                let echo_col = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(check("set-stream-echo", t("voice.stream_echo"), "voiceStreamEcho", false, cx))
+                    .child(small(t("voice.stream_echo_hint")));
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(small(t("voice.settings_hint")))
+                    .child(two(field(tu("voice.mic"), pick(Some("voice"), "mic")).into_any_element(), field(tu("voice.speakers"), pick(Some("voice"), "out")).into_any_element()))
+                    .child(test)
+                    .child(group(t("voice.group_processing")))
+                    .child(two(mode.into_any_element(), processing.into_any_element()))
+                    .child(group(t("voice.group_sounds")))
+                    .child(two(sounds_col.into_any_element(), echo_col.into_any_element()))
                     .into_any_element()
             }
             SetTab::Updates => div()
@@ -942,8 +1025,9 @@ impl Shell {
                 .into_any_element(),
         };
         div()
-            .w(px(680.))
-            .h(px(560.))
+            .w(px(880.))
+            .max_w(relative(0.94))
+            .h(px(720.))
             .max_h(relative(0.92))
             .bg(rgb(color::MAIN))
             .rounded(px(12.))
