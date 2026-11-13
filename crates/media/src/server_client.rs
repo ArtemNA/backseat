@@ -74,8 +74,9 @@ enum End {
 }
 
 /// Moves messages both ways until the connection ends.
-/// Nothing from the server (it pings every 2 s) this long: the link is dead even if the
-/// socket says nothing. A proxy once passed nothing for ~25 s while the socket stayed open;
+/// Nothing back this long (we ping every second; a proxy in front of the server may answer
+/// for it, and it may also keep the server's own pings from us): the link is dead even if
+/// the socket says nothing. A proxy once passed nothing for ~25 s while the socket stayed open;
 /// the server freed our place after its 20 s and we learned of it only then.
 const SILENT_FOR: Duration = Duration::from_secs(6);
 
@@ -83,6 +84,10 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
     let mut alive = Instant::now() - Duration::from_secs(1);
     let mut heard = Instant::now();
     let watchdog = std::env::var_os("STREAMER_DEBUG_NO_WATCHDOG").is_none();
+    // Tests: STREAMER_DEBUG_IGNORE_SERVER_PINGS acts as that proxy (the server's pings never
+    // count); STREAMER_DEBUG_NO_CLIENT_PING sends none of ours (0.2.9's way).
+    let ignore_server_pings = std::env::var_os("STREAMER_DEBUG_IGNORE_SERVER_PINGS").is_some();
+    let client_ping = std::env::var_os("STREAMER_DEBUG_NO_CLIENT_PING").is_none();
     loop {
         if watchdog && heard.elapsed() >= SILENT_FOR {
             eprintln!("signaling: nothing from the server for {} s, reconnecting", SILENT_FOR.as_secs());
@@ -126,6 +131,13 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
             if let Err(e) = ws.send(Message::Text(ClientMsg::Alive.to_json().into())) {
                 eprintln!("signaling: send failed: {e}");
                 return End::Broken;
+            }
+            // Answered by the server or the proxy before it: either way the link carries.
+            if client_ping {
+                if let Err(e) = ws.send(Message::Ping(Vec::new().into())) {
+                    eprintln!("signaling: send failed: {e}");
+                    return End::Broken;
+                }
             }
         }
         loop {
@@ -173,7 +185,8 @@ fn pump(ws: &mut Ws, out_rx: &mpsc::Receiver<ClientMsg>, in_tx: &mpsc::Sender<Se
                 eprintln!("signaling: server closed the connection: {f:?}");
                 return End::Broken;
             }
-            // Pings from the server: it is there.
+            Ok(Message::Ping(_)) if ignore_server_pings => {}
+            // Pongs to our pings, pings from the server: the link carries.
             Ok(_) => heard = Instant::now(),
             // On Windows a read that times out can also report ERROR_IO_PENDING (997);
             // treating it as a lost connection dropped a host after ~5 min of churn.

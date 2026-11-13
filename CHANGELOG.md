@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.11
+
+- Fixed in this release (it was broken in 0.2.9 and 0.2.10): in a quiet room the app reconnected to the server every few seconds and showed "Reconnecting…" again and again. The hosting's proxy keeps the server's pings from the app, so the new check saw silence; the app now pings the server itself every second.
+
 ## 0.2.10
 
 - Invite links bring their server. A room you open from an invite link (clicked or pasted) is on the server that link came from, whatever server is in your settings. Before, a friend with another server in the settings (or none) could not get into the room. Each room keeps its own server.
