@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.12
+
+- **Hear yourself.** *Settings → Voice → Hear yourself* plays your microphone back the way others hear it (processed, a moment later), with its level on the meter, also outside voice. It stops when the settings close.
+- *Settings → Voice* now has the microphone's processing: noise suppression (off, low, normal, high, very high), echo cancelling, and evening out your microphone's loudness. Changes apply at once.
+- A person's volume menu (click or right click in the voice list) and a room's menu show above the video; they were hidden behind it.
+
 ## 0.2.11
 
 - Fixed in this release (it was broken in 0.2.9 and 0.2.10): in a quiet room the app reconnected to the server every few seconds and showed "Reconnecting…" again and again. The hosting's proxy keeps the server's pings from the app, so the new check saw silence; the app now pings the server itself every second.
