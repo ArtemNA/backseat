@@ -169,7 +169,7 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     // Silence keeps the mixer running when no program plays.
     let silence = gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "silence").property("is-live", true).property("samplesperbuffer", 480i32).build().map_err(|e| e.to_string())?;
     let scaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
-    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", 20_000_000u64).build().map_err(|e| e.to_string())?;
+    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1_000_000).build().map_err(|e| e.to_string())?;
     bin.add_many([&silence, &scaps, &mixer]).unwrap();
     gst::Element::link_many([&silence, &scaps, &mixer]).map_err(|e| e.to_string())?;
     bin.add_pad(&gst::GhostPad::with_target(&mixer.static_pad("src").unwrap()).unwrap()).unwrap();
@@ -247,14 +247,15 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
     match cfg.source {
         // Tests only: STREAMER_DEBUG_TEST_AUDIO=<audiotestsrc wave> instead of ticks (the
         // echo gate needs sound all the time, as speech or a game has).
-        Source::Bars | Source::Noise => gst::ElementFactory::make("audiotestsrc")
+        // Tests: STREAMER_DEBUG_BARS_SYSTEM_SOUND gives the test pattern the system's real sound.
+        Source::Bars | Source::Noise if std::env::var_os("STREAMER_DEBUG_BARS_SYSTEM_SOUND").is_none() => gst::ElementFactory::make("audiotestsrc")
             .name("audiosrc")
             .property("is-live", true)
             .property_from_str("wave", &std::env::var("STREAMER_DEBUG_TEST_AUDIO").unwrap_or_else(|_| "ticks".into()))
             .property("volume", 0.3f64)
             .build()
             .map_err(|e| e.to_string()),
-        Source::Capture { .. } | Source::Monitor { .. } | Source::Window { .. } => {
+        Source::Capture { .. } | Source::Monitor { .. } | Source::Window { .. } | Source::Bars | Source::Noise => {
             let src = gst::ElementFactory::make("wasapi2src")
                 .name("audiosrc")
                 .property("loopback", true)

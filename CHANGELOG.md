@@ -2,6 +2,13 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.13
+
+- **Your voice chat no longer gets into your stream through sound software.** With SteelSeries Sonar, GoXLR, Wave Link, Voicemeeter and the like, the voices you hear were played again by that software and went into a stream of the whole system's sound. Now the system's sound is taken one program at a time, leaving out Backseat and such sound routers.
+- *Settings → Streaming* lists the programs whose sound never goes into such a stream. Discord is there at first (take it out with ✕); programs playing sound now can be added with one click.
+- Fixed in this release: *Hear yourself* (0.2.12) did not start in the installed app, and with sound software it could play where you did not hear it. It now plays where voices and streams do, and its meter moves on its own, in push-to-talk too.
+- The settings window is larger, and the voice settings are laid out in two columns so everything about the microphone fits on one screen.
+
 ## 0.2.12
 
 - **Hear yourself.** *Settings → Voice → Hear yourself* plays your microphone back the way others hear it (processed, a moment later), with its level on the meter, also outside voice. It stops when the settings close.
