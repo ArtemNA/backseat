@@ -1029,7 +1029,8 @@ impl Shell {
                     .gap_2()
                     .child(field(tu("voice.noise"), pick(Some("voice"), "noise")))
                     .child(check("set-voice-echo", t("voice.echo"), "voiceEcho", true, cx))
-                    .child(check("set-voice-gain", t("voice.gain"), "voiceGain", true, cx));
+                    .child(check("set-voice-gain", t("voice.gain"), "voiceGain", true, cx))
+                    .child(check("set-voice-highcut", t("voice.high_cut"), "voiceHighCut", false, cx));
                 let sounds_col = div()
                     .flex()
                     .flex_col()

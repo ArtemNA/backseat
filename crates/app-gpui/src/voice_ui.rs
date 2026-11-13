@@ -54,6 +54,7 @@ pub fn saved() -> core::VoiceSettings {
             auto_gain: flag("voiceGain"),
             rnnoise: matches!(voice_pref("noise").as_deref(), None | Some("rnnoise")),
             notches: notches(),
+            high_cut: settings().get("voiceHighCut").and_then(|v| v.as_bool()) == Some(true),
         },
     }
 }

@@ -26,7 +26,7 @@ impl MicTest {
         crate::init();
         let pipeline = gst::Pipeline::new();
         let src = match tone {
-            Some(f) => gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "sine").property("freq", f).property("volume", 0.3f64).property("is-live", true).build().map_err(|e| e.to_string())?,
+            Some(f) => gst::ElementFactory::make("audiotestsrc").property_from_str("wave", if std::env::var_os("STREAMER_DEBUG_TONE_SQUARE").is_some() { "square" } else { "sine" }).property("freq", f).property("volume", 0.3f64).property("is-live", true).build().map_err(|e| e.to_string())?,
             None => {
                 let s = make("wasapi2src")?;
                 if s.has_property("low-latency") {
@@ -114,7 +114,7 @@ pub fn find_whine(mic: Option<String>, secs: u64, tone: Option<f64>) -> Result<V
     crate::init();
     let pipeline = gst::Pipeline::new();
     let src = match tone {
-        Some(f) => gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "sine").property("freq", f).property("volume", 0.01f64).property("is-live", true).build().map_err(|e| e.to_string())?,
+        Some(f) => gst::ElementFactory::make("audiotestsrc").property_from_str("wave", if std::env::var_os("STREAMER_DEBUG_TONE_SQUARE").is_some() { "square" } else { "sine" }).property("freq", f).property("volume", 0.01f64).property("is-live", true).build().map_err(|e| e.to_string())?,
         None => {
             let s = make("wasapi2src")?;
             if let (Some(d), true) = (&mic, s.has_property("device")) {
@@ -174,7 +174,36 @@ pub fn find_whine(mic: Option<String>, secs: u64, tone: Option<f64>) -> Result<V
             kept.push(p);
         }
     }
-    let mut out: Vec<f32> = kept.into_iter().take(16).map(|(f, _)| f.round() as f32).collect();
+    let mut out: Vec<f32> = kept.iter().take(16).map(|(f, _)| f.round() as f32).collect();
+    // A whine from ground or USB is a comb: tones at multiples of one base. When most of the
+    // found tones sit on multiples of the strongest low one, all its multiples up to 20 kHz
+    // are cut, also those too quiet to stand out in 3 s.
+    let base = out.iter().copied().filter(|f| *f >= 80.0 && *f <= 1200.0).fold(None::<f32>, |a, f| Some(a.map_or(f, |a: f32| a.min(f))));
+    if let Some(b0) = base {
+        // The base from the low tones first (up high a small error in it adds up), then which
+        // tones sit on its multiples, allowing for drift that grows with the frequency.
+        let mut low: Vec<f32> = out.iter().copied().filter(|f| *f < 4_000.0 && ((f / b0) - (f / b0).round()).abs() * b0 < 15.0).map(|f| f / (f / b0).round()).collect();
+        low.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let b = low.get(low.len() / 2).copied().unwrap_or(b0);
+        let on: Vec<f32> = out.iter().copied().filter(|f| ((f / b) - (f / b).round()).abs() * b < (f * 0.006).max(15.0)).collect();
+        if out.len() >= 3 && on.len() * 3 >= out.len() * 2 {
+            // The base from all the tones on the comb (the lowest alone was 498 Hz for a
+            // 500.1 Hz comb: 40 Hz off by the 20th tone, past a 12 Hz notch).
+            let mut ratios: Vec<f32> = on.iter().map(|f| f / (f / b).round()).collect();
+            ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let base = ratios[ratios.len() / 2];
+            let mut all: Vec<f32> = (1..).map(|k| k as f32 * base).take_while(|f| *f < 20_000.0).take(48).collect();
+            // The tones found stay as they were found (a comb drifts a little up high).
+            for f in &out {
+                if !all.iter().any(|g| (g - f).abs() < 8.0) {
+                    all.push(*f);
+                }
+            }
+            all.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!("whine: a comb of {base:.1} Hz, {} tones", all.len());
+            out = all.into_iter().map(|f| f.round()).collect();
+        }
+    }
     out.sort_by(|a, b| a.partial_cmp(b).unwrap());
     eprintln!("whine: {} peaks at {:?} Hz", out.len(), out);
     Ok(out)

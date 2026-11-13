@@ -64,11 +64,13 @@ pub struct DspConfig {
     pub rnnoise: bool,
     /// Narrow cuts at these frequencies (Hz): a whine's tones, found by `mictest::find_whine`.
     pub notches: Vec<f32>,
+    /// Everything above 8 kHz cut (speech needs little of it; a high whine sits there).
+    pub high_cut: bool,
 }
 
 impl Default for DspConfig {
     fn default() -> Self {
-        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true, rnnoise: false, notches: vec![] }
+        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true, rnnoise: false, notches: vec![], high_cut: false }
     }
 }
 
@@ -92,7 +94,7 @@ impl DspConfig {
     /// else none. `tested`: a steady test tone, which it would take for noise: none.
     pub fn after(&self, tested: bool) -> Result<Vec<gst::Element>, String> {
         let rnnoise = self.rnnoise && !tested;
-        if !rnnoise && self.notches.is_empty() {
+        if !rnnoise && self.notches.is_empty() && !self.high_cut {
             return Ok(vec![]);
         }
         let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
@@ -111,6 +113,19 @@ impl DspConfig {
             n.set_property("lower-frequency", (f - NOTCH_HALF).max(10.0));
             n.set_property("upper-frequency", (f + NOTCH_HALF).min(RATE as f32 / 2.0 - 10.0));
             out.push(n);
+        }
+        if self.high_cut {
+            let lp = mk("audiocheblimit")?;
+            lp.set_property_from_str("mode", "low-pass");
+            lp.set_property("cutoff", 8000.0f32);
+            lp.set_property("poles", 4i32);
+            out.push(lp.clone());
+            // Twice, as the notches: steeper above 8 kHz without the instability of more poles.
+            let lp2 = mk("audiocheblimit")?;
+            lp2.set_property_from_str("mode", "low-pass");
+            lp2.set_property("cutoff", 8000.0f32);
+            lp2.set_property("poles", 4i32);
+            out.push(lp2);
         }
         if rnnoise {
             out.push(mk("audiornnoise")?);
