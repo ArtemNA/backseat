@@ -47,11 +47,12 @@ pub fn saved() -> core::VoiceSettings {
             echo_cancel: flag("voiceEcho"),
             // Unset: the usual middle level; "off": none.
             noise: match voice_pref("noise").as_deref() {
-                Some("off") => None,
+                Some("off") | Some("rnnoise") => None,
                 None => Some("moderate".into()),
                 Some(v) => Some(v.to_string()),
             },
             auto_gain: flag("voiceGain"),
+            rnnoise: voice_pref("noise").as_deref() == Some("rnnoise"),
         },
     }
 }

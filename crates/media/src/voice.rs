@@ -59,11 +59,14 @@ pub struct DspConfig {
     pub noise: Option<String>,
     /// Evens out the microphone's loudness.
     pub auto_gain: bool,
+    /// The RNNoise denoiser (a small neural network) after the processing, in place of the
+    /// noise suppression above: stronger on whines and hums that are not like hiss.
+    pub rnnoise: bool,
 }
 
 impl Default for DspConfig {
     fn default() -> Self {
-        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true }
+        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true, rnnoise: false }
     }
 }
 
@@ -78,6 +81,19 @@ impl DspConfig {
         }
         dsp.set_property("gain-control", self.auto_gain && !tested);
         dsp.set_property("high-pass-filter", true);
+    }
+
+    /// The elements after webrtcdsp (S16LE mono in, S16LE mono out): RNNoise when chosen,
+    /// else none. `tested`: a steady test tone, which it would take for noise: none.
+    pub fn after(&self, tested: bool) -> Result<Vec<gst::Element>, String> {
+        if !self.rnnoise || tested {
+            return Ok(vec![]);
+        }
+        let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
+        let f32 = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
+        let s16 = gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
+        let cf = |c: gst::Caps| gst::ElementFactory::make("capsfilter").property("caps", c).build().unwrap();
+        Ok(vec![mk("audioconvert")?, cf(f32), mk("audiornnoise")?, mk("audioconvert")?, cf(s16)])
     }
 }
 
@@ -391,7 +407,9 @@ impl Voice {
         // Capture side, in its own pipeline, up to an appsink...
         let handoff = gst_app::AppSink::builder().sync(false).build();
         handoff.set_property("async", false);
-        let inp = [src, make("audioconvert")?, make("audioresample")?, mono_caps(), dsp, mute.clone(), handoff.clone().upcast()];
+        let mut inp = vec![src, make("audioconvert")?, make("audioresample")?, mono_caps(), dsp];
+        inp.extend(cfg.dsp.after(tested)?);
+        inp.extend([mute.clone(), handoff.clone().upcast()]);
         mic_pipe.add_many(&inp).map_err(|e| e.to_string())?;
         gst::Element::link_many(&inp).map_err(|e| e.to_string())?;
         // ...and on in the shared pipeline: encoder and the fan-out to the peers.

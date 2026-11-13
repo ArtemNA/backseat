@@ -170,9 +170,48 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     let silence = gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "silence").property("is-live", true).property("samplesperbuffer", 480i32).build().map_err(|e| e.to_string())?;
     let scaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
     let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1_000_000).build().map_err(|e| e.to_string())?;
-    bin.add_many([&silence, &scaps, &mixer]).unwrap();
-    gst::Element::link_many([&silence, &scaps, &mixer]).map_err(|e| e.to_string())?;
-    bin.add_pad(&gst::GhostPad::with_target(&mixer.static_pad("src").unwrap()).unwrap()).unwrap();
+    if std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_SILENCE").is_some() {
+        bin.add(&mixer).unwrap();
+    } else {
+        bin.add_many([&silence, &scaps, &mixer]).unwrap();
+        gst::Element::link_many([&silence, &scaps, &mixer]).map_err(|e| e.to_string())?;
+    }
+    // The mix stays in the inputs' format (F32): left to choose, it took the encoder's S16 and
+    // sent silence (0.2.13, 0.2.14). STREAMER_DEBUG_SYSMIX_ANY_FORMAT: as then.
+    let outcaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
+    let out = if std::env::var_os("STREAMER_DEBUG_SYSMIX_ANY_FORMAT").is_some() {
+        mixer.clone()
+    } else {
+        bin.add(&outcaps).unwrap();
+        mixer.link(&outcaps).map_err(|e| e.to_string())?;
+        outcaps.clone()
+    };
+    bin.add_pad(&gst::GhostPad::with_target(&out.static_pad("src").unwrap()).unwrap()).unwrap();
+    // Tests: STREAMER_DEBUG_SYSMIX_LEVEL logs the mix's level once a second (packets alone
+    // flow with silence too: 0.2.13 passed that check and sent silence).
+    if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
+        let acc = std::sync::Mutex::new((0f64, 0usize));
+        let mixer_dbg = mixer.clone();
+        let pad_rt = |e: &gst::Element| e.current_running_time();
+        eprintln!("host: mixer caps check later");
+        mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            if let Some(c) = pad.current_caps() { let _ = c; }
+            if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                let mut a = acc.lock().unwrap();
+                for c in map.as_slice().chunks_exact(4) {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+                    a.0 += v * v;
+                    a.1 += 1;
+                }
+                if a.1 >= 96_000 {
+                    let db = if a.0 > 0.0 { 10.0 * (a.0 / a.1 as f64).log10() } else { -100.0 };
+                    eprintln!("host: system sound level {db:.0} dB, pts {:?}, running {:?}", info.buffer().and_then(|b| b.pts()), pad_rt(&mixer_dbg));
+                    *a = (0.0, 0);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
     let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
     let add = move |bin: &gst::Bin, app: &crate::audio_apps::AudioApp| -> Result<(), String> {
         let src = mk("wasapi2src")?;
@@ -187,10 +226,44 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
         branch.add_many([&src, &conv, &res, &cf]).unwrap();
         gst::Element::link_many([&src, &conv, &res, &cf]).map_err(|e| e.to_string())?;
         branch.add_pad(&gst::GhostPad::with_target(&cf.static_pad("src").unwrap()).unwrap()).unwrap();
+        if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
+            let (acc, exe, n) = (std::sync::Mutex::new((0f64, 0usize)), app.exe.clone(), std::sync::atomic::AtomicU64::new(0));
+            src.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                let k = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k == 0 {
+                    eprintln!("host: sound of {exe}: first buffer, caps {:?}", pad.current_caps().map(|c| c.to_string()));
+                }
+                if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                    let mut a = acc.lock().unwrap();
+                    for c in map.as_slice().chunks_exact(2) {
+                        let v = i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0;
+                        a.0 += v * v;
+                        a.1 += 1;
+                    }
+                    if k % 100 == 99 {
+                        let db = if a.0 > 0.0 { 10.0 * (a.0 / a.1 as f64).log10() } else { -100.0 };
+                        eprintln!("host: sound of {exe}: buffers {} level {db:.0} dB", k + 1);
+                        *a = (0.0, 0);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         bin.add(&branch).map_err(|e| e.to_string())?;
         let mixer = bin.by_name("sysmix").unwrap();
         let pad = mixer.request_pad_simple("sink_%u").ok_or("mixer pad")?;
         branch.static_pad("src").unwrap().link(&pad).map_err(|e| e.to_string())?;
+        if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
+            let (exe, n) = (app.exe.clone(), std::sync::atomic::AtomicU64::new(0));
+            pad.add_probe(gst::PadProbeType::BUFFER, move |p, info| {
+                let k = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k % 100 == 0 {
+                    let nz = info.buffer().and_then(|b| b.map_readable().ok()).map(|m| m.as_slice().iter().filter(|x| **x != 0).count()).unwrap_or(0);
+                    eprintln!("host: mixer input {exe}: buffer {k}, nonzero bytes {nz}, caps {:?}, pts {:?}", p.current_caps().map(|c| c.to_string()), info.buffer().and_then(|b| b.pts()));
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         branch.sync_state_with_parent().map_err(|e| e.to_string())?;
         Ok(())
     };

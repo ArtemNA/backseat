@@ -56,7 +56,9 @@ impl MicTest {
             let (t, input) = crate::playback::tail("mic test")?;
             (t, Some(input))
         };
+        let after = dsp.after(tone.is_some())?;
         let mut all: Vec<&gst::Element> = vec![&src, &conv, &res, &caps, &proc];
+        all.extend(after.iter());
         all.extend(tail.iter());
         pipeline.add_many(all.iter().copied()).map_err(|e| e.to_string())?;
         gst::Element::link_many(all.iter().copied()).map_err(|e| e.to_string())?;
@@ -66,7 +68,7 @@ impl MicTest {
         let store = Arc::new(AtomicU64::new((-100f64).to_bits()));
         let st = store.clone();
         let acc = std::sync::Mutex::new((0f64, 0usize));
-        proc.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        after.last().unwrap_or(&proc).static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(buf) = info.buffer() {
                 if let Ok(map) = buf.map_readable() {
                     let mut a = acc.lock().unwrap();

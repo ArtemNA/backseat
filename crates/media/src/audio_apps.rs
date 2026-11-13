@@ -137,7 +137,9 @@ pub fn to_capture(apps: &[AudioApp]) -> Vec<AudioApp> {
     let routers = std::env::var_os("STREAMER_DEBUG_CAPTURE_ROUTERS").is_none();
     // Another copy of this app (by its file name) is Backseat too.
     let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase())).unwrap_or_default();
-    let ours = |a: &AudioApp| under(a.pid, me) || (!own.is_empty() && a.exe.eq_ignore_ascii_case(&own)) || a.exe.eq_ignore_ascii_case("backseat.exe");
+    let ours = |a: &AudioApp| under(a.pid, me) || (!own.is_empty() && a.exe.eq_ignore_ascii_case(&own)) || a.exe.eq_ignore_ascii_case("backseat.exe")
+        // Windows' own sound engine: never a program to take sound from.
+        || a.exe.eq_ignore_ascii_case("audiodg.exe");
     let keep: Vec<AudioApp> = apps.iter().filter(|a| !ours(a) && !(routers && is_router(&a.exe))).cloned().collect();
     keep.iter().filter(|a| !keep.iter().any(|b| b.pid != a.pid && under(a.pid, b.pid))).cloned().collect()
 }
