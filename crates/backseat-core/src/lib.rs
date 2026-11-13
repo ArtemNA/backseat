@@ -361,6 +361,20 @@ pub fn sounding_programs() -> Vec<String> {
     vec![]
 }
 
+/// Listens to the chosen microphone for 3 s (the user stays quiet) and returns a steady
+/// whine's frequencies, to cut. The microphone test pauses meanwhile. Blocks.
+pub fn find_whine(app: &App) -> Result<Vec<f32>, String> {
+    let was = mic_test_on(app);
+    let _ = set_mic_test(app, false);
+    let mic = app.voice_settings.lock().unwrap().mic.clone();
+    let tone = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok());
+    let r = media::mictest::find_whine(mic, 3, tone);
+    if was {
+        let _ = set_mic_test(app, true);
+    }
+    r
+}
+
 pub fn mic_test_on(app: &App) -> bool {
     app.mic_test.lock().unwrap().is_some()
 }

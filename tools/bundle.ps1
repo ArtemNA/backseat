@@ -35,7 +35,11 @@ $plugins = @(
   # Data channels of a direct connection (no server).
   'sctp',
   # Voice chat: echo canceller and echo probe, and the mixer of the shared sound output.
-  'webrtcdsp', 'audiomixer'
+  'webrtcdsp', 'audiomixer',
+  # Voice chat: the RNNoise denoiser (a choice in Settings -> Voice).
+  'rsaudiofx',
+  # Voice chat: finding a microphone's whine, and the narrow cuts that remove it.
+  'spectrum', 'audiofx'
 )
 # License folders under share\licenses for the libraries that end up in the folder.
 $licenses = @(

@@ -108,6 +108,8 @@ pub struct SettingsState {
     pub threshold: Entity<gpui_kit::component::slider::SliderState>,
     /// Programs playing sound when the settings opened (to exclude from streams).
     sounding: Vec<String>,
+    /// "Remove the whine" is listening.
+    pub finding_whine: bool,
 }
 
 #[derive(Default)]
@@ -700,7 +702,7 @@ impl Shell {
             (Some("voice"), "mic", devices(true)),
             (Some("voice"), "out", devices(false)),
             (Some("voice"), "mode", rows(&[("", t("voice.mode_va")), ("ptt", t("voice.mode_ptt"))])),
-            (Some("voice"), "noise", rows(&[("off", t("voice.noise_off")), ("low", t("voice.noise_low")), ("", t("voice.noise_moderate")), ("high", t("voice.noise_high")), ("very-high", t("voice.noise_very_high")), ("rnnoise", t("voice.noise_rnnoise"))])),
+            (Some("voice"), "noise", rows(&[("", t("voice.noise_rnnoise")), ("off", t("voice.noise_off")), ("low", t("voice.noise_low")), ("moderate", t("voice.noise_moderate")), ("high", t("voice.noise_high")), ("very-high", t("voice.noise_very_high"))])),
             (Some("voice"), "key", rows(&crate::voice_ui::PTT_KEYS.map(|(k, n)| (k, plain(n))))),
         ];
         let mut prefs = vec![];
@@ -725,7 +727,7 @@ impl Shell {
         let update = self.update.clone().or_else(|| self.dialogs.settings.as_ref().and_then(|s| s.update.clone()));
         let (threshold, sub) = self.threshold_slider(window, cx);
         subs.push(sub);
-        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold, sounding: core::sounding_programs() });
+        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold, sounding: core::sounding_programs(), finding_whine: false });
         self.dialogs.open = Some(Open::Settings);
         eprintln!("settings: opened in {} ms", started.elapsed().as_millis());
         cx.notify();
@@ -767,6 +769,36 @@ impl Shell {
                         }
                         Err(e) => st.status = tf("set.failed", &[("e", &e)]).to_string(),
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// "Remove the whine": 3 s of quiet, then the whine's tones are cut from the microphone.
+    fn find_whine(&mut self, cx: &mut Context<Self>) {
+        if let Some(st) = self.dialogs.settings.as_mut() {
+            st.finding_whine = true;
+            st.status.clear();
+        }
+        let core = self.core.clone();
+        let task = cx.background_executor().spawn(async move { core::find_whine(&core) });
+        cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
+            let r = task.await;
+            let _ = this.update(cx, |s, cx| {
+                if let Some(st) = s.dialogs.settings.as_mut() {
+                    st.finding_whine = false;
+                    match &r {
+                        Ok(f) if f.is_empty() => st.status = t("voice.whine_none").to_string(),
+                        Ok(_) => {}
+                        Err(e) => st.status = tf("voice.test_failed", &[("e", e)]).to_string(),
+                    }
+                }
+                if let Ok(f) = r {
+                    crate::voice_ui::set_notches(&f);
+                    crate::voice_ui::apply_settings(&s.core);
                 }
                 cx.notify();
             });
@@ -964,6 +996,24 @@ impl Shell {
                             )
                             .child(div().flex_1().min_w_0().child(small(t("voice.test_hint")))),
                     )
+                    .child({
+                        let cuts = crate::voice_ui::notches();
+                        let busy = st.finding_whine;
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(Button::new("voice-whine").cursor_pointer().small().loading(busy).label(t(if busy { "voice.whine_listening" } else { "voice.whine" })).on_click(cx.listener(|s, _, _, cx| s.find_whine(cx))))
+                            .when(!cuts.is_empty() && !busy, |d| {
+                                d.child(div().flex_1().min_w_0().text_xs().text_color(rgb(color::MUTED)).child(tf("voice.whine_cut", &[("n", &cuts.len()), ("hz", &cuts.iter().map(|f| format!("{f:.0}")).collect::<Vec<_>>().join(", "))])))
+                                    .child(Button::new("voice-whine-reset").cursor_pointer().small().label(t("voice.whine_reset")).on_click(cx.listener(|s, _, _, cx| {
+                                        crate::voice_ui::set_notches(&[]);
+                                        crate::voice_ui::apply_settings(&s.core);
+                                        cx.notify();
+                                    })))
+                            })
+                            .when(cuts.is_empty() && !busy, |d| d.child(div().flex_1().min_w_0().child(small(t("voice.whine_hint")))))
+                    })
                     .when(!st.status.is_empty(), |d| d.child(div().text_xs().text_color(rgb(0xff8a8f)).child(st.status.clone())))
                     .when(!ptt, |d| d.child(crate::voice_ui::threshold_view(&st.threshold, core::mic_input_db(&self.core))))
                     .when(ptt, |d| d.children(crate::voice_ui::level_meter(core::mic_input_db(&self.core))));

@@ -46,15 +46,25 @@ pub fn saved() -> core::VoiceSettings {
         dsp: media::voice::DspConfig {
             echo_cancel: flag("voiceEcho"),
             // Unset: the usual middle level; "off": none.
+            // Unset: RNNoise (the strongest on whines and hums); "off": none; else the WebRTC level.
             noise: match voice_pref("noise").as_deref() {
-                Some("off") | Some("rnnoise") => None,
-                None => Some("moderate".into()),
+                None | Some("off") | Some("rnnoise") => None,
                 Some(v) => Some(v.to_string()),
             },
             auto_gain: flag("voiceGain"),
-            rnnoise: voice_pref("noise").as_deref() == Some("rnnoise"),
+            rnnoise: matches!(voice_pref("noise").as_deref(), None | Some("rnnoise")),
+            notches: notches(),
         },
     }
+}
+
+/// The whine's frequencies cut from the microphone (Hz), from "Remove the whine".
+pub fn notches() -> Vec<f32> {
+    settings().get("voiceNotches").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect()).unwrap_or_default()
+}
+
+pub fn set_notches(list: &[f32]) {
+    crate::set_setting("voiceNotches", serde_json::Value::Array(list.iter().map(|f| serde_json::json!(f)).collect()));
 }
 
 /// The lowest end of the threshold slider means "off".
