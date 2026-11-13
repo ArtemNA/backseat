@@ -2,6 +2,15 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.15
+
+- Fixed in this release (it was broken in 0.2.13 and 0.2.14): a stream of the whole system's sound sent silence. The programs' sound was taken but lost in the mixer.
+- Windows' own sound engine (audiodg) is never taken into a stream's sound.
+- **RNNoise is the noise suppression by default**: a small neural network, stronger than before on hums, whines and other noise that is not hiss. The previous levels stay a choice in *Settings → Voice*.
+- **Remove the whine** (*Settings → Voice*, next to *Hear yourself*): stay quiet for 3 seconds and a steady whine or hum of your microphone (ground, USB) is found and cut out with narrow filters, also while you speak. A whine made of many tones (multiples of one) is cut whole. *Reset* takes it back.
+- New option: *Cut high frequencies (above 8 kHz)*, for a high whine; speech needs little of that range.
+- The installer is about 2 MB larger (the denoiser and the filters).
+
 ## 0.2.14
 
 - Another copy of Backseat is never taken into a stream's sound nor offered to exclude (it showed up in that list when a second copy ran).
