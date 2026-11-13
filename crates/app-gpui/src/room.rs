@@ -231,7 +231,10 @@ impl Shell {
     /// pickers under it) was hidden behind it. STREAMER_DEBUG_LISTS_UNDER_VIDEO: the old way.
     pub fn sync_videos_hidden(&mut self, cx: &App) {
         let list_open = gpui_kit::component::GlobalState::is_in_deferred_context(cx) && std::env::var_os("STREAMER_DEBUG_LISTS_UNDER_VIDEO").is_none();
-        let hide = self.join_shown() || self.dialog_open() || list_open;
+        // Our own popups too (a member's volume, a room's menu): drawn in the main window,
+        // under the video windows as the lists were.
+        let menu_open = (self.voice_menu.is_some() || self.room_menu.is_some()) && std::env::var_os("STREAMER_DEBUG_LISTS_UNDER_VIDEO").is_none();
+        let hide = self.join_shown() || self.dialog_open() || list_open || menu_open;
         if hide != self.room.videos_hidden {
             self.room.videos_hidden = hide;
             core::videos_hidden(&self.core, hide);

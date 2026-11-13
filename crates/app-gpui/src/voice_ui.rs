@@ -43,6 +43,16 @@ pub fn saved() -> core::VoiceSettings {
         threshold: threshold(),
         // Off unless chosen: the stream's sound stays exactly as without voice chat.
         stream_echo: settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true),
+        dsp: media::voice::DspConfig {
+            echo_cancel: flag("voiceEcho"),
+            // Unset: the usual middle level; "off": none.
+            noise: match voice_pref("noise").as_deref() {
+                Some("off") => None,
+                None => Some("moderate".into()),
+                Some(v) => Some(v.to_string()),
+            },
+            auto_gain: flag("voiceGain"),
+        },
     }
 }
 

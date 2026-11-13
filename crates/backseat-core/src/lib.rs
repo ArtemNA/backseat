@@ -38,6 +38,8 @@ pub struct App {
     /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
     voice_prefs: Mutex<(bool, bool)>,
     voice_settings: Mutex<VoiceSettings>,
+    /// "Hear yourself" in the settings, while on.
+    mic_test: Mutex<Option<media::mictest::MicTest>>,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -178,6 +180,8 @@ pub struct VoiceSettings {
     /// Streams' sound through the shared output, for the echo canceller (~20 ms later).
     /// Takes effect for streams watched from then on.
     pub stream_echo: bool,
+    /// The microphone's processing: echo cancelling, noise suppression, gain.
+    pub dsp: media::voice::DspConfig,
 }
 
 /// Sound above this (dBFS over 100 ms) counts as speaking.
@@ -243,7 +247,11 @@ pub fn join_voice(app: &Arc<App>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
     // Voice, like watching and streaming, happens in one room at a time.
     quiet_background(app);
-    let mut cfg = media::voice::VoiceConfig { mic: app.voice_settings.lock().unwrap().mic.clone(), ..Default::default() };
+    let (mic, dsp) = {
+        let st = app.voice_settings.lock().unwrap();
+        (st.mic.clone(), st.dsp.clone())
+    };
+    let mut cfg = media::voice::VoiceConfig { mic, dsp, ..Default::default() };
     // Tests only: STREAMER_APP_TEST_VOICE=<Hz> sends a tone instead of the microphone and
     // plays nothing.
     if let Some(hz) = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok()) {
@@ -312,9 +320,33 @@ fn apply_voice_prefs(app: &App, mic: bool, deaf: bool) {
     eprintln!("voice: microphone {}, sound {}", if mic || deaf { "off" } else { "on" }, if deaf { "off" } else { "on" });
 }
 
-/// The microphone's level before the threshold (dBFS), while in voice.
+/// The microphone's level before the threshold (dBFS): in voice, or during the microphone
+/// test.
 pub fn mic_input_db(app: &App) -> Option<f64> {
-    voice_session(app).and_then(|s| s.voice()).map(|v| v.input_db())
+    voice_session(app).and_then(|s| s.voice()).map(|v| v.input_db()).or_else(|| app.mic_test.lock().unwrap().as_ref().map(|t| t.level_db()))
+}
+
+/// "Hear yourself": the microphone, processed as in voice, to the speakers. Starts it with the
+/// settings as they are now (again, if on), or stops it. Opens the microphone: off the UI
+/// thread. Tests: STREAMER_APP_TEST_VOICE=<Hz> uses a tone and plays nothing.
+pub fn set_mic_test(app: &App, on: bool) -> Result<(), String> {
+    let old = app.mic_test.lock().unwrap().take();
+    drop(old);
+    if !on {
+        return Ok(());
+    }
+    let (mic, speakers, dsp) = {
+        let st = app.voice_settings.lock().unwrap();
+        (st.mic.clone(), st.speakers.clone(), st.dsp.clone())
+    };
+    let tone = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok());
+    let t = media::mictest::MicTest::start(mic, speakers, &dsp, tone, tone.is_some())?;
+    *app.mic_test.lock().unwrap() = Some(t);
+    Ok(())
+}
+
+pub fn mic_test_on(app: &App) -> bool {
+    app.mic_test.lock().unwrap().is_some()
 }
 
 /// One member's loudness in voice, 0..2 (1: as they send it).
@@ -374,6 +406,12 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
     if old.speakers != new.speakers {
         media::playback::set_device(new.speakers.clone());
     }
+    // The microphone test hears the settings as they are now.
+    if mic_test_on(app) && (old.mic != new.mic || old.speakers != new.speakers || old.dsp != new.dsp) {
+        if let Err(e) = set_mic_test(app, true) {
+            eprintln!("mic test: {e}");
+        }
+    }
     let voice = voice_session(app).and_then(|s| s.voice());
     if let Some(v) = &voice {
         if old.ptt_key != new.ptt_key {
@@ -382,7 +420,7 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
         // The threshold is for voice activity; push-to-talk sends what the key lets through.
         v.set_threshold(new.threshold.filter(|_| new.ptt_key.is_none()));
     }
-    if old.mic != new.mic && voice.is_some() {
+    if (old.mic != new.mic || old.dsp != new.dsp) && voice.is_some() {
         eprintln!("voice: microphone changed, rejoining");
         if let Some(s) = voice_session(app) {
             s.leave_voice();

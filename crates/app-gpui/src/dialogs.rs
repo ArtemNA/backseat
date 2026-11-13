@@ -215,6 +215,10 @@ impl Shell {
 
     pub fn close_dialog(&mut self, cx: &mut Context<Self>) {
         self.dialogs.open = None;
+        // The microphone test lives only while the settings are open.
+        if core::mic_test_on(&self.core) {
+            let _ = core::set_mic_test(&self.core, false);
+        }
         cx.notify();
     }
 
@@ -681,6 +685,7 @@ impl Shell {
             (Some("voice"), "mic", devices(true)),
             (Some("voice"), "out", devices(false)),
             (Some("voice"), "mode", rows(&[("", t("voice.mode_va")), ("ptt", t("voice.mode_ptt"))])),
+            (Some("voice"), "noise", rows(&[("off", t("voice.noise_off")), ("low", t("voice.noise_low")), ("", t("voice.noise_moderate")), ("high", t("voice.noise_high")), ("very-high", t("voice.noise_very_high"))])),
             (Some("voice"), "key", rows(&crate::voice_ui::PTT_KEYS.map(|(k, n)| (k, plain(n))))),
         ];
         let mut prefs = vec![];
@@ -866,6 +871,39 @@ impl Shell {
                     .child(field(tu("voice.mode"), pick(Some("voice"), "mode")))
                     .when(ptt, |d| d.child(field(tu("voice.key"), pick(Some("voice"), "key"))).child(small(t("voice.key_hint"))))
                     .when(!ptt, |d| d.child(crate::voice_ui::threshold_view(&st.threshold, core::mic_input_db(&self.core))))
+                    .child({
+                        let on = core::mic_test_on(&self.core);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                Button::new("voice-test")
+                                    .cursor_pointer()
+                                    .when(on, |b| b.primary())
+                                    .label(t(if on { "voice.test_stop" } else { "voice.test" }))
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        if let Err(e) = core::set_mic_test(&s.core, !on) {
+                                            if let Some(st) = s.dialogs.settings.as_mut() {
+                                                st.status = e;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(small(t("voice.test_hint")))
+                    })
+                    .child(field(tu("voice.noise"), pick(Some("voice"), "noise")))
+                    .child(Checkbox::new("set-voice-echo").cursor_pointer().label(t("voice.echo")).checked(settings().get("voiceEcho").and_then(|v| v.as_bool()) != Some(false)).on_click(cx.listener(|s, v: &bool, _, cx| {
+                        set_setting("voiceEcho", serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    })))
+                    .child(Checkbox::new("set-voice-gain").cursor_pointer().label(t("voice.gain")).checked(settings().get("voiceGain").and_then(|v| v.as_bool()) != Some(false)).on_click(cx.listener(|s, v: &bool, _, cx| {
+                        set_setting("voiceGain", serde_json::Value::Bool(*v));
+                        crate::voice_ui::apply_settings(&s.core);
+                        cx.notify();
+                    })))
                     .child(Checkbox::new("set-voice-sounds").cursor_pointer().label(t("voice.sounds")).checked(sounds).on_click(cx.listener(|s, v: &bool, _, cx| {
                         set_setting("voiceSounds", serde_json::Value::Bool(*v));
                         crate::voice_ui::apply_settings(&s.core);
@@ -991,14 +1029,33 @@ pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
             eprintln!("test: language now {}; tray {show} / {quit}", crate::i18n::current());
         }
         if let Some(tab) = show {
+            let tab_name = tab.clone();
             let tab = match tab.as_str() {
                 "stream" => SetTab::Stream,
                 "watch" => SetTab::Watch,
-                "voice" => SetTab::Voice,
+                "voice" | "voicetest" => SetTab::Voice,
                 "updates" => SetTab::Updates,
                 _ => SetTab::General,
             };
-            let _ = this.update_in(cx, |s, window, cx| s.open_settings(tab, window, cx));
+            let test = tab_name == "voicetest";
+            let _ = this.update_in(cx, |s, window, cx| {
+                s.open_settings(tab, window, cx);
+                // "voicetest": the microphone test on (a tone with STREAMER_APP_TEST_VOICE).
+                if test {
+                    if let Err(e) = core::set_mic_test(&s.core, true) {
+                        eprintln!("test: mic test failed: {e}");
+                    }
+                }
+            });
+            if test {
+                for _ in 0..6 {
+                    ex.timer(Duration::from_millis(500)).await;
+                    let _ = this.update(cx, |s, cx| {
+                        eprintln!("test: mic test level {:?}", core::mic_input_db(&s.core).map(|v| v.round()));
+                        cx.notify();
+                    });
+                }
+            }
         }
         if let Some(g) = golive {
             // 3 s after start, as the webview's driver (gates take pictures by that clock);

@@ -39,11 +39,45 @@ pub struct VoiceConfig {
     pub silent: bool,
     /// The microphone (a device id from `playback::devices(true)`), None for the system's.
     pub mic: Option<String>,
+    /// Echo cancelling, noise suppression and gain control, as the settings say.
+    pub dsp: DspConfig,
 }
 
 impl Default for VoiceConfig {
     fn default() -> Self {
-        Self { ice: IceConfig::default(), kbit: 32, latency_ms: 60, test_tone: None, silent: false, mic: None }
+        Self { ice: IceConfig::default(), kbit: 32, latency_ms: 60, test_tone: None, silent: false, mic: None, dsp: DspConfig::default() }
+    }
+}
+
+/// What the microphone's processing does (Settings -> Voice).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DspConfig {
+    /// Takes what the speakers play out of the microphone.
+    pub echo_cancel: bool,
+    /// Noise suppression level as webrtcdsp names it ("low", "moderate", "high",
+    /// "very-high"); None: off.
+    pub noise: Option<String>,
+    /// Evens out the microphone's loudness.
+    pub auto_gain: bool,
+}
+
+impl Default for DspConfig {
+    fn default() -> Self {
+        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true }
+    }
+}
+
+impl DspConfig {
+    /// Noise and gain on a webrtcdsp (echo cancelling is set by the caller). `tested`: a
+    /// steady test tone, which both would take for noise: off.
+    pub fn apply(&self, dsp: &gst::Element, tested: bool) {
+        let noise = self.noise.as_deref().filter(|_| !tested);
+        dsp.set_property("noise-suppression", noise.is_some());
+        if let Some(level) = noise {
+            dsp.set_property_from_str("noise-suppression-level", level);
+        }
+        dsp.set_property("gain-control", self.auto_gain && !tested);
+        dsp.set_property("high-pass-filter", true);
     }
 }
 
@@ -343,11 +377,9 @@ impl Voice {
         };
         let dsp = make("webrtcdsp")?;
         dsp.set_property("probe", ECHO_PROBE);
-        dsp.set_property("echo-cancel", std::env::var_os("STREAMER_DEBUG_VOICE_NO_AEC").is_none());
+        dsp.set_property("echo-cancel", cfg.dsp.echo_cancel && std::env::var_os("STREAMER_DEBUG_VOICE_NO_AEC").is_none());
         let tested = cfg.test_tone.is_some() || room;
-        dsp.set_property("noise-suppression", !tested);
-        dsp.set_property("gain-control", !tested);
-        dsp.set_property("high-pass-filter", true);
+        cfg.dsp.apply(&dsp, tested);
         let mute = gst::ElementFactory::make("volume").build().unwrap();
         let opus = make("opusenc")?;
         opus.set_property_from_str("audio-type", "voice");

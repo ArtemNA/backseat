@@ -21,6 +21,7 @@ pub mod stats;
 pub mod thumbs;
 pub mod viewer;
 pub mod voice;
+pub mod mictest;
 
 #[cfg(windows)]
 mod controls;
