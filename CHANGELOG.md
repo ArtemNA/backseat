@@ -2,6 +2,11 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.14
+
+- Another copy of Backseat is never taken into a stream's sound nor offered to exclude (it showed up in that list when a second copy ran).
+- *Settings → Streaming*: the list to add exclusions from is now called "Programs with sound": it shows every program that has sound open, also while it is quiet.
+
 ## 0.2.13
 
 - **Your voice chat no longer gets into your stream through sound software.** With SteelSeries Sonar, GoXLR, Wave Link, Voicemeeter and the like, the voices you hear were played again by that software and went into a stream of the whole system's sound. Now the system's sound is taken one program at a time, leaving out Backseat and such sound routers.
