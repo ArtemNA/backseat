@@ -113,4 +113,6 @@ Section "Uninstall"
   RMDir "$LOCALAPPDATA\${NAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\Classes\backseat"
+  ; The app's own "start with Windows" value.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Backseat"
 SectionEnd

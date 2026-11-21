@@ -11,6 +11,7 @@ mod room;
 mod testing;
 mod voice_ui;
 mod tray;
+mod autostart;
 
 use backseat_core::{self as core, App as Core, Snapshot};
 use gpui_kit::component::button::ButtonVariants as _;
@@ -1110,6 +1111,9 @@ fn main() {
     if settings().get("tray").and_then(|v| v.as_bool()) == Some(false) {
         core.close_to_tray.store(false, Ordering::SeqCst);
     }
+    autostart::sync();
+    // Started with Windows: the window stays hidden; the tray (or a later start) shows it.
+    let hidden = autostart::started_by_windows() && std::env::var_os("STREAMER_DEBUG_AUTOSTART_SHOWN").is_none();
     gpui_kit::application().with_assets(AppAssets).run(move |cx: &mut App| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -1157,6 +1161,8 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(800.)), cx)),
             titlebar: Some(TitlebarOptions { title: Some("Backseat".into()), ..Default::default() }),
+            show: !hidden,
+            focus: !hidden,
             ..Default::default()
         };
         let c = core.clone();
@@ -1213,6 +1219,10 @@ fn main() {
             Ok(()) => eprintln!("tray: ready"),
             Err(e) => eprintln!("tray: {e}"),
         }
-        cx.activate(true);
+        if hidden {
+            eprintln!("window: started with Windows, hidden in the tray");
+        } else {
+            cx.activate(true);
+        }
     });
 }

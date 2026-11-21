@@ -878,6 +878,11 @@ impl Shell {
                     s.set_tray(*v);
                     cx.notify();
                 })))
+                .child(Checkbox::new("set-autostart").cursor_pointer().label(t("set.autostart")).checked(crate::autostart::wanted()).on_click(cx.listener(|_, v: &bool, _, cx| {
+                    set_setting("autostart", serde_json::Value::Bool(*v));
+                    crate::autostart::sync();
+                    cx.notify();
+                })))
                 .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").cursor_pointer().label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
                     if let Err(e) = core::open_logs() {
                         s.error = Some(e);

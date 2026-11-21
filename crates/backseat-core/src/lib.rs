@@ -1432,6 +1432,10 @@ pub fn start(on_message: impl Fn(&Arc<App>, String) + Send + Sync + 'static) -> 
             None => {
                 // Another start holds the pipe: hand it this one's link and leave. Even if it
                 // does not answer in time, leave: a second app would join the room twice.
+                // Started with Windows while the app already runs: nothing to show, just leave.
+                if std::env::args().skip(1).any(|a| a.eq_ignore_ascii_case("--autostart")) {
+                    return None;
+                }
                 if media::instance::send_to_running(&link_arg().unwrap_or_else(|| "show".into())) {
                     return None;
                 }
