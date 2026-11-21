@@ -2,6 +2,11 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.18
+
+- Closing the window you stream now ends the stream, and you are told why. Before, viewers kept its last frame, and changing the source afterwards showed them nothing.
+- Changing the source of a running stream can no longer freeze the app: a window that does not stop or start capturing in time is left behind, and a source that cannot start keeps the old one live and shows why.
+
 ## 0.2.17
 
 - **See what you stream:** while you are live, a small preview of your stream sits next to the viewer count. It runs only while the Backseat window is in front (behind a game it costs nothing), also before anyone watches.
