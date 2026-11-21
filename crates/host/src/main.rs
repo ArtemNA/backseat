@@ -214,6 +214,41 @@ fn main() {
             }
         });
     }
+    // Test only: STREAMER_DEBUG_PREVIEW="ON OFF" turns the streamer's own small picture on
+    // after ON seconds and off after OFF, printing each second how many frames came, their
+    // size and mean brightness, as the app's window does while it is in front.
+    if let Ok(v) = std::env::var("STREAMER_DEBUG_PREVIEW") {
+        let p: Vec<u64> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let (on, off) = (p.first().copied().unwrap_or(3), p.get(1).copied().unwrap_or(u64::MAX));
+        let h = host.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut state = false;
+            let (mut n, mut last) = (0u32, String::from("-"));
+            let mut sec = 0;
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let s = t0.elapsed().as_secs();
+                let want = s >= on && s < off;
+                if want != state {
+                    state = want;
+                    if let Err(e) = h.set_preview(want) {
+                        println!("preview failed: {e}");
+                    }
+                }
+                if let Some((w, hh, px)) = h.preview_frame() {
+                    n += 1;
+                    let mean = px.as_chunks::<4>().0.iter().map(|c| (c[0] as u64 + c[1] as u64 + c[2] as u64) / 3).sum::<u64>() / (w as u64 * hh as u64).max(1);
+                    last = format!("{w}x{hh} mean {mean}");
+                }
+                if s > sec {
+                    println!("preview t={sec} frames {n} {last}");
+                    sec = s;
+                    n = 0;
+                }
+            }
+        });
+    }
     let started = Instant::now();
     let s = &host.stats;
     let load = || {

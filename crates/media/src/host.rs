@@ -46,7 +46,21 @@ pub struct Host {
     /// Lock order: `viewers`, then `layers`. Streaming threads take neither.
     viewers: Mutex<HashMap<u64, Branch>>,
     layers: Mutex<HashMap<Quality, Layer>>,
+    /// The streamer's own small picture (`set_preview`), made on first use.
+    preview: Mutex<Option<Preview>>,
 }
+
+/// A small copy of what is captured, for the streamer to see what goes out. Its input is
+/// dropped while it is off, so it costs nothing then.
+struct Preview {
+    sink: gst_app::AppSink,
+    on: Arc<AtomicBool>,
+}
+
+/// The preview's size (the picture keeps its shape inside, with black bars) and rate.
+pub const PREVIEW_W: u32 = 320;
+pub const PREVIEW_H: u32 = 180;
+const PREVIEW_FPS: u32 = 5;
 
 /// One encoder at one quality, fed from the shared capture.
 struct Layer {
@@ -120,7 +134,20 @@ struct Branch {
     unlinked: Vec<(gst::Pad, gst::Pad)>,
 }
 
+/// The capture as a pipeline description. The caps end in a named capsfilter, not bare caps:
+/// a description that ends in caps parses inside the whole pipeline (`Host::new`) but not as
+/// a bin on its own (`swap_video_source`: "no element D3D11Memory", so a running stream could
+/// not change to another window or monitor, nor change its frame rate).
+/// STREAMER_DEBUG_SOURCE_BARE_CAPS: the old description, the spoiled variant.
 fn video_source(cfg: &HostConfig) -> String {
+    let desc = video_source_desc(cfg);
+    if std::env::var_os("STREAMER_DEBUG_SOURCE_BARE_CAPS").is_some() {
+        return desc.replace("capsfilter caps=\"", "").replace("/1\"", "/1");
+    }
+    desc
+}
+
+fn video_source_desc(cfg: &HostConfig) -> String {
     // Test only: STREAMER_DEBUG_SOURCE replaces the capture with any pipeline description
     // that ends in D3D11 memory (e.g. a raw clip from disk played in real time).
     if let Ok(desc) = std::env::var("STREAMER_DEBUG_SOURCE") {
@@ -130,18 +157,18 @@ fn video_source(cfg: &HostConfig) -> String {
     match cfg.source {
         Source::Capture { monitor } => format!(
             "d3d11screencapturesrc capture-api=dxgi show-cursor=true monitor-index={monitor} ! \
-             video/x-raw(memory:D3D11Memory),framerate={}/1",
+             capsfilter caps=\"video/x-raw(memory:D3D11Memory),framerate={}/1\"",
             m.fps
         ),
         // The frame rate must be set: WGC and DXGI otherwise negotiate 30 (stage 6 probe A).
         Source::Monitor { handle } => format!(
             "d3d11screencapturesrc capture-api=dxgi show-cursor=true monitor-handle={handle} ! \
-             video/x-raw(memory:D3D11Memory),framerate={}/1",
+             capsfilter caps=\"video/x-raw(memory:D3D11Memory),framerate={}/1\"",
             m.fps
         ),
         Source::Window { hwnd } => format!(
             "d3d11screencapturesrc capture-api=wgc show-cursor=true window-handle={hwnd} ! \
-             video/x-raw(memory:D3D11Memory),framerate={}/1",
+             capsfilter caps=\"video/x-raw(memory:D3D11Memory),framerate={}/1\"",
             m.fps
         ),
         Source::Bars => format!(
@@ -410,6 +437,7 @@ impl Host {
             source_changed: AtomicBool::new(false),
             viewers: Mutex::default(),
             layers: Mutex::default(),
+            preview: Mutex::default(),
         })
     }
 
@@ -506,6 +534,85 @@ impl Host {
         new.static_pad("src").ok_or("no sound output")?.link(&next).map_err(|e| format!("sound: {e}"))?;
         new.sync_state_with_parent().map_err(|e| format!("sound: {e}"))?;
         Ok(())
+    }
+
+    /// Turns the streamer's own small picture on or off. Off, its frames are dropped at the
+    /// capture tee and nothing downstream runs.
+    pub fn set_preview(&self, on: bool) -> Result<(), String> {
+        // Before the first viewer nothing runs: the preview starts the capture (no encoder:
+        // layers come with viewers) and stops it again when it turns off, if still nobody
+        // came. Once a viewer started it, the capture stays as before.
+        // Lock order: `viewers`, then `layers`, then `preview`.
+        let viewers = self.viewers.lock().unwrap();
+        let idle = viewers.is_empty() && self.layers.lock().unwrap().is_empty();
+        let mut p = self.preview.lock().unwrap();
+        let r = self.switch_preview(&mut p, on);
+        if idle && std::env::var_os("STREAMER_DEBUG_PREVIEW_NO_CAPTURE").is_none() {
+            let target = if on && r.is_ok() { gst::State::Playing } else { gst::State::Null };
+            if self.pipeline.current_state() != target && self.pipeline.pending_state() != target {
+                eprintln!("host: capture {} for the preview", if target == gst::State::Playing { "started" } else { "stopped" });
+                self.pipeline.set_state(target).map_err(|e| format!("preview capture: {e}"))?;
+            }
+        }
+        drop(viewers);
+        r
+    }
+
+    fn switch_preview(&self, p: &mut Option<Preview>, on: bool) -> Result<(), String> {
+        if p.is_none() {
+            if !on {
+                return Ok(());
+            }
+            *p = Some(self.make_preview()?);
+        }
+        let p = p.as_ref().unwrap();
+        // STREAMER_DEBUG_PREVIEW_STUCK: it never turns on (the spoiled variant).
+        let on = on && std::env::var_os("STREAMER_DEBUG_PREVIEW_STUCK").is_none();
+        if p.on.swap(on, Ordering::SeqCst) != on {
+            eprintln!("host: preview {}", if on { "on" } else { "off" });
+        }
+        Ok(())
+    }
+
+    /// The latest small picture since the last call: width, height and BGRA rows.
+    pub fn preview_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let p = self.preview.lock().unwrap();
+        let p = p.as_ref().filter(|p| p.on.load(Ordering::Relaxed))?;
+        let sample = p.sink.try_pull_sample(gst::ClockTime::ZERO)?;
+        let s = sample.caps()?.structure(0)?;
+        let (w, h) = (s.get::<i32>("width").ok()? as usize, s.get::<i32>("height").ok()? as usize);
+        let map = sample.buffer()?.map_readable().ok()?;
+        let stride = map.len().checked_div(h).unwrap_or(0);
+        if w == 0 || stride < w * 4 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(w * h * 4);
+        for row in map.chunks_exact(stride).take(h) {
+            out.extend_from_slice(&row[..w * 4]);
+        }
+        Some((w as u32, h as u32, out))
+    }
+
+    fn make_preview(&self) -> Result<Preview, String> {
+        let desc = format!(
+            "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
+             videorate drop-only=true max-rate={PREVIEW_FPS} ! d3d11convert ! \
+             capsfilter caps=\"video/x-raw(memory:D3D11Memory),format=BGRA,width={PREVIEW_W},height={PREVIEW_H}\" ! \
+             d3d11download ! capsfilter caps=\"video/x-raw,format=BGRA\" ! \
+             appsink name=psink max-buffers=1 drop=true sync=false enable-last-sample=false"
+        );
+        let bin = gst::parse::bin_from_description(&desc, true).map_err(|e| format!("preview: {e}"))?;
+        bin.set_property("name", "preview");
+        let sink = bin.by_name("psink").unwrap().downcast::<gst_app::AppSink>().map_err(|_| "preview: no appsink")?;
+        self.pipeline.add(&bin).map_err(|e| e.to_string())?;
+        let feed = self.pipeline.by_name("srctee").ok_or("no capture tee")?.request_pad_simple("src_%u").ok_or("preview: no tee pad")?;
+        let on = Arc::new(AtomicBool::new(false));
+        let o = on.clone();
+        // Buffers only: caps and other events still pass, so it is ready the moment it turns on.
+        feed.add_probe(gst::PadProbeType::BUFFER, move |_, _| if o.load(Ordering::Relaxed) { gst::PadProbeReturn::Ok } else { gst::PadProbeReturn::Drop });
+        feed.link(&bin.static_pad("sink").unwrap()).map_err(|e| format!("preview: {e}"))?;
+        bin.sync_state_with_parent().map_err(|e| format!("preview: {e}"))?;
+        Ok(Preview { sink, on })
     }
 
     /// The encoded width for a quality: its height times the source's shape, even, at most
@@ -1330,6 +1437,28 @@ pub fn add_ice(webrtc: &gst::Element, payload: &str) {
     if let Some((mline, cand)) = payload.split_once(' ') {
         if let Ok(mline) = mline.parse::<u32>() {
             webrtc.emit_by_name::<()>("add-ice-candidate", &[&mline, &cand.to_string()]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::config::{Codec, IceConfig, VideoMode};
+
+    fn cfg(source: Source) -> HostConfig {
+        HostConfig { mode: VideoMode::parse("1080p60").unwrap(), kbit: 8000, codec: Codec::H264, keyframe_secs: 2, audio: false, audio_pid: None, audio_exclude: vec![], source, ice: IceConfig::default() }
+    }
+
+    /// A running stream changes its window or monitor by building the new capture as a bin
+    /// on its own (`swap_video_source`). Only parsed here: nothing is captured.
+    #[test]
+    fn every_capture_parses_as_a_bin_on_its_own() {
+        crate::init();
+        for s in [Source::Capture { monitor: 0 }, Source::Monitor { handle: 1 }, Source::Window { hwnd: 1 }, Source::Bars, Source::Noise] {
+            let desc = video_source(&cfg(s.clone()));
+            let bin = gst::parse::bin_from_description(&desc, true);
+            assert!(bin.is_ok(), "{s:?}: {desc}: {:?}", bin.err());
         }
     }
 }

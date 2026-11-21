@@ -1274,6 +1274,23 @@ pub fn update_live(app: &App, req: GoLive) -> Result<(), String> {
     h.reconfigure(cfg).inspect_err(|e| eprintln!("update_live failed: {e}"))
 }
 
+/// The streamer's own small picture: on while the window is in front, off otherwise.
+/// Not live: nothing to do.
+pub fn set_preview(app: &App, on: bool) {
+    let s = app.session.lock().unwrap().clone();
+    if let Some(h) = s.and_then(|s| s.host()) {
+        if let Err(e) = h.set_preview(on) {
+            eprintln!("preview: {e}");
+        }
+    }
+}
+
+/// The latest small picture of our own stream since the last call (width, height, BGRA).
+pub fn preview_frame(app: &App) -> Option<(u32, u32, Vec<u8>)> {
+    let s = app.session.lock().unwrap().clone()?;
+    s.host()?.preview_frame()
+}
+
 pub fn end_live(app: &App) {
     let s = app.session.lock().unwrap().clone();
     if let Some(s) = s {

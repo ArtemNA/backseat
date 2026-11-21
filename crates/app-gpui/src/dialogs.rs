@@ -619,10 +619,12 @@ impl Shell {
                                 .child(div().flex().items_center().gap_3().child(small(t("up.limit"))).child(div().w(px(120.)).rounded_md().bg(rgb(color::RAIL)).child(Input::new(&g.limit).small())))
                                 .child(small(t("up.limit_hint")))
                                 .when(over, |d| d.child(banner(tf("up.over", &[("need", &num(need)), ("limit", &num(limit))]), true))),
-                        )
-                        .when_some(g.error.clone(), |d, e| d.child(banner(e, false))),
+                        ),
                 ).vertical_scrollbar(&g.scroll),
             )
+            // Above the buttons, not at the end of the scrolled list: a failed Apply showed
+            // its reason out of sight, so the dialog only seemed not to close.
+            .when_some(g.error.clone(), |d, e| d.child(div().px_6().pb_3().child(banner(e, false))))
             .child(
                 div()
                     .px_6()

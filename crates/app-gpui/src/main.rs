@@ -193,7 +193,8 @@ impl Shell {
         // second, redrawing only on a change.
         cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| loop {
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            let alive = this.update_in(cx, |s, _, cx| {
+            let alive = this.update_in(cx, |s, window, cx| {
+                s.sync_preview(window, cx);
                 // The voice tab's meter moves with the microphone: redrawn while in voice or
                 // while the microphone test runs (outside voice it stood still until the mouse
                 // moved).

@@ -49,6 +49,9 @@ pub struct Room {
     pub videos_hidden: bool,
     /// Tests: what was last written about the layout and our stream.
     pub reported: String,
+    /// Our own stream's small picture, while the window is in front (`sync_preview`).
+    pub preview: Option<std::sync::Arc<RenderImage>>,
+    pub preview_on: bool,
 }
 
 fn mbit(kbit: u32) -> String {
@@ -434,6 +437,45 @@ impl Shell {
             )
     }
 
+    /// Our own stream's small picture: on only while we are live and the window is in front
+    /// (a window behind the game costs nothing), about 5 times a second. Each picture
+    /// replaces the last in the GPU atlas.
+    pub fn sync_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // STREAMER_DEBUG_PREVIEW_ALWAYS: also while the window is behind (the spoiled variant).
+        let front = window.is_window_active() || std::env::var_os("STREAMER_DEBUG_PREVIEW_ALWAYS").is_some();
+        // With no viewer yet the preview starts the capture itself (`Host::set_preview`).
+        let want = self.snap.live.is_some() && front;
+        if want != self.room.preview_on {
+            self.room.preview_on = want;
+            if std::env::var_os("STREAMER_DEBUG_PREVIEW_LOG").is_some() {
+                eprintln!("preview: {}", if want { "on" } else { "off" });
+            }
+            if !want {
+                core::set_preview(&self.core, false);
+                if let Some(old) = self.room.preview.take() {
+                    cx.drop_image(old, Some(window));
+                }
+                cx.notify();
+            }
+        }
+        if !want {
+            return;
+        }
+        // Every time: a stream started again has a new host with its preview off.
+        core::set_preview(&self.core, true);
+        if let Some((w, h, px)) = core::preview_frame(&self.core) {
+            if let Some(buf) = image::RgbaImage::from_raw(w, h, px) {
+                let new = std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+                if let Some(old) = self.room.preview.replace(new) {
+                    cx.drop_image(old, Some(window));
+                } else if std::env::var_os("STREAMER_DEBUG_PREVIEW_LOG").is_some() {
+                    eprintln!("preview: first picture {w}x{h}");
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn live_panel(&self, l: &LiveStats) -> impl IntoElement {
         let active: Vec<_> = l.layers.iter().filter(|x| !x.parked).collect();
         let fps = active.iter().map(|x| x.fps).fold(0.0, f64::max).round();
@@ -459,6 +501,14 @@ impl Shell {
                 div()
                     .flex()
                     .gap_3()
+                    .child(
+                        card().flex_none().p(px(8.)).flex().flex_col().gap_1p5().child(small_text(t("live.preview"))).child(
+                            div().w(px(224.)).h(px(126.)).rounded_md().bg(rgb(0x000000)).overflow_hidden().flex().items_center().justify_center().map(|d| match &self.room.preview {
+                                Some(i) => d.child(img(i.clone()).w_full().h_full().object_fit(ObjectFit::Contain)),
+                                None => d.child(div().px_3().text_xs().text_center().text_color(rgb(color::MUTED)).child(t("live.preview_paused"))),
+                            }),
+                        ),
+                    )
                     .child(tile(t("live.viewers"), l.viewers.len().to_string()))
                     .child(tile(t("live.encoding"), format!("{fps} fps")).child(small_text(tf("live.layers", &[("n", &active.len()), ("list", &if active.is_empty() { "—".to_string() } else { active.iter().map(|x| short_quality(&x.quality)).collect::<Vec<_>>().join(", ") })]))))
                     .child(tile(t("live.upload"), up).child(div().h_2().rounded(px(4.)).bg(rgb(color::RAIL)).child(div().h_2().rounded(px(4.)).w(relative((l.upload_mbit / cap).min(1.0) as f32)).bg(rgb(if wont_fit { 0xf0b232 } else { 0x2f9e6e }))))),
