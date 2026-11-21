@@ -608,7 +608,9 @@ fn add_audio(
     let depay = make("rtpopusdepay")?;
     let decoder = make("opusdec")?;
     decoder.set_property("plc", true);
-    let sink = make(platform::audio_sink())?;
+    // Tests: STREAMER_DEBUG_SILENT_PLAYBACK plays nothing here either (a viewer of its own,
+    // not through the shared output).
+    let sink = make(if std::env::var_os("STREAMER_DEBUG_SILENT_PLAYBACK").is_some() { "fakesink" } else { platform::audio_sink() })?;
     // Mute by zeroing samples before the device, not by the sink's own mute: wasapi2sink's
     // mute acts on the Windows session, which a check through process loopback could not
     // see change. The stream keeps coming, so unmuting is instant and stays in sync.

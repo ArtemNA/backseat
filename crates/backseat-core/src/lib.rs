@@ -837,13 +837,13 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     if app.joined.lock().unwrap().as_deref() == Some(key.as_str()) && app.session.lock().unwrap().is_some() {
         return Ok(());
     }
-    step_away(app);
     // A room kept in the background opens again as it is: no new join.
     let kept = {
         let mut bg = app.background.lock().unwrap();
         bg.iter().position(|(k, _)| *k == key).map(|i| bg.remove(i).1)
     };
     if let Some(s) = kept {
+        step_away(app);
         eprintln!("rooms: back to {room} (kept in the background)");
         set_videos_hidden(&s, false);
         *app.joined.lock().unwrap() = Some(key);
@@ -851,7 +851,14 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         app.sampler.attach(s);
         return Ok(());
     }
+    // STREAMER_DEBUG_STEP_AWAY_FIRST: the open room is left before the join, as before (the
+    // spoiled variant): a refused or unreachable join left the user in no room at all.
+    if std::env::var_os("STREAMER_DEBUG_STEP_AWAY_FIRST").is_some() {
+        step_away(app);
+    }
     let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
+    // Joined: only now the open room steps away (into the background, or closed).
+    step_away(app);
     save_place(&key, s.resume());
     *app.joined.lock().unwrap() = Some(key);
     // Whatever got in meanwhile leaves.
@@ -1471,4 +1478,23 @@ pub fn start(on_message: impl Fn(&Arc<App>, String) + Send + Sync + 'static) -> 
     app.sampler.start();
     automate(&app);
     Some(app)
+}
+
+#[cfg(test)]
+mod switch_tests {
+    /// STREAMER_TEST_SERVER=ws://127.0.0.1:PORT/ws (a running server): in room A, a join to an
+    /// unreachable server fails and A stays the open room, still connected. Skipped without
+    /// it. Spoiled: STREAMER_DEBUG_STEP_AWAY_FIRST.
+    #[test]
+    fn a_failed_join_keeps_the_open_room() {
+        let Ok(url) = std::env::var("STREAMER_TEST_SERVER") else { return };
+        let app = std::sync::Arc::new(super::App::default());
+        super::connect(&app, &url, "keep-a", "Tester", None).expect("join A");
+        assert!(super::connect(&app, "ws://127.0.0.1:9/ws", "keep-b", "Tester", None).is_err());
+        let s = app.session.lock().unwrap().clone().expect("no open room after the failed join");
+        assert_eq!(s.room, "keep-a");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!s.reconnecting(), "room A was closed");
+        super::leave_for_good(&app, std::time::Duration::from_millis(300));
+    }
 }

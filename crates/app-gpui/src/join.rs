@@ -71,6 +71,8 @@ pub struct Join {
     pub copied: Option<&'static str>,
     /// An invite code to put in the code field at the next draw (it needs the window).
     pub pending_code: Option<String>,
+    /// A server to put in the server field at the next draw (an invite's unknown server).
+    pub pending_server: Option<String>,
     /// The page's scroll, so a tall form (the direct texts) scrolls inside the window.
     pub scroll: ScrollHandle,
     /// The language, also on the form (as the webview had it), and its listener.
@@ -213,6 +215,14 @@ fn looks_like_short(v: &str) -> bool {
     v.len() == 8 && v.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Whether an invite's server is one we already use (a built-in server, the settings', or a
+/// saved room's): only then the app goes there by itself. Spoiled:
+/// STREAMER_DEBUG_TRUST_ANY_SERVER.
+pub fn server_known<'a>(server: &str, built_in: bool, ours: impl IntoIterator<Item = &'a str>) -> bool {
+    let same = |a: &str| a.trim().trim_end_matches('/').eq_ignore_ascii_case(server.trim().trim_end_matches('/'));
+    built_in || std::env::var_os("STREAMER_DEBUG_TRUST_ANY_SERVER").is_some() || ours.into_iter().any(same)
+}
+
 pub fn show_short(c: &str) -> String {
     format!("{}-{}", &c[..4.min(c.len())], &c[4.min(c.len())..])
 }
@@ -286,6 +296,7 @@ impl Join {
             direct_open: false,
             copied: None,
             pending_code: None,
+            pending_server: None,
             scroll: ScrollHandle::new(),
             lang,
             _lang_sub,
@@ -933,5 +944,18 @@ mod tests {
         assert_eq!(link, "https://example.org/t/0H4N-1NFB-KRKK-RY8Z-3HVT?title=Fri%20%D0%86%D0%B3%D1%80%D0%B8");
         assert_eq!(parse_title(&link).as_deref(), Some("Fri Ігри"));
         assert!(!temp_over(code) || protocol::temp::ends(code).unwrap() <= protocol::temp::now());
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    #[test]
+    fn only_our_servers_are_joined_without_asking() {
+        let ours = ["wss://a.example/ws", "ws://127.0.0.1:7800/ws"];
+        assert!(super::server_known("wss://a.example/ws", false, ours));
+        assert!(super::server_known("WSS://a.example/ws/", false, ours));
+        assert!(!super::server_known("wss://evil.example/ws", false, ours));
+        assert!(!super::server_known("wss://evil.example/ws", false, []));
+        assert!(super::server_known("wss://evil.example/ws", true, []));
     }
 }

@@ -8,7 +8,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, PeerId, PeerInfo, Resume, ServerMsg, MAX_NAME_LEN, MAX_PAYLOAD_LEN, MAX_ROOM_LEN, MAX_TITLE_LEN};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -35,10 +35,45 @@ impl Default for Config {
     }
 }
 
+/// Bytes a connection may have queued and not yet written. A client that stops reading (or
+/// one that is flooded through it) is cut off at this, instead of the server's memory
+/// growing with the flood.
+pub const MAX_QUEUED_BYTES: usize = 1024 * 1024;
+/// Connections the server holds at once; more are refused.
+pub const MAX_CONNECTIONS: usize = 1000;
+/// Messages a client may send in one second.
+pub const MAX_MSGS_PER_SEC: u32 = 600;
+/// A connection must join a room within this.
+pub const JOIN_WITHIN: Duration = Duration::from_secs(10);
+
+/// What the server writes to one connection: JSON text, counted in bytes while queued.
+#[derive(Clone)]
+struct Outbox {
+    tx: mpsc::UnboundedSender<(String, bool)>,
+    queued: Arc<AtomicUsize>,
+    /// Woken when the queue overflows: the connection is cut off.
+    overflow: Arc<tokio::sync::Notify>,
+}
+
+impl Outbox {
+    fn send(&self, msg: ServerMsg) {
+        // A temporary room ended (or was refused for it): nothing more comes after it.
+        let last = matches!(&msg, ServerMsg::Error { message } if message == protocol::temp::ENDED);
+        let text = msg.to_json();
+        let limit = std::env::var("STREAMER_DEBUG_QUEUE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_QUEUED_BYTES);
+        if self.queued.load(Ordering::SeqCst) + text.len() > limit {
+            self.overflow.notify_one();
+            return;
+        }
+        self.queued.fetch_add(text.len(), Ordering::SeqCst);
+        let _ = self.tx.send((text, last));
+    }
+}
+
 struct Peer {
     info: PeerInfo,
     room: String,
-    tx: mpsc::UnboundedSender<ServerMsg>,
+    tx: Outbox,
     /// Streamers this peer watches.
     watching: HashSet<PeerId>,
     /// Secret for taking this place back (`Join::resume`).
@@ -74,14 +109,14 @@ impl Rooms {
 
     fn send(&self, id: PeerId, msg: ServerMsg) {
         if let Some(p) = self.peers.get(&id) {
-            let _ = p.tx.send(msg);
+            p.tx.send(msg);
         }
     }
 
     fn broadcast(&self, room: &str, except: PeerId, msg: &ServerMsg) {
         for (id, p) in &self.peers {
             if *id != except && p.room == room {
-                let _ = p.tx.send(msg.clone());
+                p.tx.send(msg.clone());
             }
         }
     }
@@ -113,6 +148,8 @@ pub struct Server {
     rooms: Mutex<Rooms>,
     next_id: AtomicU64,
     next_conn: AtomicU64,
+    /// Connections open now.
+    connections: AtomicUsize,
     /// Bytes received from all clients, for checking that no media passes through.
     pub bytes_in: AtomicU64,
 }
@@ -124,7 +161,7 @@ impl Server {
 
     /// Like `new`, also taking temporary rooms signed with `temp`.
     pub fn with_temp(cfg: Config, temp: Option<TempKey>) -> Arc<Self> {
-        Arc::new(Self { cfg, temp, rooms: Mutex::default(), next_id: AtomicU64::new(1), next_conn: AtomicU64::new(1), bytes_in: AtomicU64::new(0) })
+        Arc::new(Self { cfg, temp, rooms: Mutex::default(), next_id: AtomicU64::new(1), next_conn: AtomicU64::new(1), connections: AtomicUsize::new(0), bytes_in: AtomicU64::new(0) })
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -199,7 +236,7 @@ impl Server {
 
     /// Joins `room`, or takes back a kept place with `resume`. Returns the peer id and the
     /// connection number that now holds it.
-    fn join(self: &Arc<Self>, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
+    fn join(self: &Arc<Self>, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: Outbox) -> Result<(PeerId, u64), String> {
         // Counted in characters, not bytes: a Cyrillic letter is two bytes, so a 17-letter
         // Ukrainian name was refused as too long.
         if room.is_empty() || room.chars().count() > MAX_ROOM_LEN || name.is_empty() || name.chars().count() > MAX_NAME_LEN {
@@ -262,7 +299,7 @@ impl Server {
         println!("server: a temporary room ended");
     }
 
-    fn join_checked(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: mpsc::UnboundedSender<ServerMsg>) -> Result<(PeerId, u64), String> {
+    fn join_checked(&self, room: String, name: String, title: Option<String>, resume: Option<Resume>, tx: Outbox) -> Result<(PeerId, u64), String> {
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let mut rooms = self.rooms.lock().unwrap();
         if let Some(r) = resume {
@@ -272,7 +309,7 @@ impl Server {
                 p.tx = tx.clone();
                 p.conn = conn;
                 p.away = false;
-                let _ = tx.send(ServerMsg::Welcome { id: r.id, room, peers: others, title, token: Some(r.token) });
+                tx.send(ServerMsg::Welcome { id: r.id, room, peers: others, title, token: Some(r.token) });
                 return Ok((r.id, conn));
             }
             // Too late or unknown: an ordinary join below, with a new id.
@@ -289,7 +326,7 @@ impl Server {
         }
         let title = rooms.titles.get(&room).cloned();
         let token = new_token(id);
-        let _ = tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members, title, token: Some(token.clone()) });
+        tx.send(ServerMsg::Welcome { id, room: room.clone(), peers: members, title, token: Some(token.clone()) });
         rooms.broadcast(&room, id, &ServerMsg::PeerJoined { peer: info.clone() });
         rooms.peers.insert(id, Peer { info, room, tx, watching: HashSet::new(), token, conn, away: false });
         Ok((id, conn))
@@ -454,26 +491,50 @@ else setTimeout(function(){location.href="backseat://join/{HREF}"},300);
 "#;
 
 async fn upgrade(ws: WebSocketUpgrade, State(server): State<Arc<Server>>) -> axum::response::Response {
-    ws.max_message_size(MAX_PAYLOAD_LEN * 2).on_upgrade(move |socket| session(server, socket))
+    use axum::response::IntoResponse;
+    let max = std::env::var("STREAMER_DEBUG_MAX_CONNECTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_CONNECTIONS);
+    if server.connections.load(Ordering::SeqCst) >= max {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "server is full").into_response();
+    }
+    // A frame's header names its length and the reader reserves that much at once: without
+    // this limit (16 MiB by default) a 14-byte header made the server hold 16 MiB.
+    // STREAMER_DEBUG_ANY_FRAME_SIZE keeps the default (the spoiled variant).
+    let ws = ws.max_message_size(MAX_PAYLOAD_LEN * 2);
+    let ws = if std::env::var_os("STREAMER_DEBUG_ANY_FRAME_SIZE").is_some() { ws } else { ws.max_frame_size(MAX_PAYLOAD_LEN * 2) };
+    ws.on_upgrade(move |socket| session(server, socket))
+}
+
+/// Counts an open connection while it lives.
+struct Open(Arc<Server>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// One client connection: Join first, then messages until close or silence.
 async fn session(server: Arc<Server>, socket: WebSocket) {
+    server.connections.fetch_add(1, Ordering::SeqCst);
+    let _open = Open(server.clone());
     let server = &server;
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (raw, mut rx) = mpsc::unbounded_channel::<(String, bool)>();
+    let tx = Outbox { tx: raw, queued: Arc::new(AtomicUsize::new(0)), overflow: Arc::new(tokio::sync::Notify::new()) };
     let cfg = server.cfg;
 
     // Writer task: queued server messages and periodic pings.
+    let queued = tx.queued.clone();
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(cfg.ping_interval);
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(m) => {
-                        // A temporary room ended (or was refused for it): nothing more comes.
-                        let last = matches!(&m, ServerMsg::Error { message } if message == protocol::temp::ENDED);
-                        if sink.send(Message::Text(m.to_json().into())).await.is_err() || last {
+                    Some((text, last)) => {
+                        let n = text.len();
+                        let sent = sink.send(Message::Text(text.into())).await;
+                        queued.fetch_sub(n, Ordering::SeqCst);
+                        if sent.is_err() || last {
                             break;
                         }
                     }
@@ -493,9 +554,19 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
     // there, since a proxy may answer our pings for a client that is gone.
     let mut heartbeat = false;
     let mut last_text = tokio::time::Instant::now();
+    let opened = tokio::time::Instant::now();
+    // Messages in the current second.
+    let (mut second, mut in_second) = (tokio::time::Instant::now(), 0u32);
+    let overflow = tx.overflow.clone();
     loop {
         // Any frame, including the pong to our ping, proves the client is alive.
-        let next = tokio::time::timeout(cfg.idle_timeout, stream.next()).await;
+        let next = tokio::select! {
+            n = tokio::time::timeout(cfg.idle_timeout, stream.next()) => n,
+            _ = overflow.notified() => {
+                eprintln!("connection {}: too much queued for it, cut off", id.map_or("(not joined)".to_string(), |i| i.to_string()));
+                break;
+            }
+        };
         let frame = match next {
             Ok(Some(Ok(f))) => f,
             _ => break,
@@ -503,11 +574,23 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
         if heartbeat && last_text.elapsed() > cfg.idle_timeout && std::env::var_os("STREAMER_DEBUG_NO_HEARTBEAT").is_none() {
             break;
         }
+        // Pings and pongs keep a connection open, but not one that never joins.
+        if id.is_none() && opened.elapsed() > JOIN_WITHIN {
+            break;
+        }
+        if second.elapsed() >= Duration::from_secs(1) {
+            (second, in_second) = (tokio::time::Instant::now(), 0);
+        }
+        in_second += 1;
+        if in_second > MAX_MSGS_PER_SEC && std::env::var_os("STREAMER_DEBUG_NO_RATE_LIMIT").is_none() {
+            eprintln!("connection {}: more than {MAX_MSGS_PER_SEC} messages a second, cut off", id.map_or("(not joined)".to_string(), |i| i.to_string()));
+            break;
+        }
         let text = match frame {
             Message::Text(t) => t,
             Message::Close(_) => break,
             Message::Binary(_) => {
-                let _ = tx.send(ServerMsg::Error { message: "binary frames are not accepted".into() });
+                tx.send(ServerMsg::Error { message: "binary frames are not accepted".into() });
                 continue;
             }
             _ => continue,
@@ -517,7 +600,7 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
         let msg = match protocol::parse_client(&text) {
             Ok(m) => m,
             Err(e) => {
-                let _ = tx.send(ServerMsg::Error { message: format!("bad message: {e}") });
+                tx.send(ServerMsg::Error { message: format!("bad message: {e}") });
                 continue;
             }
         };
@@ -533,15 +616,15 @@ async fn session(server: Arc<Server>, socket: WebSocket) {
                     conn = c;
                 }
                 Err(e) => {
-                    let _ = tx.send(ServerMsg::Error { message: e });
+                    tx.send(ServerMsg::Error { message: e });
                 }
             },
             (None, _) => {
-                let _ = tx.send(ServerMsg::Error { message: "join first".into() });
+                tx.send(ServerMsg::Error { message: "join first".into() });
             }
             (Some(me), m) => {
                 if let Some(e) = server.handle(me, m) {
-                    let _ = tx.send(ServerMsg::Error { message: e });
+                    tx.send(ServerMsg::Error { message: e });
                 }
             }
         }

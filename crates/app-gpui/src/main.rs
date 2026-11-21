@@ -305,7 +305,9 @@ impl Shell {
         if self.joining || (self.snap.connected && self.current.as_ref().is_some_and(|c| c.same(&r))) {
             return;
         }
-        self.current = Some(r.clone());
+        // A join that fails leaves the open room as it was (the core keeps it until the new
+        // one has joined), so the view goes back to it.
+        let prev = self.current.replace(r.clone());
         self.joining = true;
         self.error = None;
         self.remember(&r);
@@ -318,6 +320,9 @@ impl Shell {
                 s.joining = false;
                 if let Err(e) = result {
                     s.error = Some(s.join_error(&r_room, &e));
+                    if prev.is_some() && s.current.as_ref().is_some_and(|c| c.room == r_room) {
+                        s.current = prev;
+                    }
                 }
                 s.tick(cx);
             });
@@ -345,14 +350,25 @@ impl Shell {
             .or_else(|| self.current.as_ref().map(|c| c.server.clone()))
             .unwrap_or_else(|| self.join.server.read(cx).value().to_string());
         let name = self.current.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| self.join.name.read(cx).value().trim().to_string());
-        if !name.is_empty() {
+        // A server none of our rooms or settings use: the app does not go there by itself (a
+        // web page can open such a link); the form shows the server, the user presses Join.
+        let setting = settings().get("server").and_then(|v| v.as_str()).map(String::from);
+        let known = join::server_known(&server, core::built_in().is_some(), setting.iter().map(String::as_str).chain(self.rooms.iter().map(|r| r.server.as_str())).chain(self.current.iter().map(|c| c.server.as_str())));
+        if !name.is_empty() && known {
             self.open_room(Room { server, room: code, name, title }, cx);
             return;
+        }
+        if !known {
+            eprintln!("link: a server we do not know, asking first");
+            self.join.pending_server = Some(server.clone());
         }
         // First time: ask for a name; the code goes into the form.
         self.join.mode = join::Mode::Code;
         self.join.pending_code = Some(join::fmt_code(&code));
         self.open_join(cx);
+        if !known {
+            self.join.error = Some(i18n::tf("join.other_server", &[("server", &server)]).to_string());
+        }
     }
 
     /// The rail's menu for a room: open it, copy its invite, change my name in it, remove it.
@@ -999,6 +1015,9 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(code) = self.join.pending_code.take() {
             self.join.code.update(cx, |i, cx| i.set_value(code, window, cx));
+        }
+        if let Some(server) = self.join.pending_server.take() {
+            self.join.server.update(cx, |i, cx| i.set_value(server, window, cx));
         }
         self.sync_videos_hidden(cx);
         self.sync_tiles(window, cx);

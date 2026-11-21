@@ -37,15 +37,50 @@ struct Welcomed {
 }
 
 /// Connects and sends `join`; returns the socket and the server's Welcome.
+/// How long the TCP connect may take, and then each read or write of the TLS and WebSocket
+/// handshakes and of the Welcome.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The WebSocket to `url`, with every step bounded: a server that took the TCP connection
+/// and said nothing hung tungstenite::connect for good, and with it every later join.
+/// STREAMER_DEBUG_NO_CONNECT_TIMEOUT: tungstenite::connect as before (the spoiled variant).
+fn open(url: &str) -> Result<Ws, String> {
+    if std::env::var_os("STREAMER_DEBUG_NO_CONNECT_TIMEOUT").is_some() {
+        return tungstenite::connect(url).map(|(ws, _)| ws).map_err(|e| e.to_string());
+    }
+    use std::net::ToSocketAddrs;
+    let uri: tungstenite::http::Uri = url.parse().map_err(|e| format!("bad server address: {e}"))?;
+    let host = uri.host().ok_or("no host in the server address")?.trim_start_matches('[').trim_end_matches(']');
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    let mut last = String::from("no address");
+    for addr in (host, port).to_socket_addrs().map_err(|e| e.to_string())? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
+                s.set_write_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
+                return tungstenite::client_tls(url, s).map(|(ws, _)| ws).map_err(|e| e.to_string());
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
 fn connect(url: &str, join: &ClientMsg) -> Result<(Ws, Welcomed), String> {
-    let (mut ws, _) = tungstenite::connect(url).map_err(|e| format!("cannot reach server {url}: {e}"))?;
+    let mut ws = open(url).map_err(|e| format!("cannot reach server {url}: {e}"))?;
     if let Some(s) = tcp(ws.get_mut()) {
         s.set_nodelay(true).ok();
         // Bounded, so a stalled reconnect cannot hang the thread.
-        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
     }
     ws.send(Message::Text(join.to_json().into())).map_err(|e| e.to_string())?;
+    // A server that keeps talking but never welcomes us is no server either.
+    let until = Instant::now() + HANDSHAKE_TIMEOUT;
     let w = loop {
+        if Instant::now() > until {
+            return Err(format!("no welcome from {url}"));
+        }
         match ws.read().map_err(|e| e.to_string())? {
             Message::Text(t) => match protocol::parse_server(&t)? {
                 ServerMsg::Welcome { id, peers, title, token, .. } => break Welcomed { id, peers, title, token },
@@ -346,5 +381,42 @@ struct PeerOutbox {
 impl Outbox for PeerOutbox {
     fn send(&self, kind: &str, payload: &str) {
         self.client.send(ClientMsg::Signal { to: self.peer, kind: kind.into(), payload: payload.into() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A server that takes the TCP connection and says nothing: the join gives up within the
+    /// handshake timeout (10 s) instead of hanging. Spoiled: STREAMER_DEBUG_NO_CONNECT_TIMEOUT.
+    #[test]
+    fn a_silent_server_does_not_hang_the_join() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let held: Vec<_> = l.incoming().take(1).collect();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            drop(held);
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let join = protocol::ClientMsg::Join { room: "r".into(), name: "n".into(), title: None, resume: None };
+            let _ = tx.send(super::connect(&format!("ws://{addr}/ws"), &join).map(|_| ()));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(15)).expect("the join still hangs after 15 s");
+        assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod wss {
+    /// STREAMER_TEST_WSS=wss://host/ws: the TLS handshake through `open` (no join). Skipped
+    /// without it.
+    #[test]
+    fn opens_a_wss_server() {
+        let Ok(url) = std::env::var("STREAMER_TEST_WSS") else { return };
+        let t = std::time::Instant::now();
+        let mut ws = super::open(&url).expect("wss handshake");
+        eprintln!("wss open in {:?}", t.elapsed());
+        let _ = ws.close(None);
     }
 }
