@@ -522,7 +522,7 @@ impl Voice {
         }
         let on_mic_error: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>> = Arc::default();
         let tell = on_mic_error.clone();
-        crate::drain_bus_with(&mic_pipe, "voice-mic", Some(Box::new(move |e: String| {
+        crate::drain_bus_with(&mic_pipe, "voice-mic", Some(Box::new(move |e: String, _| {
             if let Some(f) = tell.lock().unwrap().as_ref() {
                 f(e);
             }

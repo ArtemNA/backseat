@@ -652,6 +652,7 @@ fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &s
             event_cue(&a, &e, &mut heard);
             match e {
                 Event::WatchEnded { reason, .. } if !own_end(&reason) => a.notify(format!("watch_ended:{reason}")),
+                Event::LiveEnded { .. } => a.notify("live_ended".into()),
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 // Left on purpose (another room opened): no news, and not ours to close.
                 Event::Lost if !is_open_session(&a, &mine) => break,
@@ -928,6 +929,7 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                     ended = true;
                     a.notify(format!("temp_ended:{room}"));
                 }
+                Event::LiveEnded { .. } => a.notify("live_ended".into()),
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 // A room left on purpose (another one opened) ends too. That is no news, and
                 // the open session is the new room's: taking it here left the new room and

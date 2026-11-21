@@ -48,6 +48,32 @@ pub struct Host {
     layers: Mutex<HashMap<Quality, Layer>>,
     /// The streamer's own small picture (`set_preview`), made on first use.
     preview: Mutex<Option<Preview>>,
+    /// The capture failed for good (its window closed).
+    lost: Arc<SourceLost>,
+}
+
+/// The capture failed (its window was closed): the stream cannot go on with it. Told once,
+/// to whoever listens (`Host::on_source_lost`), even if the failure came first.
+type Tell = Box<dyn Fn(String) + Send>;
+
+#[derive(Default)]
+struct SourceLost {
+    reason: Mutex<Option<String>>,
+    tell: Mutex<Option<Tell>>,
+}
+
+impl SourceLost {
+    fn fail(&self, reason: String) {
+        let mut r = self.reason.lock().unwrap();
+        if r.is_some() {
+            return;
+        }
+        *r = Some(reason.clone());
+        drop(r);
+        if let Some(f) = self.tell.lock().unwrap().as_ref() {
+            f(reason);
+        }
+    }
 }
 
 /// A small copy of what is captured, for the streamer to see what goes out. Its input is
@@ -425,7 +451,24 @@ impl Host {
             gst::Element::link_many(&chain).map_err(|e| format!("audio link: {e}"))?;
         }
 
-        crate::drain_bus(&pipeline, "host");
+        debug_source_error(&pipeline);
+        debug_source_stuck(&pipeline);
+        // An error from the capture itself (not an encoder or a viewer's branch) ends it:
+        // WGC says "Capture item was closed" and sends EOS on, so nothing more comes.
+        let lost = Arc::new(SourceLost::default());
+        let (l, weak) = (lost.clone(), pipeline.downgrade());
+        crate::drain_bus_with(
+            &pipeline,
+            "host",
+            Some(Box::new(move |e: String, src: Option<gst::Object>| {
+                let (Some(p), Some(src)) = (weak.upgrade(), src) else { return };
+                let ours = capture_elements(&p).iter().any(|c| src == *c.upcast_ref::<gst::Object>() || src.has_as_ancestor(c));
+                // STREAMER_DEBUG_KEEP_LOST_SOURCE: the stream goes on without it (the spoiled variant).
+                if ours && std::env::var_os("STREAMER_DEBUG_KEEP_LOST_SOURCE").is_none() {
+                    l.fail(e);
+                }
+            })),
+        );
         let ceiling = Quality::new(cfg.mode, cfg.kbit);
         Ok(Self {
             pipeline,
@@ -438,7 +481,22 @@ impl Host {
             viewers: Mutex::default(),
             layers: Mutex::default(),
             preview: Mutex::default(),
+            lost,
         })
+    }
+
+    /// `f` is told, once, when the capture fails for good (its window closed); at once if it
+    /// already did. Called on the pipeline's bus thread.
+    pub fn on_source_lost(&self, f: Box<dyn Fn(String) + Send>) {
+        // Under `reason`'s lock: a failure cannot slip in between the check and the setting.
+        let reason = self.lost.reason.lock().unwrap();
+        match reason.clone() {
+            Some(r) => {
+                drop(reason);
+                f(r)
+            }
+            None => *self.lost.tell.lock().unwrap() = Some(f),
+        }
     }
 
     pub fn cfg(&self) -> HostConfig {
@@ -498,24 +556,58 @@ impl Host {
     }
 
     /// Replaces the capture in front of the capture tee; the layers and viewers stay.
+    /// Neither the old capture's stop nor the new one's start may hold the stream (and the
+    /// app, which waits on the same locks): a window capture (WGC) can hang in either
+    /// (2026-11-21: the app froze for good on the second change of window).
     fn swap_video_source(&self, cfg: &HostConfig) -> Result<(), String> {
+        const START_WAIT: Duration = Duration::from_secs(5);
         let tee = self.pipeline.by_name("srctee").ok_or("no capture tee")?;
         let sink = tee.static_pad("sink").ok_or("no tee sink")?;
-        // Everything upstream of the tee is the old source.
-        let mut old = Vec::new();
-        let mut pad = sink.peer();
-        while let Some(p) = pad {
-            let Some(e) = p.parent_element() else { break };
-            pad = e.sink_pads().first().and_then(|s| s.peer());
-            old.push(e);
-        }
+        let old = capture_elements(&self.pipeline);
         let bin = gst::parse::bin_from_description(&video_source(cfg), true).map_err(|e| format!("new source: {e}"))?;
-        for e in &old {
-            let _ = e.set_state(gst::State::Null);
+        // The new capture starts on its own first (with the pipeline's GPU device), so one
+        // that cannot start leaves the old one running, and one that never answers is left
+        // behind after START_WAIT. A live source sends nothing before it plays.
+        for c in self.pipeline.contexts() {
+            bin.set_context(&c);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b = bin.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(b.set_state(gst::State::Paused));
+        });
+        match rx.recv_timeout(START_WAIT) {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                let _ = bin.set_state(gst::State::Null);
+                return Err("new source: it cannot be captured".into());
+            }
+            Err(_) => {
+                eprintln!("host: the new source did not start in {} s; left behind", START_WAIT.as_secs());
+                return Err("new source: it did not start".into());
+            }
+        }
+        debug_source_stuck_now();
+        // The old one: off the tee and out of the pipeline at once, stopped on its own thread.
+        // STREAMER_DEBUG_SWAP_INLINE_STOP: stopped here first, as before (the spoiled variant).
+        if std::env::var_os("STREAMER_DEBUG_SWAP_INLINE_STOP").is_some() {
+            for e in &old {
+                let _ = e.set_state(gst::State::Null);
+            }
+        }
+        if let Some(peer) = sink.peer() {
+            let _ = peer.unlink(&sink);
         }
         for e in &old {
             let _ = self.pipeline.remove(e);
         }
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            for e in &old {
+                let _ = e.set_state(gst::State::Null);
+            }
+            eprintln!("host: old source stopped in {} ms", t.elapsed().as_millis());
+        });
         self.pipeline.add(&bin).map_err(|e| e.to_string())?;
         bin.static_pad("src").ok_or("new source has no output")?.link(&sink).map_err(|e| format!("new source: {e}"))?;
         bin.sync_state_with_parent().map_err(|e| format!("new source: {e}"))?;
@@ -542,8 +634,14 @@ impl Host {
         // Before the first viewer nothing runs: the preview starts the capture (no encoder:
         // layers come with viewers) and stops it again when it turns off, if still nobody
         // came. Once a viewer started it, the capture stays as before.
-        // Lock order: `viewers`, then `layers`, then `preview`.
-        let viewers = self.viewers.lock().unwrap();
+        // Lock order: `viewers`, then `layers`, then `preview`. Called by the window every
+        // tick: never waits for a change in progress (`reconfigure` holds `viewers`); the
+        // next tick asks again.
+        let viewers = match self.viewers.try_lock() {
+            Ok(v) => v,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         let idle = viewers.is_empty() && self.layers.lock().unwrap().is_empty();
         let mut p = self.preview.lock().unwrap();
         let r = self.switch_preview(&mut p, on);
@@ -1223,6 +1321,62 @@ impl Host {
 /// exactly as when a viewer moves to another encoder.
 /// The captured size of a screen or window source, as far as it is known before capture
 /// starts; None for test sources (they are made at the mode's size).
+/// Test only: STREAMER_DEBUG_SOURCE_ERROR_SECS=N fails the first capture N seconds after its
+/// first frame, as a closed window does ("Capture item was closed": the source posts an
+/// error and sends EOS downstream).
+fn debug_source_error(pipeline: &gst::Pipeline) {
+    let Some(secs) = std::env::var("STREAMER_DEBUG_SOURCE_ERROR_SECS").ok().and_then(|v| v.parse::<f64>().ok()) else { return };
+    let Some(pad) = pipeline.by_name("srctee").and_then(|t| t.static_pad("sink")).and_then(|p| p.peer()) else { return };
+    let first = std::sync::OnceLock::new();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if first.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() < secs {
+            return gst::PadProbeReturn::Ok;
+        }
+        // Handled, not Drop: only then does the push return the probe's flow result.
+        info.data.take();
+        info.flow_res = Err(gst::FlowError::Error);
+        gst::PadProbeReturn::Handled
+    });
+}
+
+/// The capture: every element upstream of the capture tee.
+fn capture_elements(pipeline: &gst::Pipeline) -> Vec<gst::Element> {
+    let mut out = Vec::new();
+    let mut pad = pipeline.by_name("srctee").and_then(|t| t.static_pad("sink")).and_then(|s| s.peer());
+    while let Some(p) = pad {
+        let Some(e) = p.parent_element() else { break };
+        pad = e.sink_pads().first().and_then(|s| s.peer());
+        out.push(e);
+    }
+    out
+}
+
+/// Test only: STREAMER_DEBUG_SOURCE_STUCK makes the first capture's streaming thread hang for
+/// good once a change of source begins, so stopping it never returns (as a window capture
+/// that hung on stop).
+static DEBUG_STUCK: AtomicBool = AtomicBool::new(false);
+
+fn debug_source_stuck(pipeline: &gst::Pipeline) {
+    if std::env::var_os("STREAMER_DEBUG_SOURCE_STUCK").is_none() {
+        return;
+    }
+    let Some(pad) = pipeline.by_name("srctee").and_then(|t| t.static_pad("sink")).and_then(|p| p.peer()) else { return };
+    pad.add_probe(gst::PadProbeType::BUFFER, |_, _| {
+        while DEBUG_STUCK.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Hangs the first capture's streaming thread (STREAMER_DEBUG_SOURCE_STUCK) and waits until
+/// it is caught there.
+fn debug_source_stuck_now() {
+    if std::env::var_os("STREAMER_DEBUG_SOURCE_STUCK").is_some() && !DEBUG_STUCK.swap(true, Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn source_size(source: &Source) -> Option<(i32, i32)> {
     let monitor = |pick: &dyn Fn(&platform::MonitorInfo) -> bool| {
         platform::monitors().into_iter().find(|m| pick(m)).map(|m| (m.width as i32, m.height as i32))

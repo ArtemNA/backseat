@@ -194,23 +194,29 @@ fn main() {
     );
 
     // Test only: STREAMER_DEBUG_RECONFIGURE="SECS MODE KBIT SOURCE" changes the running stream
-    // after SECS seconds (SOURCE: bars, noise or capture), as the app's Change button does.
+    // at SECS seconds from the start (SOURCE: bars, noise or capture), as the app's Change
+    // button does. More changes after ';', each at its own SECS.
     if let Ok(v) = std::env::var("STREAMER_DEBUG_RECONFIGURE") {
-        let p: Vec<String> = v.split_whitespace().map(String::from).collect();
-        let (h, base) = (host.clone(), args.cfg.clone());
+        let steps: Vec<Vec<String>> = v.split(';').map(|s| s.split_whitespace().map(String::from).collect()).filter(|p: &Vec<String>| p.len() >= 3).collect();
+        let (h, base, t0) = (host.clone(), args.cfg.clone(), Instant::now());
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(p[0].parse().unwrap_or(10)));
-            let mut cfg = base;
-            cfg.mode = media::config::VideoMode::parse(&p[1]).expect("mode");
-            cfg.kbit = p[2].parse().expect("kbit");
-            cfg.source = match p.get(3).map(String::as_str) {
-                Some("noise") => media::config::Source::Noise,
-                Some("capture") => media::config::Source::Capture { monitor: 0 },
-                _ => media::config::Source::Bars,
-            };
-            match h.reconfigure(cfg) {
-                Ok(()) => println!("host: reconfigured to {} {} {}", p[1], p[2], p.get(3).map(String::as_str).unwrap_or("bars")),
-                Err(e) => println!("host: reconfigure failed: {e}"),
+            for p in steps {
+                let at = Duration::from_secs_f64(p[0].parse().unwrap_or(10.0));
+                std::thread::sleep(at.saturating_sub(t0.elapsed()));
+                let mut cfg = base.clone();
+                cfg.mode = media::config::VideoMode::parse(&p[1]).expect("mode");
+                cfg.kbit = p[2].parse().expect("kbit");
+                cfg.source = match p.get(3).map(String::as_str) {
+                    Some("noise") => media::config::Source::Noise,
+                    Some("capture") => media::config::Source::Capture { monitor: 0 },
+                    Some(w) if w.starts_with("window:") => media::config::Source::Window { hwnd: w[7..].parse().expect("hwnd") },
+                    _ => media::config::Source::Bars,
+                };
+                let started = Instant::now();
+                match h.reconfigure(cfg) {
+                    Ok(()) => println!("host: reconfigured to {} {} {} in {} ms", p[1], p[2], p.get(3).map(String::as_str).unwrap_or("bars"), started.elapsed().as_millis()),
+                    Err(e) => println!("host: reconfigure failed: {e}"),
+                }
             }
         });
     }

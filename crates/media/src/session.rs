@@ -34,6 +34,8 @@ pub enum Event {
     ViewerLeft { viewer: PeerId, took_ms: u64 },
     /// A watched stream ended: the streamer stopped or left, or our window was closed.
     WatchEnded { streamer: PeerId, reason: String },
+    /// Our stream stopped by itself: its capture failed for good (the window was closed).
+    LiveEnded { reason: String },
     /// The connection to the signaling server is gone.
     Lost,
     /// A recoverable problem worth showing.
@@ -281,7 +283,9 @@ impl Session {
     }
 
     /// Starts streaming with `cfg`. The encoder only runs while someone watches.
-    pub fn start_streaming(&self, cfg: HostConfig) -> Result<Arc<Host>, String> {
+    /// A capture that fails for good (its window closed) ends the stream as Stop does, and
+    /// `Event::LiveEnded` says why; the viewers would otherwise keep its last frame.
+    pub fn start_streaming(self: &Arc<Self>, cfg: HostConfig) -> Result<Arc<Host>, String> {
         let host = Arc::new(Host::new(cfg)?);
         {
             let mut st = self.state.lock().unwrap();
@@ -292,6 +296,21 @@ impl Session {
         }
         self.client.send(ClientMsg::SetStreaming { streaming: true });
         self.set_streaming_flag(true);
+        let (s, h) = (Arc::downgrade(self), Arc::downgrade(&host));
+        host.on_source_lost(Box::new(move |reason| {
+            let (s, h) = (s.clone(), h.clone());
+            // Off the bus thread: stopping waits for the pipeline.
+            std::thread::spawn(move || {
+                let (Some(s), Some(h)) = (s.upgrade(), h.upgrade()) else { return };
+                // Only the stream it belongs to (not a newer one started since).
+                if !s.host().is_some_and(|cur| Arc::ptr_eq(&cur, &h)) {
+                    return;
+                }
+                eprintln!("host: source lost ({reason}): the stream ends");
+                s.stop_streaming();
+                let _ = s.events.send(Event::LiveEnded { reason });
+            });
+        }));
         Ok(host)
     }
 

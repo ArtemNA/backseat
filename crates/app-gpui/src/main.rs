@@ -243,6 +243,7 @@ impl Shell {
             self.error = Some(match kind {
                 "direct_ended" => t("notice.direct_ended").to_string(),
                 "lost" => t("notice.lost").to_string(),
+                "live_ended" => t("notice.live_ended").to_string(),
                 "temp_ended" => {
                     // It is gone for good: off the rail too.
                     self.ended.push(rest.to_string());

@@ -79,8 +79,10 @@ pub(crate) fn drain_bus(pipeline: &gst::Pipeline, label: &'static str) {
     drain_bus_with(pipeline, label, None)
 }
 
-/// As `drain_bus`, and `on_error` is told each error.
-pub(crate) fn drain_bus_with(pipeline: &gst::Pipeline, label: &'static str, on_error: Option<Box<dyn Fn(String) + Send>>) {
+/// As `drain_bus`, and `on_error` is told each error and the object it came from.
+pub(crate) type OnError = Box<dyn Fn(String, Option<gst::Object>) + Send>;
+
+pub(crate) fn drain_bus_with(pipeline: &gst::Pipeline, label: &'static str, on_error: Option<OnError>) {
     use gst::prelude::*;
     let bus = pipeline.bus().expect("pipeline has a bus");
     let weak = pipeline.downgrade();
@@ -100,7 +102,7 @@ pub(crate) fn drain_bus_with(pipeline: &gst::Pipeline, label: &'static str, on_e
                     gst::MessageView::Error(e) => {
                         eprintln!("{label}: error from {:?}: {} ({:?})", e.src().map(|s| s.name()), e.error(), e.debug());
                         if let Some(f) = &on_error {
-                            f(e.error().to_string());
+                            f(e.error().to_string(), e.src().cloned());
                         }
                     }
                     // STREAMER_DEBUG_STATES traces the pipeline's own state changes and the
