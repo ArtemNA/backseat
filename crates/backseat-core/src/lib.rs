@@ -651,7 +651,7 @@ fn install_direct(app: &Arc<App>, control: Arc<media::direct::Control>, name: &s
         while let Ok(e) = events.recv() {
             event_cue(&a, &e, &mut heard);
             match e {
-                Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
+                Event::WatchEnded { reason, .. } if !own_end(&reason) => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) => a.notify(format!("error:{m}")),
                 // Left on purpose (another room opened): no news, and not ours to close.
                 Event::Lost if !is_open_session(&a, &mine) => break,
@@ -923,7 +923,7 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
             event_cue(&a, &e, &mut heard);
             match e {
                 // Leaving the room on purpose ends its watches; that is no news.
-                Event::WatchEnded { reason, .. } if reason != "left the room" => a.notify(format!("watch_ended:{reason}")),
+                Event::WatchEnded { reason, .. } if !own_end(&reason) => a.notify(format!("watch_ended:{reason}")),
                 Event::Error(m) if m == protocol::temp::ENDED => {
                     ended = true;
                     a.notify(format!("temp_ended:{room}"));
@@ -1272,6 +1272,27 @@ pub fn update_live(app: &App, req: GoLive) -> Result<(), String> {
     let h = s.host().ok_or("not live")?;
     let cfg = live_config(&req)?;
     h.reconfigure(cfg).inspect_err(|e| eprintln!("update_live failed: {e}"))
+}
+
+/// A watch we ended ourselves (Stop, closing its window, leaving the room) needs no notice;
+/// "the stream ended: stopped" showed after the viewer's own Stop.
+/// STREAMER_DEBUG_NOTIFY_OWN_STOP: the old way, the spoiled variant.
+fn own_end(reason: &str) -> bool {
+    let own: &[&str] = if std::env::var_os("STREAMER_DEBUG_NOTIFY_OWN_STOP").is_some() { &["left the room"] } else { &["left the room", "stopped", "window closed"] };
+    own.contains(&reason)
+}
+
+#[cfg(test)]
+mod own_end_tests {
+    #[test]
+    fn only_the_streamers_end_is_told() {
+        for r in ["stopped", "window closed", "left the room"] {
+            assert!(super::own_end(r), "{r} was told");
+        }
+        for r in ["the streamer stopped", "the streamer left"] {
+            assert!(!super::own_end(r), "{r} was not told");
+        }
+    }
 }
 
 /// The streamer's own small picture: on while the window is in front, off otherwise.

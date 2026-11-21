@@ -364,6 +364,10 @@ impl Shell {
         let w: WatchStats = self.snap.watches.iter().find(|w| w.streamer == id).cloned().unwrap_or_default();
         let core = self.core.clone();
         let embedded = w.embedded;
+        // Not `!embedded`: before the video window is made (or the first sample) that is false
+        // too, and the "in its own window" line showed at every start.
+        // STREAMER_DEBUG_POPPED_EARLY: the old way, the spoiled variant.
+        let popped = if std::env::var_os("STREAMER_DEBUG_POPPED_EARLY").is_some() { !embedded } else { w.popped };
         let stat = format!("{:.0} fps · {}{}", w.shown_fps, ms(w.latency_ms), if w.quality.is_some() { format!(" · {}", request_label(&w.quality)) } else { String::new() });
         let throttled = w.received_fps > 20.0 && w.shown_fps < w.received_fps * 0.8;
         let placed = self.room.placed.clone();
@@ -412,8 +416,11 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .text_color(rgb(color::MUTED))
+                    .relative()
                     .child(video)
-                    .when(!embedded, |d| d.child(tf("tile.popped", &[("name", &p.name)]))),
+                    // Over the box, centred: as a second child of the row it sat beside the
+                    // full-size video box, pushed to the right edge and cut off.
+                    .when(popped, |d| d.child(div().absolute().inset_0().px_4().flex().items_center().justify_center().text_center().child(tf("tile.popped", &[("name", &p.name)])))),
             )
             .child(
                 div()

@@ -36,6 +36,9 @@ pub struct WatchStats {
     pub badge: bool,
     /// Shown inside the main window (else popped out into its own).
     pub embedded: bool,
+    /// The video window exists and is out on its own. False before the window is made
+    /// (then `embedded` is false too, but nothing is popped out yet).
+    pub popped: bool,
     pub muted: bool,
     /// "AV1 · GPU", "AV1 · CPU (dav1d)", "H265 · GPU"; empty before video arrives.
     pub codec: String,
@@ -116,6 +119,7 @@ impl Sampler {
                     x.fullscreen = st.fullscreen;
                     x.topmost = st.topmost;
                     x.embedded = st.embedded;
+                    x.popped = !st.embedded;
                 }
                 x.muted = w.viewer.muted();
             }
@@ -250,6 +254,7 @@ fn sample(inner: &Mutex<Inner>) {
             overlay: st.overlay,
             badge: st.badge,
             embedded: st.embedded,
+            popped: w.viewer.window.is_some() && !st.embedded,
             muted: w.viewer.muted(),
             codec: w
                 .viewer
