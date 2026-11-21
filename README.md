@@ -53,8 +53,8 @@ good connection) and the picture as sharp as your upload allows.
   (Shift+F3).
 - **Light:** a native window drawn on the graphics card, one process and no browser engine
   inside; it needs nothing else installed.
-- **Stays out of the way:** closing the window keeps Backseat in the tray. It updates
-  itself.
+- **Stays out of the way:** it starts with Windows into the tray (you can turn that off),
+  and closing the window keeps it there. It updates itself.
 - **Direct connection (beta):** two people can connect with no server at all (see below).
 - In **English, Ukrainian and Russian**.
 

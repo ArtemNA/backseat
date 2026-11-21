@@ -2,6 +2,20 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.16
+
+- **Starts with Windows**, hidden in the tray, so friends can find you in voice and rooms. On by default; *Settings → General* turns it off. The uninstaller removes it.
+- Voice comes back by itself after trouble: someone who joined or left voice while your connection to the server was down, a friend whose app crashed and came back, or a connection that broke (another network) no longer leaves two people "in voice" who cannot hear each other.
+- Changing the microphone or its processing (or *Remove the whine*) keeps your voice in its own room; before, it moved to the room you had open and closed the other one.
+- A double click on *Join voice* no longer opens it twice (and leaves some people unheard).
+- The voice threshold listens after the noise suppression and the whine's cuts: a whine they remove no longer keeps your microphone open.
+- Leaving voice in a room you had switched away from closes that room (your place is kept 20 s), instead of leaving you online there.
+- *Hear yourself* stops when the settings close or the window goes to the tray, also during *Remove the whine*.
+- Switching speakers no longer silences the app; speakers that do not open keep the current ones; unplugged speakers no longer stop the app's sound. A lost microphone is shown.
+- A failed join (an ended or wrong invite, a server that does not answer) keeps you in the room you were in.
+- An invite that leads to a server you have not used before opens the join form showing that server, instead of connecting by itself.
+- Connecting to a server that does not answer gives up after 10 s instead of waiting forever.
+
 ## 0.2.15
 
 - Fixed in this release (it was broken in 0.2.13 and 0.2.14): a stream of the whole system's sound sent silence. The programs' sound was taken but lost in the mixer.
