@@ -2,6 +2,13 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.17
+
+- **See what you stream:** while you are live, a small preview of your stream sits next to the viewer count. It runs only while the Backseat window is in front (behind a game it costs nothing), also before anyone watches.
+- Fixed: changing the window, monitor or frame rate of a running stream failed (*Apply* seemed to do nothing and the dialog stayed open). A failed *Apply* now shows why, above the buttons.
+- The "… in its own window" line no longer flashes at the start of watching or after *Stop*, and sits in the middle of the box instead of being cut off at its edge.
+- Your own *Stop* (or closing a popped-out video) no longer says "the stream ended: stopped".
+
 ## 0.2.16
 
 - **Starts with Windows**, hidden in the tray, so friends can find you in voice and rooms. On by default; *Settings → General* turns it off. The uninstaller removes it.
