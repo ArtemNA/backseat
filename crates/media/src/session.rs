@@ -126,6 +126,8 @@ pub struct Session {
     pub title: Option<String>,
     state: Mutex<State>,
     events: mpsc::Sender<Event>,
+    /// Held while joining voice: two joins at once (a double click) opened two voices.
+    voice_join: Mutex<()>,
 }
 
 impl Session {
@@ -144,6 +146,7 @@ impl Session {
     /// and the streamers it watched are told so.
     pub fn join_resuming(url: &str, room: &str, name: &str, title: Option<&str>, resume: Option<Resume>) -> Result<(Arc<Self>, mpsc::Receiver<Event>), String> {
         let (client, rx) = ServerClient::join_resuming(url, room, name, title, resume)?;
+        let resumed = client.resumed;
         if client.resumed {
             eprintln!("session: took back our place {} from an earlier start", client.id);
             client.send(ClientMsg::SetStreaming { streaming: false });
@@ -151,7 +154,14 @@ impl Session {
                 client.send(ClientMsg::Unsubscribe { streamer: p.id });
             }
         }
-        Self::run(client, rx, room, name, false)
+        let (s, events) = Self::run(client, rx, room, name, false)?;
+        // That start may have been in voice: the others drop its connections and its place.
+        if resumed {
+            for id in s.peers().iter().map(|p| p.id).filter(|id| *id != s.id) {
+                s.voice_link(id).send("bye", "");
+            }
+        }
+        Ok((s, events))
     }
 
     /// A session over `client`, with server messages arriving on `rx`.
@@ -168,6 +178,7 @@ impl Session {
             client,
             state: Mutex::new(State { peers: peers.clone(), ..Default::default() }),
             events: tx,
+            voice_join: Mutex::new(()),
         });
         let _ = s.events.send(Event::Peers(peers));
         let weak = Arc::downgrade(&s);
@@ -412,17 +423,23 @@ impl Session {
 
     /// Joins the room's voice chat: everyone else in it connects with us.
     pub fn join_voice(&self, cfg: VoiceConfig) -> Result<Arc<Voice>, String> {
+        // STREAMER_DEBUG_VOICE_JOIN_UNLOCKED: no lock (the spoiled variant for a double join).
+        let _one = if std::env::var_os("STREAMER_DEBUG_VOICE_JOIN_UNLOCKED").is_none() { Some(self.voice_join.lock().unwrap_or_else(|e| e.into_inner())) } else { None };
         if let Some(v) = self.voice() {
             return Ok(v);
         }
         let voice = Voice::new(cfg)?;
+        let events = self.events.clone();
+        voice.on_mic_error(move |e| {
+            let _ = events.send(Event::Error(format!("microphone: {e}")));
+        });
         let (others, members) = {
             let mut st = self.state.lock().unwrap();
             st.voice = Some(voice.clone());
             (st.peers.iter().map(|p| p.id).filter(|id| *id != self.id).collect::<Vec<_>>(), st.voice_members.clone())
         };
         for id in others {
-            self.voice_link(id).send("hi", "");
+            self.voice_link(id).send("hi", crate::voice::JOIN);
         }
         // Those already known to be in voice: the lower id offers (the higher one waits).
         for id in members {
@@ -502,7 +519,18 @@ impl Session {
                 if new {
                     let _ = self.events.send(Event::VoiceMembers(self.voice_members()));
                 }
+                // Not in voice: a "hi" from someone who thinks we are (a "bye" of ours that
+                // was lost) is answered with one.
+                if voice.is_none() && std::env::var_os("STREAMER_DEBUG_VOICE_NO_SYNC").is_none() {
+                    self.voice_link(from).send("bye", "");
+                }
                 if let Some(v) = voice {
+                    // A fresh join from someone we have a connection with: that one is a
+                    // leftover (they crashed, or it broke); start over.
+                    if payload == crate::voice::JOIN && v.has(from) && std::env::var_os("STREAMER_DEBUG_VOICE_NO_SYNC").is_none() {
+                        eprintln!("voice: {from} joined again, starting the connection over");
+                        v.remove_peer(from);
+                    }
                     if !v.has(from) {
                         // Our answer first, so it reaches them before our offer does.
                         self.voice_link(from).send("hi", "");
@@ -619,12 +647,25 @@ impl Session {
                     (peers, gone_watches, gone_viewers)
                 };
                 eprintln!("session: back on the server; {} watches and {} viewers gone meanwhile", gone_watches.len(), gone_viewers.len());
-                let _ = self.events.send(Event::Peers(peers));
+                let _ = self.events.send(Event::Peers(peers.clone()));
                 for id in gone_watches {
                     self.end_watch(id, "the streamer left", false);
                 }
                 for id in gone_viewers {
                     self.drop_viewer(id);
+                }
+                // Voice: who left meanwhile is gone; the others hear "hi" again, so whoever
+                // joined meanwhile (their "hi" to us was lost) connects with us now, and whoever
+                // left voice meanwhile answers "bye".
+                if self.voice().is_some() && std::env::var_os("STREAMER_DEBUG_VOICE_NO_SYNC").is_none() {
+                    let members: Vec<PeerId> = self.voice_members();
+                    let here: Vec<PeerId> = peers.iter().map(|p| p.id).collect();
+                    for id in members.into_iter().filter(|id| !here.contains(id)) {
+                        self.voice_gone(id);
+                    }
+                    for id in here.into_iter().filter(|id| *id != self.id) {
+                        self.voice_link(id).send("hi", "");
+                    }
                 }
             }
         }

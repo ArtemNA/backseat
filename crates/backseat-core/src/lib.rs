@@ -40,6 +40,9 @@ pub struct App {
     voice_settings: Mutex<VoiceSettings>,
     /// "Hear yourself" in the settings, while on.
     mic_test: Mutex<Option<media::mictest::MicTest>>,
+    /// The microphone test was paused for "Remove the whine" and comes back after it, unless
+    /// the settings closed meanwhile (`stop_mic_test`).
+    mic_test_paused: std::sync::atomic::AtomicBool,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -245,8 +248,18 @@ fn cue(app: &App, c: media::sounds::Cue) {
 /// Joins the open room's voice chat. Opens the microphone: run it off the UI thread.
 pub fn join_voice(app: &Arc<App>) -> Result<(), String> {
     let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
-    // Voice, like watching and streaming, happens in one room at a time.
-    quiet_background(app);
+    join_voice_in(app, s)
+}
+
+/// Joins voice in `s`: the open room, or (joining again after a settings change) the room
+/// kept in the background whose voice it was.
+fn join_voice_in(app: &Arc<App>, s: Arc<Session>) -> Result<(), String> {
+    // Voice, like watching and streaming, happens in one room at a time; a room in the
+    // background that joins again is that one room.
+    let open = app.session.lock().unwrap().as_ref().is_some_and(|o| Arc::ptr_eq(o, &s));
+    if open {
+        quiet_background(app);
+    }
     let (mic, dsp) = {
         let st = app.voice_settings.lock().unwrap();
         (st.mic.clone(), st.dsp.clone())
@@ -279,6 +292,18 @@ pub fn leave_voice(app: &App) {
             s.leave_voice();
             cue(app, media::sounds::Cue::VoiceLeft);
             eprintln!("voice: left");
+            // A room kept in the background only for its voice has nothing left to do there:
+            // it closes keeping its place, as one switched away from idle does.
+            if !s.busy() && std::env::var_os("STREAMER_DEBUG_KEEP_IDLE_BACKGROUND").is_none() {
+                let idle = {
+                    let mut bg = app.background.lock().unwrap();
+                    bg.iter().position(|(_, b)| Arc::ptr_eq(b, &s)).map(|i| bg.remove(i))
+                };
+                if let Some((_, b)) = idle {
+                    eprintln!("rooms: {} closed after leaving its voice, place kept", b.room);
+                    b.close_keeping_place();
+                }
+            }
         }
     }
 }
@@ -364,15 +389,32 @@ pub fn sounding_programs() -> Vec<String> {
 /// Listens to the chosen microphone for 3 s (the user stays quiet) and returns a steady
 /// whine's frequencies, to cut. The microphone test pauses meanwhile. Blocks.
 pub fn find_whine(app: &App) -> Result<Vec<f32>, String> {
-    let was = mic_test_on(app);
+    use std::sync::atomic::Ordering;
+    if mic_test_on(app) {
+        app.mic_test_paused.store(true, Ordering::SeqCst);
+    }
     let _ = set_mic_test(app, false);
     let mic = app.voice_settings.lock().unwrap().mic.clone();
     let tone = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok());
     let r = media::mictest::find_whine(mic, 3, tone);
-    if was {
+    // Back on only if nothing stopped it meanwhile (the settings closed: the microphone
+    // stays closed). STREAMER_DEBUG_WHINE_RESUMES_TEST: back on anyway, as before.
+    let resume = app.mic_test_paused.swap(false, Ordering::SeqCst) || (std::env::var_os("STREAMER_DEBUG_WHINE_RESUMES_TEST").is_some());
+    if resume {
         let _ = set_mic_test(app, true);
     }
     r
+}
+
+/// The settings closed (or the window went to the tray): the microphone test stops and does
+/// not come back after a whine search that is still listening.
+pub fn stop_mic_test(app: &App) {
+    use std::sync::atomic::Ordering;
+    let was_paused = app.mic_test_paused.swap(false, Ordering::SeqCst);
+    let _ = set_mic_test(app, false);
+    if was_paused && std::env::var_os("STREAMER_DEBUG_WHINE_RESUMES_TEST").is_some() {
+        app.mic_test_paused.store(true, Ordering::SeqCst);
+    }
 }
 
 pub fn mic_test_on(app: &App) -> bool {
@@ -452,15 +494,19 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
     }
     if (old.mic != new.mic || old.dsp != new.dsp) && voice.is_some() {
         eprintln!("voice: microphone changed, rejoining");
+        // The voice joins again where it was, also in a room kept in the background.
+        // STREAMER_DEBUG_REJOIN_OPEN_ROOM: in the open room (the spoiled variant).
         if let Some(s) = voice_session(app) {
             s.leave_voice();
+            let a = app.clone();
+            let open_room = std::env::var_os("STREAMER_DEBUG_REJOIN_OPEN_ROOM").is_some();
+            std::thread::spawn(move || {
+                let r = if open_room { join_voice(&a) } else { join_voice_in(&a, s) };
+                if let Err(e) = r {
+                    a.notify(format!("error:{e}"));
+                }
+            });
         }
-        let a = app.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = join_voice(&a) {
-                a.notify(format!("error:{e}"));
-            }
-        });
     }
     start_ptt(app);
 }
@@ -1496,5 +1542,69 @@ mod switch_tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(!s.reconnecting(), "room A was closed");
         super::leave_for_good(&app, std::time::Duration::from_millis(300));
+    }
+}
+
+#[cfg(test)]
+mod voice_room_tests {
+    use std::time::Duration;
+
+    fn wait_for(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("{what}: not within 10 s");
+    }
+
+    /// STREAMER_TEST_SERVER (a running server) and STREAMER_APP_TEST_VOICE (a tone, silent):
+    /// in voice in room A, then room B opens (A stays in the background for its voice). A
+    /// settings change that joins voice again does it in A, not in B; leaving voice then
+    /// closes A (nothing left to do there). Skipped without them. Spoiled:
+    /// STREAMER_DEBUG_REJOIN_OPEN_ROOM, STREAMER_DEBUG_KEEP_IDLE_BACKGROUND.
+    #[test]
+    fn voice_stays_in_its_room() {
+        let (Ok(url), Ok(_)) = (std::env::var("STREAMER_TEST_SERVER"), std::env::var("STREAMER_APP_TEST_VOICE")) else { return };
+        media::init();
+        let app = std::sync::Arc::new(super::App::default());
+        super::connect(&app, &url, "vroom-a", "Tester", None).expect("join A");
+        super::join_voice(&app).expect("voice in A");
+        super::connect(&app, &url, "vroom-b", "Tester", None).expect("join B");
+        let in_bg = |room: &str| app.background.lock().unwrap().iter().any(|(_, s)| s.room == room);
+        assert!(in_bg("vroom-a"), "A was not kept in the background for its voice");
+        let mut st = app.voice_settings.lock().unwrap().clone();
+        st.dsp.high_cut = !st.dsp.high_cut;
+        super::set_voice_settings(&app, st);
+        let voice_in = |room: &str| -> bool {
+            let open = app.session.lock().unwrap().clone().filter(|s| s.room == room);
+            let bg = app.background.lock().unwrap().iter().find(|(_, s)| s.room == room).map(|(_, s)| s.clone());
+            open.or(bg).is_some_and(|s| s.voice().is_some())
+        };
+        wait_for("voice back in A", || voice_in("vroom-a"));
+        assert!(!voice_in("vroom-b"), "the voice moved to the open room B");
+        super::leave_voice(&app);
+        assert!(!in_bg("vroom-a"), "A stayed in the background with nothing to do");
+        super::leave_everything(&app, Duration::from_millis(300));
+    }
+
+    /// The microphone test paused by a whine search does not come back once the settings
+    /// closed meanwhile. Needs STREAMER_APP_TEST_VOICE (a tone). Spoiled:
+    /// STREAMER_DEBUG_WHINE_RESUMES_TEST.
+    #[test]
+    fn mic_test_stays_off_after_the_settings_close() {
+        if std::env::var("STREAMER_APP_TEST_VOICE").is_err() {
+            return;
+        }
+        media::init();
+        let app = std::sync::Arc::new(super::App::default());
+        super::set_mic_test(&app, true).expect("mic test");
+        let a = app.clone();
+        let search = std::thread::spawn(move || super::find_whine(&a));
+        std::thread::sleep(Duration::from_millis(1000));
+        super::stop_mic_test(&app);
+        let _ = search.join().unwrap();
+        assert!(!super::mic_test_on(&app), "the microphone test came back after the settings closed");
     }
 }

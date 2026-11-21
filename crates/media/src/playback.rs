@@ -121,6 +121,11 @@ fn sink_for(silent: bool, device: &Option<String>) -> Result<gst::Element, Strin
     if let (Some(d), true) = (device, s.has_property("device")) {
         s.set_property("device", d);
     }
+    // Speakers unplugged: the output goes on without them instead of stopping the whole
+    // shared pipeline (the voice's sending side lives in it too).
+    if s.has_property("continue-on-error") && std::env::var_os("STREAMER_DEBUG_SINK_STOPS_ON_ERROR").is_none() {
+        s.set_property("continue-on-error", true);
+    }
     Ok(s)
 }
 
@@ -256,10 +261,48 @@ impl Playback {
                 return;
             }
         };
+        // The new speakers start first; only once they play does the mixer's output move to
+        // them, between buffers (an idle probe). Stopping the old sink while the mixer still
+        // pushed into it stopped the mixer, and with it every sound of the app; and speakers
+        // that would not open left no sink at all. The new sink takes the old one's name.
+        // STREAMER_DEBUG_SWITCH_OLD_WAY: the old order (the spoiled variant).
+        if std::env::var_os("STREAMER_DEBUG_SWITCH_OLD_WAY").is_some() {
+            let _ = old.set_state(gst::State::Null);
+            before.unlink(&old);
+            let _ = self.pipeline.remove(&old);
+            new.set_property("name", "pout");
+            if self.pipeline.add(&new).is_err() || before.link(&new).is_err() || new.sync_state_with_parent().is_err() {
+                eprintln!("playback: switching the speakers failed");
+            }
+            *cur = id;
+            return;
+        }
+        new.set_property("name", "pout-next");
+        if self.pipeline.add(&new).is_err() {
+            eprintln!("playback: switching the speakers failed");
+            return;
+        }
+        if new.set_state(gst::State::Playing) == Err(gst::StateChangeError) {
+            let _ = new.set_state(gst::State::Null);
+            let _ = self.pipeline.remove(&new);
+            eprintln!("playback: the chosen speakers do not open; staying on the current ones");
+            return;
+        }
+        let Some(out) = before.static_pad("src") else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (o, n) = (old.clone(), new.clone());
+        out.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+            if let (Some(os), Some(ns)) = (o.static_pad("sink"), n.static_pad("sink")) {
+                let _ = pad.unlink(&os);
+                let _ = tx.send(pad.link(&ns).is_ok());
+            }
+            gst::PadProbeReturn::Remove
+        });
+        let linked = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false);
         let _ = old.set_state(gst::State::Null);
-        before.unlink(&old);
         let _ = self.pipeline.remove(&old);
-        if self.pipeline.add(&new).is_err() || before.link(&new).is_err() || new.sync_state_with_parent().is_err() {
+        new.set_property("name", "pout");
+        if !linked {
             eprintln!("playback: switching the speakers failed");
         }
         eprintln!("playback: speakers {}", if id.is_some() { "chosen" } else { "system default" });

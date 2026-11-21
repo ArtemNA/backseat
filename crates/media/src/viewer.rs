@@ -624,6 +624,10 @@ fn add_audio(
     if sink.has_property("low-latency") {
         sink.set_property("low-latency", true);
     }
+    // Speakers unplugged: the stream goes on without its sound instead of stopping.
+    if sink.has_property("continue-on-error") {
+        sink.set_property("continue-on-error", true);
+    }
     if sink.has_property("buffer-time") {
         // Microseconds: a small device buffer, as latency matters more than gap-free audio.
         sink.set_property("buffer-time", 40_000i64);

@@ -215,6 +215,11 @@ struct Peer {
     link: Arc<dyn Outbox>,
 }
 
+/// The "hi" payload of a fresh join into voice: whoever has a connection with the sender
+/// already (a leftover from before a crash, a broken link) starts it over. A plain "hi" (an
+/// answer, or "I am still here") leaves a working connection as it is.
+pub const JOIN: &str = "join";
+
 pub struct Voice {
     /// The process's shared output pipeline: the voice lives inside it (one clock, the
     /// peers' sound straight into its mixer, the echo probe next to the canceller).
@@ -244,6 +249,10 @@ pub struct Voice {
     volumes: Arc<Mutex<HashMap<PeerId, f64>>>,
     /// Voice activity threshold (`Gate`): below it for a while, silence goes out.
     gate: Arc<Gate>,
+    /// This voice itself, for the threads that reconnect a peer.
+    me: Mutex<std::sync::Weak<Voice>>,
+    /// Told when the microphone fails (unplugged, taken away).
+    on_mic_error: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
 }
 
 /// Voice activity: the microphone (after noise suppression) opens above a threshold and
@@ -477,10 +486,13 @@ impl Voice {
         gst::Element::link_many(&send).map_err(|e| e.to_string())?;
         let mic_level = Arc::new(Level::default());
         mic_level.watch(&mute.static_pad("src").unwrap());
-        // The voice activity gate, between the canceller (its noise suppression) and mute.
+        // The voice activity gate, after all the processing (canceller, RNNoise, the whine's
+        // cuts, the high cut) and before mute: it opened on a whine the processing removes.
+        // STREAMER_DEBUG_GATE_BEFORE_PROCESSING: right after the canceller, as before.
         let gate = Arc::new(Gate::default());
         let g = gate.clone();
-        inp[4].static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let gate_at = if std::env::var_os("STREAMER_DEBUG_GATE_BEFORE_PROCESSING").is_some() { 4 } else { inp.len() - 3 };
+        inp[gate_at].static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(gst::PadProbeData::Buffer(ref mut b)) = info.data {
                 let b = b.make_mut();
                 if let Ok(mut m) = b.map_writable() {
@@ -508,8 +520,37 @@ impl Voice {
             }
             return Err(format!("cannot open the microphone: {e}"));
         }
-        crate::drain_bus(&mic_pipe, "voice-mic");
-        Ok(Arc::new(Self { pipeline, mixer, mic_pipe, mic: send.to_vec(), mute, tee, room_stop, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), deafened: Arc::default(), mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate }))
+        let on_mic_error: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>> = Arc::default();
+        let tell = on_mic_error.clone();
+        crate::drain_bus_with(&mic_pipe, "voice-mic", Some(Box::new(move |e: String| {
+            if let Some(f) = tell.lock().unwrap().as_ref() {
+                f(e);
+            }
+        })));
+        let v = Arc::new(Self { pipeline, mixer, mic_pipe, mic: send.to_vec(), mute, tee, room_stop, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), deafened: Arc::default(), mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate, me: Mutex::default(), on_mic_error });
+        *v.me.lock().unwrap() = Arc::downgrade(&v);
+        Ok(v)
+    }
+
+    /// `f` is told the microphone's error (it was unplugged or another program took it).
+    pub fn on_mic_error(&self, f: impl Fn(String) + Send + Sync + 'static) {
+        *self.on_mic_error.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// The connection with `id` failed (ICE failed or never connected): the offering side
+    /// starts it over and asks the other to do the same ("hi" "join"). Once per failure;
+    /// the new connection is watched again.
+    fn reconnect(&self, id: PeerId) {
+        if self.stopped.load(Ordering::SeqCst) || std::env::var_os("STREAMER_DEBUG_VOICE_NO_RECONNECT").is_some() {
+            return;
+        }
+        let Some(link) = self.peers.lock().unwrap().get(&id).map(|p| p.link.clone()) else { return };
+        eprintln!("voice: the connection with {id} failed, starting it over");
+        self.remove_peer(id);
+        link.send("hi", JOIN);
+        if let Err(e) = self.add_peer(id, link, true) {
+            eprintln!("voice: reconnecting with {id}: {e}");
+        }
     }
 
     pub fn has(&self, id: PeerId) -> bool {
@@ -544,7 +585,21 @@ impl Voice {
             });
         }
         crate::ice::configure(&webrtc, &self.cfg.ice);
-        crate::ice::watch(&webrtc, format!("voice {id}"), self.cfg.ice.turn.is_some(), || {});
+        // A failed connection is started over by the offering side (the other one follows its
+        // "hi"), on a thread of its own: not on the element's streaming thread.
+        let me = self.me.lock().unwrap().clone();
+        crate::ice::watch(&webrtc, format!("voice {id}"), self.cfg.ice.turn.is_some(), move || {
+            if !offerer {
+                return;
+            }
+            let me = me.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(v) = me.upgrade() {
+                    v.reconnect(id);
+                }
+            });
+        });
         let l = link.clone();
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();

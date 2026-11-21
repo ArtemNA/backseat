@@ -232,10 +232,9 @@ impl Shell {
 
     pub fn close_dialog(&mut self, cx: &mut Context<Self>) {
         self.dialogs.open = None;
-        // The microphone test lives only while the settings are open.
-        if core::mic_test_on(&self.core) {
-            let _ = core::set_mic_test(&self.core, false);
-        }
+        // The microphone test lives only while the settings are open (also one a whine
+        // search paused and would bring back).
+        core::stop_mic_test(&self.core);
         cx.notify();
     }
 

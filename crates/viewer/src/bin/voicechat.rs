@@ -20,6 +20,7 @@ fn main() {
     let mut stream_echo = false;
     // Voice activity threshold, dBFS.
     let mut threshold = None::<f64>;
+    let mut double = false;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -47,6 +48,12 @@ fn main() {
             i += 1;
             continue;
         }
+        // Joins voice from two threads at once (a double click).
+        if key == "--double-join" {
+            double = true;
+            i += 1;
+            continue;
+        }
         if key == "--silent" {
             cfg.silent = true;
             i += 1;
@@ -64,6 +71,8 @@ fn main() {
             "--watch" => watch = Some(val),
             "--voice-after" => voice_after = val.parse().unwrap_or(0),
             "--threshold" => threshold = val.parse().ok(),
+            // A whine cut at this frequency (as "Remove the whine" sets).
+            "--notch" => cfg.dsp.notches.push(val.parse().unwrap_or(1000.0)),
             "--seconds" => seconds = val.parse().unwrap_or(0),
             "--leave-after" => leave_after = val.parse().unwrap_or(0),
             "--stun" => cfg.ice = IceConfig { stun: (val != "none").then_some(val), turn: None },
@@ -101,6 +110,12 @@ fn main() {
                 }
             }
         }
+    }
+    if double {
+        let (s2, c2) = (session.clone(), cfg.clone());
+        let other = std::thread::spawn(move || s2.join_voice(c2).map(|_| ()));
+        let mine = session.join_voice(cfg.clone()).map(|_| ());
+        println!("voice: double join: {:?} / {:?}", mine, other.join().unwrap());
     }
     let voice = session.join_voice(cfg).unwrap_or_else(|e| {
         eprintln!("cannot join voice: {e}");

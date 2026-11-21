@@ -1196,6 +1196,8 @@ fn main() {
             let close = c.clone();
             window.on_window_should_close(cx, move |_, cx| {
                 if close.close_to_tray.load(Ordering::SeqCst) {
+                    // The window goes, and the microphone test with it.
+                    core::stop_mic_test(&close);
                     hide_main_window();
                     eprintln!("window: hidden in the tray");
                     return false;

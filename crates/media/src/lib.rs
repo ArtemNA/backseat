@@ -76,6 +76,11 @@ fn use_bundled_plugins() {
 /// messages hold references to their source elements, so removed elements were never
 /// freed (stage 3: ~0.6 MB and 2 handles per viewer that left).
 pub(crate) fn drain_bus(pipeline: &gst::Pipeline, label: &'static str) {
+    drain_bus_with(pipeline, label, None)
+}
+
+/// As `drain_bus`, and `on_error` is told each error.
+pub(crate) fn drain_bus_with(pipeline: &gst::Pipeline, label: &'static str, on_error: Option<Box<dyn Fn(String) + Send>>) {
     use gst::prelude::*;
     let bus = pipeline.bus().expect("pipeline has a bus");
     let weak = pipeline.downgrade();
@@ -93,7 +98,10 @@ pub(crate) fn drain_bus(pipeline: &gst::Pipeline, label: &'static str) {
                         }
                     }
                     gst::MessageView::Error(e) => {
-                        eprintln!("{label}: error from {:?}: {} ({:?})", e.src().map(|s| s.name()), e.error(), e.debug())
+                        eprintln!("{label}: error from {:?}: {} ({:?})", e.src().map(|s| s.name()), e.error(), e.debug());
+                        if let Some(f) = &on_error {
+                            f(e.error().to_string());
+                        }
                     }
                     // STREAMER_DEBUG_STATES traces the pipeline's own state changes and the
                     // async (preroll) messages that drive them.
