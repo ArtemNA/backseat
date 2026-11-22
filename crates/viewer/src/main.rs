@@ -177,6 +177,7 @@ fn main() {
             let late = std::env::var_os("STREAMER_DEBUG_QUALITY_LATE").is_some();
             // Probe only: STREAMER_DEBUG_PARENT="HWND X Y W H" puts the video inside another
             // process's window at that slot, as the app's main window holds it.
+            #[cfg(windows)]
             let parent: Vec<i64> = std::env::var("STREAMER_DEBUG_PARENT").unwrap_or_default().split_whitespace().filter_map(|v| v.parse().ok()).collect();
             #[cfg(windows)]
             if parent.len() == 5 {

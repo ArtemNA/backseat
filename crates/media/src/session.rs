@@ -352,9 +352,17 @@ impl Session {
                 return Err(format!("already watching {streamer}"));
             }
         }
-        let r = self.watch_new(streamer, cfg, quality);
-        self.state.lock().unwrap().starting.remove(&streamer);
-        r
+        // Taken off again however watch_new ends, a panic too (else no later watch of them).
+        struct Started<'a>(&'a Session, PeerId);
+        impl Drop for Started<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut st) = self.0.state.lock() {
+                    st.starting.remove(&self.1);
+                }
+            }
+        }
+        let _started = Started(self, streamer);
+        self.watch_new(streamer, cfg, quality)
     }
 
     fn watch_new(self: &Arc<Self>, streamer: PeerId, cfg: ViewerConfig, quality: Option<String>) -> Result<Arc<Watch>, String> {

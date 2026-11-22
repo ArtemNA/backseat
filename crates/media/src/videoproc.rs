@@ -710,7 +710,10 @@ impl Remote {
                 let settled = self.health.lock().unwrap().started.elapsed() > Duration::from_secs(3);
                 // F3 inside this window: every other window follows, as in one process.
                 let (o, b) = (OVERLAY.load(Ordering::SeqCst), BADGE.load(Ordering::SeqCst));
-                if settled && (state.overlay != o || state.badge != b) {
+                // Not from a report made before a command of the last second was carried out:
+                // it would turn that F3 back everywhere (eighth review).
+                let fresh_command = self.last_command.lock().unwrap().elapsed() < Duration::from_secs(1);
+                if settled && !fresh_command && (state.overlay != o || state.badge != b) {
                     let mine = self.state.lock().unwrap().clone();
                     if state.overlay != mine.overlay || state.badge != mine.badge {
                         let (ov, ba) = (state.overlay, state.badge);
@@ -814,6 +817,10 @@ impl Remote {
         }
         let lived = c.started.elapsed();
         eprintln!("video process: ended (pid {pid}, code {}) after {:.1} s; the video starts again", code.map(|c| format!("{:#010x}", c as u32)).unwrap_or("?".into()), lived.as_secs_f64());
+        // Closed by its user or ended meanwhile: no restart, and no such verdict either.
+        if self.ending.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         // A third process in a row without a single picture: the video stops, as for crashes.
         let blank = if self.run_pictured.swap(false, Ordering::SeqCst) {
             self.blank_runs.store(0, Ordering::SeqCst);

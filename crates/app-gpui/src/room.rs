@@ -128,6 +128,8 @@ impl Shell {
         cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
+                // A second click while the first is being set up: nothing went wrong.
+                let result = result.map(|_| ()).or_else(|e| if e.starts_with("already watching") { Ok(()) } else { Err(e) });
                 if let Err(e) = result {
                     s.error = Some(tf("notice.error", &[("msg", &e)]).to_string());
                 }
