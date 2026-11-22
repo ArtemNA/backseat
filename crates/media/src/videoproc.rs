@@ -270,7 +270,11 @@ struct Health {
     /// When it last got a keyframe: only from then on can its decoder be expected to give
     /// pictures (without one it rightly gives none).
     key_sent: Option<Instant>,
-    /// Since when its still window has been excused by a busy app window (parent_busy).
+    /// Since when its still window has been excused by a busy app window (parent_busy); 6 s
+    /// of that plus the 2 s it stood still before and the watchdog's step keep it under 10 s.
+    /// It gave a picture at all: before the first, its decoder may still be in the making
+    /// (a slow first build), and only START_GRACE applies (sixth review).
+    pictured: bool,
     excused_since: Option<Instant>,
     /// The first keyframe sent since its decoder last gave a picture: a decoder that got one
     /// and still gives nothing hangs; one that got none may only lack it (fourth review).
@@ -285,7 +289,7 @@ struct Health {
 impl Health {
     fn new() -> Self {
         let now = Instant::now();
-        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, key_since_picture: None, streak: None, excused_since: None, pid: 0 }
+        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, key_since_picture: None, streak: None, excused_since: None, pictured: false, pid: 0 }
     }
 }
 
@@ -674,6 +678,7 @@ impl Remote {
                     }
                     if frames > 0 {
                         h.decoded = Instant::now();
+                        h.pictured = true;
                         h.key_since_picture = None;
                     }
                 }
@@ -846,7 +851,7 @@ impl Remote {
                             (h.started.elapsed() > START_GRACE).then(|| format!("no report {:.1} s after the start", h.started.elapsed().as_secs_f64()))
                         } else if stood_still {
                             Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
-                        } else if decode_watch && h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.streak.is_some_and(|s| s.elapsed() > DECODE_HANG) || std::env::var_os("STREAMER_DEBUG_VP_NO_STREAK").is_some()) && (h.key_since_picture.is_some_and(|k| k.elapsed() > Duration::from_secs(3)) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) {
+                        } else if decode_watch && (h.pictured || h.started.elapsed() > START_GRACE || std::env::var_os("STREAMER_DEBUG_VP_WATCH_BEFORE_PICTURE").is_some()) && h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.streak.is_some_and(|s| s.elapsed() > DECODE_HANG) || std::env::var_os("STREAMER_DEBUG_VP_NO_STREAK").is_some()) && (h.key_since_picture.is_some_and(|k| k.elapsed() > Duration::from_secs(3)) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) {
                             Some(format!("frames went in, none decoded for {:.1} s", h.decoded.elapsed().as_secs_f64()))
                         } else {
                             None
@@ -869,9 +874,10 @@ impl Remote {
                     // the app's thread is never kept waiting by it (third review 2026-11-22).
                     // Only inside the app's window (a popped-out one has no parent to wait for),
                     // and never past 10 s: the app could as well be waiting for it (fourth review).
-                    let embedded = me.state.lock().unwrap().embedded;
+                    // Fullscreen from inside the app is a window of its own too (sixth review).
+                    let embedded = { let st = me.state.lock().unwrap(); st.embedded && !st.fullscreen };
                     // Counted apart from loops_moved, which the excuse itself sets anew (fifth review).
-                    let long = me.health.lock().unwrap().excused_since.is_some_and(|t| t.elapsed() > Duration::from_secs(8));
+                    let long = me.health.lock().unwrap().excused_since.is_some_and(|t| t.elapsed() > Duration::from_secs(6));
                     if why.is_some() && stood_still && embedded && !long && parent_busy(me.parent) {
                         let mut h = me.health.lock().unwrap();
                         h.loops_moved = Instant::now();
@@ -1133,6 +1139,11 @@ impl ChildVideo {
     fn build(&mut self, caps: &str, decoder: &str) -> Result<(), String> {
         if self.stream.as_ref().is_some_and(|(c, d)| c == caps && d == decoder) {
             return Ok(());
+        }
+        // Tests only: STREAMER_DEBUG_VP_SLOW_BUILD_MS: the decoder takes that long to build (after
+        // the window and its first report), as a busy GPU can make it.
+        if let Some(ms) = std::env::var("STREAMER_DEBUG_VP_SLOW_BUILD_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
         }
         if self.src.is_some() {
             let _ = self.pipeline.set_state(gst::State::Null);
