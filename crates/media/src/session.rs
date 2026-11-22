@@ -103,6 +103,10 @@ struct State {
     /// Our viewers and the outboxes our host answers them through.
     viewers: HashMap<PeerId, Arc<dyn Outbox>>,
     watches: HashMap<PeerId, Arc<Watch>>,
+    /// Watches being set up (their viewer and video process are made outside the lock): a
+    /// second start for the same streamer meanwhile is refused, not made twice (seventh
+    /// review: a double click left a hidden video process behind).
+    starting: std::collections::HashSet<PeerId>,
     /// Our voice chat, while we are in it.
     voice: Option<Arc<Voice>>,
     /// Other members who said they are in voice.
@@ -342,9 +346,18 @@ impl Session {
     /// Starts watching `streamer`, at `quality` if given ("720p30 2000"). The video opens in
     /// its own native window unless `cfg.headless`.
     pub fn watch(self: &Arc<Self>, streamer: PeerId, cfg: ViewerConfig, quality: Option<String>) -> Result<Arc<Watch>, String> {
-        if self.state.lock().unwrap().watches.contains_key(&streamer) {
-            return Err(format!("already watching {streamer}"));
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.watches.contains_key(&streamer) || !st.starting.insert(streamer) {
+                return Err(format!("already watching {streamer}"));
+            }
         }
+        let r = self.watch_new(streamer, cfg, quality);
+        self.state.lock().unwrap().starting.remove(&streamer);
+        r
+    }
+
+    fn watch_new(self: &Arc<Self>, streamer: PeerId, cfg: ViewerConfig, quality: Option<String>) -> Result<Arc<Watch>, String> {
         let link: Arc<dyn Outbox> = Arc::new(Tagged { inner: self.client.to_peer(streamer), tag: TO_STREAMER });
         let clock = HostClock::default();
         let viewer = Arc::new(Viewer::new(cfg, clock.clone(), link.clone())?);

@@ -259,6 +259,8 @@ impl Shell {
                     }
                     t("notice.temp_ended").to_string()
                 }
+                // The video process gave up: said in the app's language, not as a raw reason.
+                "watch_ended" if rest == "the video stopped working" => t("notice.video_failed").to_string(),
                 "watch_ended" => tf("notice.watch_ended", &[("reason", &rest)]).to_string(),
                 _ => tf("notice.error", &[("msg", &rest)]).to_string(),
             });

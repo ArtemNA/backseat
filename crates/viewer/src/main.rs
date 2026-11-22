@@ -178,6 +178,7 @@ fn main() {
             // Probe only: STREAMER_DEBUG_PARENT="HWND X Y W H" puts the video inside another
             // process's window at that slot, as the app's main window holds it.
             let parent: Vec<i64> = std::env::var("STREAMER_DEBUG_PARENT").unwrap_or_default().split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            #[cfg(windows)]
             if parent.len() == 5 {
                 media::present::set_default_parent(parent[0] as isize);
             }
@@ -185,6 +186,7 @@ fn main() {
                 eprintln!("viewer: {e}");
                 std::process::exit(1);
             });
+            #[cfg(windows)]
             if let (5, Some(win)) = (parent.len(), w.viewer.window.clone()) {
                 win.place(Some((parent[1] as i32, parent[2] as i32, parent[3] as i32, parent[4] as i32)));
             }

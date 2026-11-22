@@ -249,6 +249,11 @@ pub struct Remote {
     runs: AtomicU64,
     /// The app's main window the video sits in (0: a window of its own).
     parent: isize,
+    /// This process gave a picture, and how many processes in a row ended without one: a
+    /// decoder that builds but never gives a picture would otherwise be restarted for good,
+    /// each run too long for the crash limit (seventh review).
+    run_pictured: AtomicBool,
+    blank_runs: std::sync::atomic::AtomicU32,
     me: Weak<Remote>,
 }
 
@@ -327,6 +332,8 @@ impl Remote {
             last_command: Mutex::new(Instant::now()),
             runs: AtomicU64::new(0),
             parent,
+            run_pictured: AtomicBool::new(false),
+            blank_runs: std::sync::atomic::AtomicU32::new(0),
             me: me.clone(),
         });
         ALL.lock().unwrap().retain(|w| w.strong_count() > 0);
@@ -447,6 +454,19 @@ impl Remote {
                 ToVideo::Audio { muted, volume } => d.audio = (*muted, *volume),
                 _ => {}
             }
+            // What the app shows of the window follows at once, not a report later (the app
+            // placed nothing for up to a second after putting a video back, seventh review).
+            {
+                let mut st = self.state.lock().unwrap();
+                match &m {
+                    ToVideo::Popped { on } => st.embedded = !*on && d.parent != 0,
+                    ToVideo::Fullscreen { on } => st.fullscreen = *on,
+                    ToVideo::ToggleFullscreen => st.fullscreen = !st.fullscreen,
+                    ToVideo::Overlay { on } => st.overlay = *on,
+                    ToVideo::Badge { on } => st.badge = *on,
+                    _ => {}
+                }
+            }
             // Sent under the same lock as a new process's snapshot is taken and sent: a
             // command is either in that snapshot or comes after it (second review).
             self.send(Out::Json(m));
@@ -540,6 +560,7 @@ impl Remote {
             Err(e) => {
                 eprintln!("video process: cannot start: {e}");
                 self.failed.store(true, Ordering::SeqCst);
+                self.state.lock().unwrap().alive = false;
                 return;
             }
         };
@@ -679,6 +700,7 @@ impl Remote {
                     if frames > 0 {
                         h.decoded = Instant::now();
                         h.pictured = true;
+                        self.run_pictured.store(true, Ordering::SeqCst);
                         h.key_since_picture = None;
                     }
                 }
@@ -708,7 +730,19 @@ impl Remote {
                     d.overlay = state.overlay;
                     d.badge = state.badge;
                 }
-                *self.state.lock().unwrap() = WindowStateMsg { alive: state.alive && !self.ending.load(Ordering::SeqCst), ..state };
+                {
+                    let mut cur = self.state.lock().unwrap();
+                    let mut next = WindowStateMsg { alive: state.alive && !self.ending.load(Ordering::SeqCst), ..state };
+                    // A command of the last second shows already (see command); a report made
+                    // before the process carried it out may not undo that (seventh review).
+                    if self.last_command.lock().unwrap().elapsed() < Duration::from_secs(1) {
+                        next.embedded = cur.embedded;
+                        next.fullscreen = cur.fullscreen;
+                        next.overlay = cur.overlay;
+                        next.badge = cur.badge;
+                    }
+                    *cur = next;
+                }
                 if closed {
                     self.closed.store(true, Ordering::SeqCst);
                 }
@@ -780,6 +814,20 @@ impl Remote {
         }
         let lived = c.started.elapsed();
         eprintln!("video process: ended (pid {pid}, code {}) after {:.1} s; the video starts again", code.map(|c| format!("{:#010x}", c as u32)).unwrap_or("?".into()), lived.as_secs_f64());
+        // A third process in a row without a single picture: the video stops, as for crashes.
+        let blank = if self.run_pictured.swap(false, Ordering::SeqCst) {
+            self.blank_runs.store(0, Ordering::SeqCst);
+            0
+        } else {
+            self.blank_runs.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        // STREAMER_DEBUG_VP_NO_BLANK_LIMIT: no such limit (the spoiled variant).
+        if blank >= 3 && std::env::var_os("STREAMER_DEBUG_VP_NO_BLANK_LIMIT").is_none() {
+            eprintln!("video process: {blank} in a row showed no picture; the video stops");
+            self.failed.store(true, Ordering::SeqCst);
+            self.state.lock().unwrap().alive = false;
+            return;
+        }
         let (too_many, recent) = {
             let mut cr = self.crashes.lock().unwrap();
             cr.push_back(Instant::now());
@@ -1247,7 +1295,7 @@ impl ChildVideo {
         // Tests only: STREAMER_DEBUG_VP_DECODER_HANG_AFTER=N: from N s on, the first video
         // process of a watch reads its frames and decodes none (as a decoder stuck in the driver).
         static HANG: std::sync::OnceLock<Option<(Instant, u64)>> = std::sync::OnceLock::new();
-        if let Some((t0, n)) = *HANG.get_or_init(|| std::env::var("STREAMER_DEBUG_VP_DECODER_HANG_AFTER").ok().and_then(|v| v.parse().ok()).filter(|_| std::env::var("STREAMER_VIDEO_RUN").as_deref() == Ok("0")).map(|n| (Instant::now(), n))) {
+        if let Some((t0, n)) = *HANG.get_or_init(|| std::env::var("STREAMER_DEBUG_VP_DECODER_HANG_AFTER").ok().and_then(|v| v.parse().ok()).filter(|_| std::env::var("STREAMER_VIDEO_RUN").as_deref() == Ok("0") || std::env::var_os("STREAMER_DEBUG_VP_DECODER_HANG_ALL").is_some()).map(|n| (Instant::now(), n))) {
             if t0.elapsed().as_secs() >= n {
                 return;
             }
