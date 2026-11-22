@@ -651,6 +651,73 @@ unsafe fn debug_shot(device: &ID3D11Device, context: &ID3D11DeviceContext, back:
     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("shot-{n}.bmp")), bmp);
 }
 
+/// Notices pictures that stop reaching the screen while frames keep coming (reported 2026-11-22:
+/// a windowed video froze for half a second now and then, or went black until fullscreen) and
+/// says in the log why: the swapchain's queue never freed, Present failing or "occluded", the
+/// window hidden or empty. Once per stall, when it ends or after 2 s.
+#[derive(Default)]
+struct Stall {
+    last_shown: Option<std::time::Instant>,
+    queue_full: u32,
+    still_drawing: u32,
+    other: Option<(windows::core::HRESULT, u32)>,
+    told: bool,
+}
+
+const STALL: std::time::Duration = std::time::Duration::from_millis(400);
+
+impl Stall {
+    fn queue_full(&mut self, hwnd: HWND, size: (u32, u32)) {
+        if self.last_shown.is_none() {
+            self.last_shown = Some(std::time::Instant::now());
+        }
+        self.queue_full += 1;
+        self.check(hwnd, size, false);
+    }
+
+    fn presented(&mut self, hwnd: HWND, hr: windows::core::HRESULT, size: (u32, u32)) {
+        // The watch starts here: no picture yet counts from the first frame on.
+        if self.last_shown.is_none() {
+            self.last_shown = Some(std::time::Instant::now());
+        }
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            self.still_drawing += 1;
+            self.check(hwnd, size, false);
+        } else if hr.is_ok() && hr.0 == 0 {
+            self.check(hwnd, size, true);
+            *self = Stall { last_shown: Some(std::time::Instant::now()), ..Default::default() };
+        } else {
+            // DXGI_STATUS_OCCLUDED and the like (success codes that show nothing), or errors.
+            let n = self.other.map(|(_, n)| n).unwrap_or(0) + 1;
+            self.other = Some((hr, n));
+            self.check(hwnd, size, false);
+        }
+    }
+
+    fn check(&mut self, hwnd: HWND, size: (u32, u32), ended: bool) {
+        let Some(t) = self.last_shown else { return };
+        let gap = t.elapsed();
+        if gap < STALL || (self.told && !ended) || (!ended && gap < std::time::Duration::from_secs(2)) {
+            return;
+        }
+        self.told = true;
+        let (client, visible, iconic) = unsafe { (client_size(hwnd), IsWindowVisible(hwnd).as_bool(), IsIconic(hwnd).as_bool()) };
+        let (embedded, fs, hidden) = WINDOWS.lock().unwrap().get(&(hwnd.0 as isize)).map(|s| (s.parent != 0 && !s.popped, s.fullscreen.is_some(), s.hidden)).unwrap_or_default();
+        eprintln!(
+            "present: no picture shown for {} ms{} (frames meanwhile: queue full {}, still drawing {}, Present {}); swapchain {}x{}, window {}x{} visible {visible} minimized {iconic} embedded {embedded} fullscreen {fs} hidden {hidden}",
+            gap.as_millis(),
+            if ended { "" } else { " so far" },
+            self.queue_full,
+            self.still_drawing,
+            self.other.map(|(hr, n)| format!("{:#010x} x{n}", hr.0 as u32)).unwrap_or("ok".into()),
+            size.0,
+            size.1,
+            client.0,
+            client.1,
+        );
+    }
+}
+
 /// The zoomed part of `src` (a frame of `from` pixels) over all of `back`.
 unsafe fn draw_zoomed(pdevice: &ID3D11Device, scaler: &mut Option<crate::scaler::Scaler>, back: &ID3D11Texture2D, size: (u32, u32), src: &ID3D11Texture2D, from: (u32, u32), z: crate::scaler::Zoom) {
     if scaler.is_none() {
@@ -1281,6 +1348,7 @@ unsafe fn run(
     // until fitted frames come (the old way, for the gate).
     let stretch = std::env::var_os("STREAMER_DEBUG_RESIZE_STRETCH").is_some();
     let mut msg = MSG::default();
+    let mut stall = Stall::default();
     loop {
         stats.loops.fetch_add(1, Ordering::Relaxed);
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -1472,6 +1540,7 @@ unsafe fn run(
                 != windows::Win32::Foundation::WAIT_OBJECT_0
         {
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            stall.queue_full(hwnd, size);
             continue;
         }
 
@@ -1589,6 +1658,7 @@ unsafe fn run(
             std::thread::sleep(std::time::Duration::from_millis(slow_ms));
         }
         stats.max_present_us.fetch_max(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        stall.presented(hwnd, hr, size);
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
             stats.skipped.fetch_add(1, Ordering::Relaxed);
         } else {
