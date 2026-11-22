@@ -269,6 +269,14 @@ pub fn windows() -> Vec<WindowInfo> {
         if pid == std::process::id() {
             return true.into();
         }
+        // Our video windows live in video processes of their own now (`crate::videoproc`): a
+        // popped-out or fullscreen one is no source to stream (fourth review 2026-11-22).
+        let mut class = [0u16; 64];
+        let cn = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(h, &mut class);
+        // STREAMER_DEBUG_LIST_VIDEO_WINDOWS: listed anyway (the spoiled variant).
+        if cn > 0 && String::from_utf16_lossy(&class[..cn as usize]) == "streamer_viewer" && std::env::var_os("STREAMER_DEBUG_LIST_VIDEO_WINDOWS").is_none() {
+            return true.into();
+        }
         let mut exe = String::new();
         if let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             let mut path = [0u16; 520];

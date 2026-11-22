@@ -270,6 +270,9 @@ struct Health {
     /// When it last got a keyframe: only from then on can its decoder be expected to give
     /// pictures (without one it rightly gives none).
     key_sent: Option<Instant>,
+    /// The first keyframe sent since its decoder last gave a picture: a decoder that got one
+    /// and still gives nothing hangs; one that got none may only lack it (fourth review).
+    key_since_picture: Option<Instant>,
     /// Since when frames go to it without a gap of 1 s or more: a pause of the stream is not
     /// the decoder's fault (third review: frames back after 6 s got a healthy process ended).
     streak: Option<Instant>,
@@ -280,7 +283,7 @@ struct Health {
 impl Health {
     fn new() -> Self {
         let now = Instant::now();
-        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, streak: None, pid: 0 }
+        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, key_since_picture: None, streak: None, pid: 0 }
     }
 }
 
@@ -408,6 +411,10 @@ impl Remote {
                 h.key_sent = Some(Instant::now());
             }
             h.key_sent.get_or_insert_with(Instant::now);
+            h.key_since_picture.get_or_insert_with(Instant::now);
+            if std::env::var_os("STREAMER_DEBUG_VP_KEY_EACH").is_some() {
+                h.key_since_picture = Some(Instant::now());
+            }
         }
     }
 
@@ -645,6 +652,12 @@ impl Remote {
             FromVideo::Report { state, closed, frames, intervals, latencies, presented, skipped, max_present_us, max_lock_us, size, loops } => {
                 {
                     let mut h = self.health.lock().unwrap();
+                    // Its first report: the decoder is only now built (or being built), so its
+                    // silence counts from here (fourth review: a slow start was ended at once).
+                    if !h.reported {
+                        h.decoded = Instant::now();
+                        h.streak = None;
+                    }
                     h.reported = true;
                     // The loop counter stands still: the presentation thread hangs.
                     if loops != h.loops {
@@ -653,6 +666,7 @@ impl Remote {
                     }
                     if frames > 0 {
                         h.decoded = Instant::now();
+                        h.key_since_picture = None;
                     }
                 }
                 // A new process's first reports show its own defaults until the state sent to
@@ -824,7 +838,7 @@ impl Remote {
                             (h.started.elapsed() > START_GRACE).then(|| format!("no report {:.1} s after the start", h.started.elapsed().as_secs_f64()))
                         } else if stood_still {
                             Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
-                        } else if decode_watch && h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.streak.is_some_and(|s| s.elapsed() > DECODE_HANG) || std::env::var_os("STREAMER_DEBUG_VP_NO_STREAK").is_some()) && (h.key_sent.is_some_and(|k| k.elapsed() > DECODE_HANG) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) {
+                        } else if decode_watch && h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.streak.is_some_and(|s| s.elapsed() > DECODE_HANG) || std::env::var_os("STREAMER_DEBUG_VP_NO_STREAK").is_some()) && (h.key_since_picture.is_some_and(|k| k.elapsed() > Duration::from_secs(3)) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) {
                             Some(format!("frames went in, none decoded for {:.1} s", h.decoded.elapsed().as_secs_f64()))
                         } else {
                             None
@@ -845,12 +859,22 @@ impl Remote {
                     // Its window waits on the app's own window when that is busy (a child window
                     // of another process's window): not its fault. Asked with no lock held, so
                     // the app's thread is never kept waiting by it (third review 2026-11-22).
-                    if why.is_some() && stood_still && parent_busy(me.parent) {
+                    // Only inside the app's window (a popped-out one has no parent to wait for),
+                    // and never past 10 s: the app could as well be waiting for it (fourth review).
+                    let embedded = me.state.lock().unwrap().embedded;
+                    let long = me.health.lock().unwrap().loops_moved.elapsed() > Duration::from_secs(10);
+                    if why.is_some() && stood_still && embedded && !long && parent_busy(me.parent) {
                         me.health.lock().unwrap().loops_moved = Instant::now();
                         why = None;
                     }
                     if let Some(why) = why {
-                        *me.health.lock().unwrap() = Health { pid, ..Health::new() };
+                        // Only if it is still about that process (a new one may have its own by now).
+                        {
+                            let mut h = me.health.lock().unwrap();
+                            if h.pid == pid {
+                                *h = Health { pid, ..Health::new() };
+                            }
+                        }
                         let mut c = me.child.lock().unwrap();
                         // Only the process this was about (a new one may have started since).
                         if let Some(c) = c.as_mut().filter(|c| c.proc.id() == pid) {
@@ -877,7 +901,7 @@ impl Drop for Remote {
 fn parent_busy(hwnd: isize) -> bool {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG};
-    if hwnd == 0 {
+    if hwnd == 0 || !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(HWND(hwnd as *mut std::ffi::c_void))) }.as_bool() {
         return false;
     }
     let mut r = 0usize;
