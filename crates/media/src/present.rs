@@ -391,7 +391,9 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         let mut map = WINDOWS.lock().unwrap();
         let Some(st) = map.get_mut(&(hwnd.0 as isize)) else { return false };
         let showing = st.controls_until.is_some_and(|t| t > std::time::Instant::now());
-        if msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL {
+        // Fullscreen, the wheel zooms: it does not bring the panel up (a next notch near the
+        // bottom then set the volume instead, second review 2026-11-22).
+        if msg == WM_MOUSEMOVE || (msg == WM_MOUSEWHEEL && st.fullscreen.is_none()) {
             st.controls_until = Some(std::time::Instant::now() + CONTROLS_FOR);
         }
         // Taken before the button-up clears it: cleared first, the button-up never saw a drag

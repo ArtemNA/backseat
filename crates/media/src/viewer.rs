@@ -673,6 +673,9 @@ fn add_remote_video(
     }));
     let (r, clock, decoder) = (Arc::downgrade(remote), clock.clone(), decoder.to_string());
     let is_av1 = codec.short() == "av1";
+    // Test switches, read once (not per frame).
+    let drop_keys = std::env::var("STREAMER_DEBUG_VP_DROP_KEYS_SECS").ok().and_then(|v| v.parse::<u64>().ok());
+    let (dbg_timing, dbg_delta, av1_by_flag) = (std::env::var_os("STREAMER_DEBUG_VP_TIMING").is_some(), std::env::var_os("STREAMER_DEBUG_VP_DELTA").is_some(), std::env::var_os("STREAMER_DEBUG_VP_AV1_FLAGS").is_some());
     let caps_sent = Mutex::new(String::new());
     sink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
@@ -691,7 +694,7 @@ fn add_remote_video(
                 let sent_host = pts.and_then(|p| by_pts.lock().unwrap().iter().rev().find(|(k, _)| *k == p).map(|(_, v)| *v));
                 let host_minus_qpc = clock.host_now().map(|h| h as i64 - crate::videolink::qpc_ns() as i64);
                 // STREAMER_DEBUG_VP_TIMING: capture to sent to the video process, each 2 s.
-                if std::env::var_os("STREAMER_DEBUG_VP_TIMING").is_some() {
+                if dbg_timing {
                     static ACC: Mutex<Vec<f64>> = Mutex::new(Vec::new());
                     if let (Some(s), Some(h)) = (sent_host, clock.host_now()) {
                         let mut a = ACC.lock().unwrap();
@@ -704,9 +707,17 @@ fn add_remote_video(
                     }
                 }
                 let data = b.map_readable().map(|m| m.to_vec()).unwrap_or_default();
+                // Tests only: STREAMER_DEBUG_VP_DROP_KEYS_SECS=N loses every keyframe for the first N s
+                // of the watch, as a bad network can.
+                if let Some(n) = drop_keys {
+                    let key = if is_av1 { crate::videolink::av1_has_sequence_header(&data) } else { !b.flags().contains(gst::BufferFlags::DELTA_UNIT) };
+                    if key && started.elapsed().as_secs() < n {
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                }
                 // STREAMER_DEBUG_VP_DELTA: each 120 frames, how many the depayloader marked
                 // as not keyframes, and the sizes of those it did not (keyframes are big).
-                if std::env::var_os("STREAMER_DEBUG_VP_DELTA").is_some() {
+                if dbg_delta {
                     static ACC: Mutex<(u32, Vec<usize>)> = Mutex::new((0, Vec::new()));
                     let mut a = ACC.lock().unwrap();
                     let d = if is_av1 { !crate::videolink::av1_has_sequence_header(&data) } else { b.flags().contains(gst::BufferFlags::DELTA_UNIT) };
@@ -726,7 +737,7 @@ fn add_remote_video(
                     duration: b.duration().map(|p| p.nseconds()),
                     // rtpav1depay marks nothing as delta: AV1 keyframes are told by their
                     // sequence header. STREAMER_DEBUG_VP_AV1_FLAGS: by the flag (the spoiled variant).
-                    delta: if is_av1 && std::env::var_os("STREAMER_DEBUG_VP_AV1_FLAGS").is_none() { !crate::videolink::av1_has_sequence_header(&data) } else { b.flags().contains(gst::BufferFlags::DELTA_UNIT) },
+                    delta: if is_av1 && !av1_by_flag { !crate::videolink::av1_has_sequence_header(&data) } else { b.flags().contains(gst::BufferFlags::DELTA_UNIT) },
                     discont: b.flags().contains(gst::BufferFlags::DISCONT),
                     sent_host,
                     host_minus_qpc,
