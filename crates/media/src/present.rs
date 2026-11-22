@@ -728,8 +728,22 @@ unsafe fn draw_zoomed(pdevice: &ID3D11Device, scaler: &mut Option<crate::scaler:
         *scaler = crate::scaler::Scaler::new(pdevice).map_err(|e| eprintln!("scaler: {e}")).ok();
     }
     if let Some(s) = scaler.as_mut() {
+        let t = std::time::Instant::now();
         if let Err(e) = s.draw_crop(back, size, src, z.crop(from.0 as f32, from.1 as f32)) {
             eprintln!("scaler: {e}");
+        }
+        // STREAMER_DEBUG_ZOOM_TIMING: each 120 zoomed frames, the median and longest time this
+        // takes on the CPU (the D2D wrappers made per frame, the draw call).
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("STREAMER_DEBUG_ZOOM_TIMING").is_some()) {
+            static ACC: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+            let mut a = ACC.lock().unwrap();
+            a.push(t.elapsed().as_micros() as u64);
+            if a.len() >= 120 {
+                a.sort_unstable();
+                eprintln!("zoom timing: median {} us, max {} us over {}", a[a.len() / 2], a[a.len() - 1], a.len());
+                a.clear();
+            }
         }
     }
 }
@@ -1379,7 +1393,17 @@ unsafe fn run(
     let stretch = std::env::var_os("STREAMER_DEBUG_RESIZE_STRETCH").is_some();
     let mut msg = MSG::default();
     let mut stall = Stall::default();
+    // Tests only: STREAMER_DEBUG_VP_WINDOW_HANG_AFTER=N hangs this thread (window and drawing)
+    // for good N s in, in the first video process of a watch, as a call stuck in the driver.
+    let hang_at = std::env::var("STREAMER_DEBUG_VP_WINDOW_HANG_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).filter(|_| std::env::var("STREAMER_VIDEO_RUN").map_or(true, |r| r == "0"));
+    let t0 = std::time::Instant::now();
     loop {
+        if hang_at.is_some_and(|n| t0.elapsed().as_secs() >= n) {
+            eprintln!("present: test hang of the window thread");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
         stats.loops.fetch_add(1, Ordering::Relaxed);
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {

@@ -21,8 +21,15 @@ pub const SWITCH: &str = "--video-process";
 /// More crashes than this within `CRASH_WINDOW` and the video gives up.
 const MAX_RESTARTS: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
-/// No report, or a presentation loop that stands still, for this long: the process hangs.
-const HANG: Duration = Duration::from_secs(5);
+/// The video window's thread stands still for this long: the process hangs. Short, as a hung
+/// window thread may hold up the app's own input (Windows joins the input of a child window
+/// and its parent); a GPU stalled this long is reset by Windows anyway (TDR, 2 s). The window
+/// thread shows signs of life at least every 500 ms, also while its window is dragged.
+/// STREAMER_DEBUG_VP_HANG_SECS: another limit (the spoiled variant: 5, as before).
+fn hang_limit() -> Duration {
+    static D: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *D.get_or_init(|| Duration::from_secs_f64(std::env::var("STREAMER_DEBUG_VP_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)))
+}
 /// Frames waiting for the process; more and frames are dropped until the next keyframe.
 const QUEUE: usize = 120;
 
@@ -689,42 +696,56 @@ impl Remote {
         let me = self.me.clone();
         std::thread::Builder::new()
             .name("video-watchdog".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(500));
-                let Some(me) = me.upgrade() else { return };
-                if me.ending.load(Ordering::SeqCst) || me.failed.load(Ordering::SeqCst) {
-                    return;
-                }
-                let (why, ask) = {
-                    let mut h = me.health.lock().unwrap();
-                    let why = if !h.reported {
-                        (h.started.elapsed() > START_GRACE).then(|| format!("no report {:.1} s after the start", h.started.elapsed().as_secs_f64()))
-                    } else if h.loops_moved.elapsed() > HANG {
-                        Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
-                    } else if h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && h.started.elapsed() > DECODE_HANG && std::env::var_os("STREAMER_DEBUG_NO_DECODE_WATCH").is_none() {
-                        Some(format!("frames went in, none decoded for {:.1} s", h.decoded.elapsed().as_secs_f64()))
-                    } else {
-                        None
+            .spawn(move || {
+                let mut last = Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let Some(me) = me.upgrade() else { return };
+                    if me.ending.load(Ordering::SeqCst) || me.failed.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // Overslept (the computer slept, or this thread was starved): nobody turned
+                    // meanwhile, so nothing stood still by its own fault; count from now.
+                    let overslept = last.elapsed() > Duration::from_millis(1500);
+                    last = Instant::now();
+                    if overslept {
+                        let mut h = me.health.lock().unwrap();
+                        let now = Instant::now();
+                        h.loops_moved = now;
+                        h.decoded = now;
+                        continue;
+                    }
+                    let (why, ask) = {
+                        let mut h = me.health.lock().unwrap();
+                        let why = if !h.reported {
+                            (h.started.elapsed() > START_GRACE).then(|| format!("no report {:.1} s after the start", h.started.elapsed().as_secs_f64()))
+                        } else if h.loops_moved.elapsed() > hang_limit() {
+                            Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
+                        } else if h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && h.started.elapsed() > DECODE_HANG && std::env::var_os("STREAMER_DEBUG_NO_DECODE_WATCH").is_none() {
+                            Some(format!("frames went in, none decoded for {:.1} s", h.decoded.elapsed().as_secs_f64()))
+                        } else {
+                            None
+                        };
+                        // Frames wait for a keyframe: ask again each second (an ask can get lost).
+                        let waiting = me.child.lock().unwrap().as_ref().is_some_and(|c| c.want_key.load(Ordering::SeqCst));
+                        let ask = waiting && h.key_asked.elapsed() > Duration::from_secs(1);
+                        if ask {
+                            h.key_asked = Instant::now();
+                        }
+                        if why.is_some() {
+                            *h = Health::new();
+                        }
+                        (why, ask)
                     };
-                    // Frames wait for a keyframe: ask again each second (an ask can get lost).
-                    let waiting = me.child.lock().unwrap().as_ref().is_some_and(|c| c.want_key.load(Ordering::SeqCst));
-                    let ask = waiting && h.key_asked.elapsed() > Duration::from_secs(1);
                     if ask {
-                        h.key_asked = Instant::now();
+                        me.ask_keyframe();
                     }
-                    if why.is_some() {
-                        *h = Health::new();
-                    }
-                    (why, ask)
-                };
-                if ask {
-                    me.ask_keyframe();
-                }
-                if let Some(why) = why {
-                    let mut c = me.child.lock().unwrap();
-                    if let Some(c) = c.as_mut() {
-                        eprintln!("video process: {why}; ended");
-                        let _ = c.proc.kill();
+                    if let Some(why) = why {
+                        let mut c = me.child.lock().unwrap();
+                        if let Some(c) = c.as_mut() {
+                            eprintln!("video process: {why}; ended");
+                            let _ = c.proc.kill();
+                        }
                     }
                 }
             })
