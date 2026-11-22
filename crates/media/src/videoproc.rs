@@ -28,7 +28,7 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 /// STREAMER_DEBUG_VP_HANG_SECS: another limit (the spoiled variant: 5, as before).
 fn hang_limit() -> Duration {
     static D: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *D.get_or_init(|| Duration::from_secs_f64(std::env::var("STREAMER_DEBUG_VP_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)))
+    *D.get_or_init(|| Duration::from_secs_f64(std::env::var("STREAMER_DEBUG_VP_HANG_SECS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(2.0)))
 }
 /// Frames waiting for the process; more and frames are dropped until the next keyframe.
 const QUEUE: usize = 120;
@@ -218,6 +218,9 @@ struct Child {
     out: mpsc::Sender<Out>,
     /// Frames sent and not yet written to the pipe.
     queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// Its first messages (Start, the window's state, the stream) are sent: frames before that
+    /// would come before its decoder exists and be lost (third review).
+    ready: Arc<AtomicBool>,
     /// A frame was dropped (queue full, or a new process): frames wait for a keyframe.
     want_key: Arc<AtomicBool>,
     started: Instant,
@@ -244,6 +247,8 @@ pub struct Remote {
     last_command: Mutex<Instant>,
     /// Video processes started for this watch so far.
     runs: AtomicU64,
+    /// The app's main window the video sits in (0: a window of its own).
+    parent: isize,
     me: Weak<Remote>,
 }
 
@@ -265,6 +270,9 @@ struct Health {
     /// When it last got a keyframe: only from then on can its decoder be expected to give
     /// pictures (without one it rightly gives none).
     key_sent: Option<Instant>,
+    /// Since when frames go to it without a gap of 1 s or more: a pause of the stream is not
+    /// the decoder's fault (third review: frames back after 6 s got a healthy process ended).
+    streak: Option<Instant>,
     /// The process these figures are about.
     pid: u32,
 }
@@ -272,7 +280,7 @@ struct Health {
 impl Health {
     fn new() -> Self {
         let now = Instant::now();
-        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, pid: 0 }
+        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, streak: None, pid: 0 }
     }
 }
 
@@ -309,6 +317,7 @@ impl Remote {
             health: Mutex::new(Health::new()),
             last_command: Mutex::new(Instant::now()),
             runs: AtomicU64::new(0),
+            parent,
             me: me.clone(),
         });
         ALL.lock().unwrap().retain(|w| w.strong_count() > 0);
@@ -343,6 +352,9 @@ impl Remote {
         let (out, queued, want_key) = {
             let guard = self.child.lock().unwrap();
             let Some(c) = guard.as_ref() else { return };
+            if !c.ready.load(Ordering::SeqCst) {
+                return;
+            }
             (c.out.clone(), c.queued.clone(), c.want_key.clone())
         };
         // Its queue full: it does not take frames. They count as sent, so a process that
@@ -350,8 +362,14 @@ impl Remote {
         if queued.load(Ordering::SeqCst) >= QUEUE {
             want_key.store(true, Ordering::SeqCst);
             let mut h = self.health.lock().unwrap();
-            h.sent = Some(Instant::now());
-            h.key_wait.get_or_insert_with(Instant::now);
+            let now = Instant::now();
+            if h.sent.is_none_or(|s| s.elapsed() > Duration::from_secs(1)) {
+                h.streak = Some(now);
+            }
+            h.sent = Some(now);
+            // The keyframe wait counts from when frames get through again, not from now
+            // (third review: after a long stall the first delta frame went on at once).
+            h.key_wait = None;
             return;
         }
         if want_key.load(Ordering::SeqCst) {
@@ -377,9 +395,19 @@ impl Remote {
             return;
         }
         let mut h = self.health.lock().unwrap();
-        h.sent = Some(Instant::now());
+        let now = Instant::now();
+        if h.sent.is_none_or(|s| s.elapsed() > Duration::from_secs(1)) {
+            h.streak = Some(now);
+        }
+        h.sent = Some(now);
         if key {
-            h.key_sent = Some(Instant::now());
+            // The first keyframe of this process: from then on its decoder owes pictures. (Each
+            // keyframe set it anew every 2 s, so the watch never came due, third review.)
+            // STREAMER_DEBUG_VP_KEY_EACH: set anew by each keyframe (the spoiled variant).
+            if std::env::var_os("STREAMER_DEBUG_VP_KEY_EACH").is_some() {
+                h.key_sent = Some(Instant::now());
+            }
+            h.key_sent.get_or_insert_with(Instant::now);
         }
     }
 
@@ -508,6 +536,7 @@ impl Remote {
         let (tx, rx) = mpsc::channel::<Out>();
         let want_key = Arc::new(AtomicBool::new(true));
         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
         // Writer: everything for the process, in order.
         let q = queued.clone();
         std::thread::Builder::new()
@@ -540,7 +569,7 @@ impl Remote {
                 let _ = proc.wait();
                 return;
             }
-            *c = Some(Child { proc, out: tx.clone(), queued, want_key, started: Instant::now() });
+            *c = Some(Child { proc, out: tx.clone(), queued, want_key, ready: ready.clone(), started: Instant::now() });
         }
         // What it should show, from the start: the window, then everything set on it so far.
         // Held until it is sent: a command sent meanwhile waits, and comes after it.
@@ -552,9 +581,6 @@ impl Remote {
         first.push(ToVideo::Audio { muted: d.audio.0, volume: d.audio.1 });
         first.push(ToVideo::Overlay { on: d.overlay });
         first.push(ToVideo::Badge { on: d.badge });
-        if let Some((caps, decoder)) = &d.stream {
-            first.push(ToVideo::Stream { caps: caps.clone(), decoder: decoder.clone() });
-        }
         first.push(ToVideo::Hidden { on: d.hidden });
         first.push(ToVideo::Topmost { on: d.topmost });
         if let Some((text, ok)) = d.badge_info {
@@ -575,11 +601,19 @@ impl Remote {
             allow_foreground(pid);
             first.push(ToVideo::Fullscreen { on: true });
         }
+        // The stream last: building its decoder takes a while, and the window should be where
+        // and how it was meanwhile (third review: a slow build let reports undo it).
+        if let Some((caps, decoder)) = &d.stream {
+            first.push(ToVideo::Stream { caps: caps.clone(), decoder: decoder.clone() });
+        }
         // Commands sent since it went in place came before these; it ignores all until Start,
         // and these carry their values.
         for m in first {
             let _ = tx.send(Out::Json(m));
         }
+        ready.store(true, Ordering::SeqCst);
+        // Its first reports may not undo what was just sent (a slow start, third review).
+        *self.last_command.lock().unwrap() = Instant::now();
         drop(held);
         self.ask_keyframe();
         // Reader: reports, sound and keyframe asks; its end is the process's end.
@@ -739,7 +773,17 @@ impl Remote {
         let wait = Duration::from_secs(match recent { 0 | 1 => 0, 2 => 2, _ => 4 });
         if !wait.is_zero() {
             eprintln!("video process: starting again in {} s", wait.as_secs());
-            std::thread::sleep(wait);
+        }
+        // Not when the watch ended or its window was closed meanwhile (third review).
+        let t = Instant::now();
+        loop {
+            if self.ending.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if t.elapsed() >= wait {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
         self.spawn();
     }
@@ -758,30 +802,29 @@ impl Remote {
                         return;
                     }
                     // Overslept (the computer slept, or this thread was starved): nobody turned
-                    // meanwhile, so nothing stood still by its own fault; count from now.
-                    let overslept = last.elapsed() > Duration::from_millis(1500);
-                    last = Instant::now();
-                    if overslept {
+                    // meanwhile, so nothing stood still by its own fault; count from now. Measured
+                    // from the end of the last turn, so a slow turn of its own does not count.
+                    if last.elapsed() > Duration::from_millis(1500) {
                         let mut h = me.health.lock().unwrap();
                         let now = Instant::now();
                         h.loops_moved = now;
                         h.decoded = now;
+                        if !h.reported {
+                            h.started = now;
+                        }
+                        drop(h);
+                        last = Instant::now();
                         continue;
                     }
-                    let (why, ask) = {
+                    let decode_watch = std::env::var_os("STREAMER_DEBUG_NO_DECODE_WATCH").is_none();
+                    let (why, stood_still, ask, pid) = {
                         let mut h = me.health.lock().unwrap();
+                        let stood_still = h.reported && h.loops_moved.elapsed() > hang_limit();
                         let why = if !h.reported {
                             (h.started.elapsed() > START_GRACE).then(|| format!("no report {:.1} s after the start", h.started.elapsed().as_secs_f64()))
-                        } else if h.loops_moved.elapsed() > hang_limit() {
-                            // Its window waits on the app's own window when that is busy
-                            // (a child window of another process's window): not its fault.
-                            if parent_busy(me.desired.lock().unwrap().parent) {
-                                h.loops_moved = Instant::now();
-                                None
-                            } else {
-                                Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
-                            }
-                        } else if h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.key_sent.is_some_and(|k| k.elapsed() > DECODE_HANG) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) && std::env::var_os("STREAMER_DEBUG_NO_DECODE_WATCH").is_none() {
+                        } else if stood_still {
+                            Some(format!("its window stood still for {:.1} s", h.loops_moved.elapsed().as_secs_f64()))
+                        } else if decode_watch && h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && h.decoded.elapsed() > DECODE_HANG && (h.streak.is_some_and(|s| s.elapsed() > DECODE_HANG) || std::env::var_os("STREAMER_DEBUG_VP_NO_STREAK").is_some()) && (h.key_sent.is_some_and(|k| k.elapsed() > DECODE_HANG) || (std::env::var_os("STREAMER_DEBUG_VP_WATCH_WITHOUT_KEY").is_some() && h.started.elapsed() > DECODE_HANG)) {
                             Some(format!("frames went in, none decoded for {:.1} s", h.decoded.elapsed().as_secs_f64()))
                         } else {
                             None
@@ -792,18 +835,22 @@ impl Remote {
                         if ask {
                             h.key_asked = Instant::now();
                         }
-                        // Its window closed by its user: the watch ends; nothing to restart.
-                        let why = why.filter(|_| !me.closed.load(Ordering::SeqCst));
-                        let pid = h.pid;
-                        if why.is_some() {
-                            *h = Health { pid, ..Health::new() };
-                        }
-                        (why.map(|w| (w, pid)), ask)
+                        (why, stood_still, ask, h.pid)
                     };
                     if ask {
                         me.ask_keyframe();
                     }
-                    if let Some((why, pid)) = why {
+                    // Its window closed by its user: the watch ends; nothing to restart.
+                    let mut why = why.filter(|_| !me.closed.load(Ordering::SeqCst));
+                    // Its window waits on the app's own window when that is busy (a child window
+                    // of another process's window): not its fault. Asked with no lock held, so
+                    // the app's thread is never kept waiting by it (third review 2026-11-22).
+                    if why.is_some() && stood_still && parent_busy(me.parent) {
+                        me.health.lock().unwrap().loops_moved = Instant::now();
+                        why = None;
+                    }
+                    if let Some(why) = why {
+                        *me.health.lock().unwrap() = Health { pid, ..Health::new() };
                         let mut c = me.child.lock().unwrap();
                         // Only the process this was about (a new one may have started since).
                         if let Some(c) = c.as_mut().filter(|c| c.proc.id() == pid) {
@@ -811,6 +858,7 @@ impl Remote {
                             let _ = c.proc.kill();
                         }
                     }
+                    last = Instant::now();
                 }
             })
             .unwrap();
@@ -1136,12 +1184,23 @@ impl ChildVideo {
         self.pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
         self.src = Some(src);
         self.stream = Some((caps.into(), decoder.into()));
+        // A new decoder starts at a keyframe (the stream may change between keyframes).
+        self.wait_key = true;
+        self.wait_since = None;
         eprintln!("video process: decoding {codec} with {decoder}");
         Ok(())
     }
 
     fn push(&mut self, f: videolink::Frame) {
         let Some(src) = &self.src else { return };
+        // Tests only: STREAMER_DEBUG_VP_DECODER_HANG_AFTER=N: from N s on, the first video
+        // process of a watch reads its frames and decodes none (as a decoder stuck in the driver).
+        static HANG: std::sync::OnceLock<Option<(Instant, u64)>> = std::sync::OnceLock::new();
+        if let Some((t0, n)) = *HANG.get_or_init(|| std::env::var("STREAMER_DEBUG_VP_DECODER_HANG_AFTER").ok().and_then(|v| v.parse().ok()).filter(|_| std::env::var("STREAMER_VIDEO_RUN").as_deref() == Ok("0")).map(|n| (Instant::now(), n))) {
+            if t0.elapsed().as_secs() >= n {
+                return;
+            }
+        }
         // The decoder is far behind (its input near full): drop frames up to the next
         // keyframe here, rather than let the input drop some and feed the decoder frames
         // whose references are gone (second review 2026-11-22).
@@ -1152,6 +1211,11 @@ impl ChildVideo {
         }
         if self.wait_key {
             if f.delta && self.wait_since.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(3) {
+                return;
+            }
+            // A keyframe into a still full input would be the one dropped: the next, then
+            // (third review).
+            if !f.delta && src.current_level_bytes() > (6 << 20) {
                 return;
             }
             self.wait_key = false;
