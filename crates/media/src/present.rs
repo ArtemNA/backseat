@@ -247,6 +247,8 @@ struct WinState {
     controls_until: Option<std::time::Instant>,
     /// The volume bar is being dragged.
     dragging: bool,
+    /// Fullscreen only: the wheel over the picture zooms in (to 4x) and out.
+    zoom: crate::scaler::Zoom,
 }
 
 /// Sets mute and/or volume (0..1) when given and returns both as they now are.
@@ -403,8 +405,24 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         let dragging = if std::env::var_os("STREAMER_DEBUG_KEEP_CAPTURE").is_some() { st.dragging } else { was };
         (st.audio.clone(), showing, dragging)
     };
-    let Some(audio) = audio else { return false };
     let (size, scale) = client_and_scale(hwnd);
+    // Fullscreen, the wheel over the picture zooms (to the point under the cursor); over the
+    // controls' panel it sets the volume, as everywhere outside fullscreen. The wheel's point
+    // comes in screen pixels. STREAMER_DEBUG_NO_ZOOM: the volume everywhere (the old way).
+    if msg == WM_MOUSEWHEEL && std::env::var_os("STREAMER_DEBUG_NO_ZOOM").is_none() {
+        let mut p = windows::Win32::Foundation::POINT { x, y };
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+        let over_panel = showing && crate::controls::hit(size, scale, p.x, p.y) != crate::controls::Hit::Outside;
+        let mut map = WINDOWS.lock().unwrap();
+        if let Some(st) = map.get_mut(&(hwnd.0 as isize)) {
+            if st.fullscreen.is_some() && !over_panel && size.0 > 0 && size.1 > 0 {
+                let notches = ((w.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                st.zoom = st.zoom.wheel(notches, (p.x as f32 / size.0 as f32, p.y as f32 / size.1 as f32));
+                return true;
+            }
+        }
+    }
+    let Some(audio) = audio else { return false };
     match msg {
         WM_MOUSEWHEEL => {
             mark_input();
@@ -444,6 +462,13 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         },
         _ => false,
     }
+}
+
+/// The zoom to draw with: fullscreen and zoomed in, else None.
+fn zoom_of(hwnd: HWND) -> Option<crate::scaler::Zoom> {
+    let map = WINDOWS.lock().unwrap();
+    let st = map.get(&(hwnd.0 as isize))?;
+    (st.fullscreen.is_some() && st.zoom.active()).then_some(st.zoom)
 }
 
 /// The badge's line and dot while the badge is on and there is something to show.
@@ -569,6 +594,75 @@ unsafe fn blit(pdevice: &ID3D11Device, pcontext: &ID3D11DeviceContext, scaler: &
     }
 }
 
+/// Tests only: STREAMER_DEBUG_SHOT=<folder> saves what is about to be shown, every 2 s, as
+/// shot-<n>.bmp there (a window drawn by a swapchain cannot be pictured from outside).
+unsafe fn debug_shot(device: &ID3D11Device, context: &ID3D11DeviceContext, back: &ID3D11Texture2D) {
+    static NEXT: Mutex<Option<(std::time::Instant, u32)>> = Mutex::new(None);
+    let Some(dir) = std::env::var_os("STREAMER_DEBUG_SHOT") else { return };
+    let n = {
+        let mut g = NEXT.lock().unwrap();
+        match *g {
+            Some((t, _)) if t.elapsed() < std::time::Duration::from_secs(2) => return,
+            Some((_, n)) => {
+                *g = Some((std::time::Instant::now(), n + 1));
+                n + 1
+            }
+            None => {
+                *g = Some((std::time::Instant::now(), 0));
+                0
+            }
+        }
+    };
+    let mut d = D3D11_TEXTURE2D_DESC::default();
+    back.GetDesc(&mut d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+    d.MiscFlags = 0;
+    let mut t = None;
+    if device.CreateTexture2D(&d, None, Some(&mut t)).is_err() {
+        return;
+    }
+    let Some(t) = t else { return };
+    context.CopyResource(&t, back);
+    let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+    if context.Map(&t, 0, D3D11_MAP_READ, 0, Some(&mut m)).is_err() {
+        return;
+    }
+    let (w, h) = (d.Width as usize, d.Height as usize);
+    let mut bmp = Vec::with_capacity(54 + w * h * 4);
+    let size = (54 + w * h * 4) as u32;
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&size.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(w as i32).to_le_bytes());
+    // Negative height: rows top to bottom.
+    bmp.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&[0; 24]);
+    for row in 0..h {
+        let p = (m.pData as *const u8).add(row * m.RowPitch as usize);
+        bmp.extend_from_slice(std::slice::from_raw_parts(p, w * 4));
+    }
+    context.Unmap(&t, 0);
+    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("shot-{n}.bmp")), bmp);
+}
+
+/// The zoomed part of `src` (a frame of `from` pixels) over all of `back`.
+unsafe fn draw_zoomed(pdevice: &ID3D11Device, scaler: &mut Option<crate::scaler::Scaler>, back: &ID3D11Texture2D, size: (u32, u32), src: &ID3D11Texture2D, from: (u32, u32), z: crate::scaler::Zoom) {
+    if scaler.is_none() {
+        *scaler = crate::scaler::Scaler::new(pdevice).map_err(|e| eprintln!("scaler: {e}")).ok();
+    }
+    if let Some(s) = scaler.as_mut() {
+        if let Err(e) = s.draw_crop(back, size, src, z.crop(from.0 as f32, from.1 as f32)) {
+            eprintln!("scaler: {e}");
+        }
+    }
+}
+
 /// The decoded video's aspect (width / height), from the fitting element's input.
 fn video_aspect(fit: &Option<gst::Element>) -> Option<f32> {
     use gst::prelude::{ElementExt, PadExt};
@@ -676,6 +770,7 @@ unsafe fn fullscreen_old(hwnd: HWND, mode: usize) {
         st.fullscreen = Some((place, style));
     } else if st.fs_from_embedded {
         st.fullscreen = None;
+        st.zoom = Default::default();
         st.fs_from_embedded = false;
         drop(map);
         apply_place(hwnd);
@@ -798,6 +893,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESUL
                         Some(st) if st.parent != 0 => {
                             st.popped = false;
                             st.fullscreen = None;
+                            st.zoom = Default::default();
                             st.fs_from_embedded = false;
                             true
                         }
@@ -1127,6 +1223,7 @@ unsafe fn run(
             audio: None,
             controls_until: None,
             dragging: false,
+            zoom: Default::default(),
         },
     );
 
@@ -1288,7 +1385,10 @@ unsafe fn run(
                     let free = waitable.is_invalid() || windows::Win32::System::Threading::WaitForSingleObjectEx(waitable, 0, false) == windows::Win32::Foundation::WAIT_OBJECT_0;
                     if free {
                         let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
-                        blit(&pdevice, &pcontext, &mut scaler, &back, size, prev, last_size, video_aspect(&fit));
+                        match zoom_of(hwnd) {
+                            Some(z) => draw_zoomed(&pdevice, &mut scaler, &back, size, prev, last_size, z),
+                            None => blit(&pdevice, &pcontext, &mut scaler, &back, size, prev, last_size, video_aspect(&fit)),
+                        }
                         if let (Some((version, text)), Some(o)) = (overlay_of(hwnd), overlay.as_mut()) {
                             o.draw(&pcontext, &back, size, version, &text);
                         }
@@ -1405,7 +1505,8 @@ unsafe fn run(
         // Everything below runs on the presentation device and cannot stall the decoder.
         let back: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
         let _ = sh.km_present.AcquireSync(1, 100);
-        if frame == size {
+        let zoom = zoom_of(hwnd);
+        if frame == size && zoom.is_none() {
             pcontext.CopyResource(&back, &sh.present);
         }
         // Kept: the controls are redrawn on it, a resized window gets it scaled.
@@ -1422,7 +1523,9 @@ unsafe fn run(
             pcontext.CopyResource(t, &sh.present);
         }
         let _ = sh.km_present.ReleaseSync(0);
-        if frame != size {
+        if let (Some(z), Some(t)) = (zoom, &last) {
+            draw_zoomed(&pdevice, &mut scaler, &back, size, t, frame, z);
+        } else if frame != size {
             if let Some(t) = &last {
                 blit(&pdevice, &pcontext, &mut scaler, &back, size, t, frame, video_aspect(&fit));
             }
@@ -1464,6 +1567,7 @@ unsafe fn run(
                 c.draw(&pcontext, &back, size, look);
             }
         }
+        debug_shot(&pdevice, &pcontext, &back);
         drop(back);
 
         let presenting = std::time::Instant::now();
