@@ -270,6 +270,8 @@ struct Health {
     /// When it last got a keyframe: only from then on can its decoder be expected to give
     /// pictures (without one it rightly gives none).
     key_sent: Option<Instant>,
+    /// Since when its still window has been excused by a busy app window (parent_busy).
+    excused_since: Option<Instant>,
     /// The first keyframe sent since its decoder last gave a picture: a decoder that got one
     /// and still gives nothing hangs; one that got none may only lack it (fourth review).
     key_since_picture: Option<Instant>,
@@ -283,7 +285,7 @@ struct Health {
 impl Health {
     fn new() -> Self {
         let now = Instant::now();
-        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, key_since_picture: None, streak: None, pid: 0 }
+        Health { started: now, reported: false, loops: 0, loops_moved: now, sent: None, decoded: now, key_asked: now, key_wait: None, key_sent: None, key_since_picture: None, streak: None, excused_since: None, pid: 0 }
     }
 }
 
@@ -656,13 +658,19 @@ impl Remote {
                     // silence counts from here (fourth review: a slow start was ended at once).
                     if !h.reported {
                         h.decoded = Instant::now();
-                        h.streak = None;
+                        // Frames that already flow count from here, not from never: cleared, the
+                        // mark came back only after a gap of 1 s, and a steady stream has none,
+                        // so a stuck decoder went unnoticed (fifth review).
+                        // STREAMER_DEBUG_VP_STREAK_CLEARED: cleared (the spoiled variant).
+                        let flowing = h.sent.is_some_and(|s| s.elapsed() < Duration::from_secs(1)) && std::env::var_os("STREAMER_DEBUG_VP_STREAK_CLEARED").is_none();
+                        h.streak = flowing.then(Instant::now);
                     }
                     h.reported = true;
                     // The loop counter stands still: the presentation thread hangs.
                     if loops != h.loops {
                         h.loops = loops;
                         h.loops_moved = Instant::now();
+                        h.excused_since = None;
                     }
                     if frames > 0 {
                         h.decoded = Instant::now();
@@ -862,9 +870,12 @@ impl Remote {
                     // Only inside the app's window (a popped-out one has no parent to wait for),
                     // and never past 10 s: the app could as well be waiting for it (fourth review).
                     let embedded = me.state.lock().unwrap().embedded;
-                    let long = me.health.lock().unwrap().loops_moved.elapsed() > Duration::from_secs(10);
+                    // Counted apart from loops_moved, which the excuse itself sets anew (fifth review).
+                    let long = me.health.lock().unwrap().excused_since.is_some_and(|t| t.elapsed() > Duration::from_secs(8));
                     if why.is_some() && stood_still && embedded && !long && parent_busy(me.parent) {
-                        me.health.lock().unwrap().loops_moved = Instant::now();
+                        let mut h = me.health.lock().unwrap();
+                        h.loops_moved = Instant::now();
+                        h.excused_since.get_or_insert_with(Instant::now);
                         why = None;
                     }
                     if let Some(why) = why {
@@ -1019,6 +1030,11 @@ fn child_main() -> i32 {
                 }
             }
             Msg::Json(ToVideo::Start { parent, title }) if video.is_none() => {
+                // Tests only: STREAMER_DEBUG_VP_SLOW_START_MS holds the window's start back, as a slow
+                // driver or disk would (frames then come before its first report).
+                if let Some(ms) = std::env::var("STREAMER_DEBUG_VP_SLOW_START_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
                 video = Some(ChildVideo::new(parent, &title, out.clone()));
             }
             Msg::Json(ToVideo::Close) => break,
