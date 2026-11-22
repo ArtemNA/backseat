@@ -37,6 +37,8 @@ mod scaler;
 mod overlay;
 #[cfg(windows)]
 pub mod present;
+#[cfg(windows)]
+pub mod videoproc;
 
 pub fn init() {
     platform::init_timer();

@@ -31,7 +31,7 @@ fn main() {
     };
     std::thread::sleep(Duration::from_secs(4));
     println!("both open      | a {:.1} fps | b {:.1} fps", fps(&wa, 3), fps(&wb, 3));
-    let (win_a, win_b) = (wa.viewer.window.expect("window a"), wb.viewer.window.expect("window b"));
+    let (win_a, win_b) = (wa.viewer.window.clone().expect("window a"), wb.viewer.window.clone().expect("window b"));
     s.unwatch(a);
     std::thread::sleep(Duration::from_secs(1));
     println!(

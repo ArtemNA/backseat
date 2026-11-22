@@ -1023,7 +1023,7 @@ fn background_rooms(app: &App) -> Vec<String> {
 /// window of its own is not touched by this (`present::place` ignores `hidden` for it).
 fn set_videos_hidden(s: &Session, hidden: bool) {
     for w in s.watching() {
-        if let Some(win) = w.viewer.window {
+        if let Some(win) = &w.viewer.window {
             win.set_hidden(hidden);
         }
     }
@@ -1122,9 +1122,9 @@ pub fn sources() -> Sources {
     Sources { monitors, windows }
 }
 
-pub fn video_window(app: &App, streamer: u64) -> Option<media::present::Window> {
+pub fn video_window(app: &App, streamer: u64) -> Option<media::videoproc::VideoWindow> {
     let s = app.session.lock().unwrap().clone()?;
-    s.watching().into_iter().find(|w| w.streamer == streamer)?.viewer.window
+    s.watching().into_iter().find(|w| w.streamer == streamer)?.viewer.window.clone()
 }
 
 /// What to do with a stream's video window: "show", "fullscreen" (on), "windowed",
@@ -1172,7 +1172,7 @@ pub fn set_muted(app: &App, streamer: u64, muted: bool) -> Result<(), String> {
 pub fn videos_hidden(app: &App, hidden: bool) {
     let Some(s) = app.session.lock().unwrap().clone() else { return };
     for w in s.watching() {
-        if let Some(win) = w.viewer.window {
+        if let Some(win) = &w.viewer.window {
             win.set_hidden(hidden);
         }
     }
@@ -1412,7 +1412,7 @@ pub fn automate(app: &Arc<App>) {
                         let Some(p) = s.peers().into_iter().find(|p| p.streaming && &p.name == name && p.id != s.id) else { return true };
                         match s.watch(p.id, viewer_config(&app), quality.clone()) {
                             Ok(w) => {
-                                test_window_actions(w.viewer.window);
+                                test_window_actions(w.viewer.window.clone());
                                 // Tests only: STREAMER_APP_TEST_MUTE mutes at +8 s and unmutes at +14 s.
                                 if std::env::var_os("STREAMER_APP_TEST_MUTE").is_some() {
                                     let w = w.clone();
@@ -1442,7 +1442,7 @@ pub fn automate(app: &Arc<App>) {
 
 /// Tests only: STREAMER_APP_AUTOWINDOW=1 makes the video window fullscreen and topmost
 /// after 3 s, and windowed again after 10 s.
-fn test_window_actions(w: Option<media::present::Window>) {
+fn test_window_actions(w: Option<media::videoproc::VideoWindow>) {
     let (Some(w), Some(mode)) = (w, std::env::var("STREAMER_APP_AUTOWINDOW").ok()) else { return };
     // "embed": pop out at +6 s, back in at +12 s, fullscreen at +18 s, back at +24 s.
     // "fsloop": from +5 s, fullscreen on and off 30 times at uneven intervals while the main
@@ -1460,10 +1460,11 @@ fn test_window_actions(w: Option<media::present::Window>) {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let spam = {
-                let (stop, w) = (stop.clone(), w);
+                let (stop, w) = (stop.clone(), w.clone());
                 std::thread::spawn(move || {
                     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                         if let Some(on_main) = ON_MAIN.get() {
+                            let w = w.clone();
                             on_main(Box::new(move || w.place_again()));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(3));

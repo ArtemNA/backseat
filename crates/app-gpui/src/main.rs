@@ -1126,6 +1126,9 @@ fn test_actions(cx: &mut Context<Shell>) {
 }
 
 fn main() {
+    // Started as the video process of a watched stream: that and nothing else.
+    #[cfg(windows)]
+    media::videoproc::run_if_asked();
     let Some(core) = core::start(|_, _| show_main_window()) else { return };
     testing::apply_test_prefs();
     i18n::init();

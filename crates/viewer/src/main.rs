@@ -17,6 +17,8 @@ const USAGE: &str = "usage: viewer (--server ws://HOST:PORT/ws [--room NAME] [--
 [--seconds 0] [--report-secs 5]";
 
 fn main() {
+    #[cfg(windows)]
+    media::videoproc::run_if_asked();
     let mut listen = "0.0.0.0:7700".to_string();
     let (mut server, mut room, mut name, mut watch) = (None::<String>, "default".to_string(), "viewer".to_string(), None::<String>);
     // Quality to ask the host for, as "720p30 4000"; the host never gives more than its own.
@@ -173,10 +175,19 @@ fn main() {
             // The quality rides on the subscription, so the stream starts at it.
             // STREAMER_DEBUG_QUALITY_LATE asks only after subscribing: the spoiled variant.
             let late = std::env::var_os("STREAMER_DEBUG_QUALITY_LATE").is_some();
+            // Probe only: STREAMER_DEBUG_PARENT="HWND X Y W H" puts the video inside another
+            // process's window at that slot, as the app's main window holds it.
+            let parent: Vec<i64> = std::env::var("STREAMER_DEBUG_PARENT").unwrap_or_default().split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            if parent.len() == 5 {
+                media::present::set_default_parent(parent[0] as isize);
+            }
             let w = s.watch(streamer, cfg, if late { None } else { quality.clone() }).unwrap_or_else(|e| {
                 eprintln!("viewer: {e}");
                 std::process::exit(1);
             });
+            if let (5, Some(win)) = (parent.len(), w.viewer.window.clone()) {
+                win.place(Some((parent[1] as i32, parent[2] as i32, parent[3] as i32, parent[4] as i32)));
+            }
             let s2 = s.clone();
             ask = Arc::new(move |q| s2.set_watch_quality(streamer, q));
             if late {

@@ -780,6 +780,8 @@ pub struct RenderStats {
     pub max_present_us: AtomicU64,
     /// Longest hold of the lock shared with the decoder.
     pub max_lock_us: AtomicU64,
+    /// Turns of the loop: stands still while it hangs (the app's watchdog reads it).
+    pub loops: AtomicU64,
 }
 
 struct Send_<T>(T);
@@ -964,6 +966,26 @@ impl Shared {
             dec,
             present,
         }
+    }
+}
+
+/// Probe only: STREAMER_DEBUG_HW_CRASH_AFTER=N raises a real integer divide by zero (the
+/// exception the NVIDIA driver raised on 2026-11-22) on this thread at the N-th frame shown.
+fn debug_crash(shown: u64) {
+    // Only the first STREAMER_DEBUG_HW_CRASH_RUNS (default 1) video processes of a watch
+    // (STREAMER_VIDEO_RUN counts them from 0), so a restart can be seen to work.
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    let at = *AT.get_or_init(|| num("STREAMER_DEBUG_HW_CRASH_AFTER").filter(|_| num("STREAMER_VIDEO_RUN").unwrap_or(0) < num("STREAMER_DEBUG_HW_CRASH_RUNS").unwrap_or(1)));
+    if at == Some(shown) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        // No "stopped working" box (SEM_NOGPFAULTERRORBOX): the probe runs unattended.
+        // SAFETY: deliberately faults; the process dies with EXCEPTION_INT_DIVIDE_BY_ZERO.
+        unsafe { SetErrorMode(0x0002) };
+        unsafe { std::arch::asm!("xor edx, edx", "xor ecx, ecx", "div ecx", out("eax") _, out("ecx") _, out("edx") _) };
     }
 }
 
@@ -1163,6 +1185,7 @@ unsafe fn run(
     let stretch = std::env::var_os("STREAMER_DEBUG_RESIZE_STRETCH").is_some();
     let mut msg = MSG::default();
     loop {
+        stats.loops.fetch_add(1, Ordering::Relaxed);
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {
                 return;
@@ -1465,7 +1488,8 @@ unsafe fn run(
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
             stats.skipped.fetch_add(1, Ordering::Relaxed);
         } else {
-            stats.presented.fetch_add(1, Ordering::Relaxed);
+            let n = stats.presented.fetch_add(1, Ordering::Relaxed) + 1;
+            debug_crash(n);
             if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
                 st.video = true;
             }

@@ -52,7 +52,10 @@ pub struct Viewer {
     render: Arc<crate::present::RenderStats>,
     /// The video window, unless headless.
     #[cfg(windows)]
-    pub window: Option<crate::present::Window>,
+    pub window: Option<crate::videoproc::VideoWindow>,
+    /// The video process crashed too often and gave up.
+    #[cfg(windows)]
+    pub video_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only loss on the path from the host.
     pub relay: Option<Arc<crate::netsim::LossRelay>>,
     /// Set when no direct connection could be made.
@@ -153,9 +156,24 @@ impl Viewer {
         };
         tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone(), (lag.clone(), ask));
 
+        // The video in a process of its own (decoder and window): a fault in the GPU driver
+        // ends only that process. STREAMER_VIDEO_IN_PROCESS: here, as before.
+        #[cfg(windows)]
+        let remote = (!cfg.headless && crate::videoproc::use_process()).then(|| {
+            crate::videoproc::Remote::start(
+                crate::present::default_parent(),
+                "",
+                crate::videoproc::StatsSink {
+                    frames: stats.frames.clone(),
+                    frame_interval: stats.frame_interval.clone(),
+                    video_latency: stats.video_latency.clone(),
+                    video_size: stats.video_size.clone(),
+                },
+            )
+        });
         #[cfg(windows)]
         // Headless (tests only): no window, no D3D device, no decoding.
-        let renderer = (!cfg.headless).then(|| {
+        let renderer = (!cfg.headless && remote.is_none()).then(|| {
             let r = crate::present::start();
             pipeline.set_context(&r.context);
             r
@@ -171,7 +189,12 @@ impl Viewer {
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         #[cfg(windows)]
-        let window = renderer.as_ref().map(|r| r.window);
+        let window = match &remote {
+            Some(r) => Some(crate::videoproc::VideoWindow::Remote(r.clone())),
+            None => renderer.as_ref().map(|r| crate::videoproc::VideoWindow::Local(r.window)),
+        };
+        #[cfg(windows)]
+        let remote2 = remote.clone();
         #[cfg(windows)]
         if let Some(w) = &window {
             // The video window's own sound controls (fullscreen, popped out) act here.
@@ -203,6 +226,15 @@ impl Viewer {
             let encoding = s.get::<&str>("encoding-name").unwrap_or("").to_ascii_lowercase();
             let result = match media {
                 "video" if cfg2.headless => add_headless_video(&pipeline, pad, &encoding),
+                #[cfg(windows)]
+                "video" if remote2.is_some() => {
+                    let c = crate::config::Codec::parse(&encoding);
+                    let dec = c.as_ref().map(|c| cfg2.decoder.clone().unwrap_or_else(|| platform::video_decoder(*c))).unwrap_or_default();
+                    if let Ok(c) = &c {
+                        *video_codec2.lock().unwrap() = Some((c.rtp_name().to_string(), dec.clone()));
+                    }
+                    add_remote_video(&pipeline, pad, &encoding, &cfg2, &clock, &stats2, started, remote2.as_ref().unwrap(), &dec)
+                }
                 "video" => {
                     #[cfg(windows)]
                     let tail = video_tail(frames_tx.clone());
@@ -227,9 +259,17 @@ impl Viewer {
             webrtc,
             stats,
             #[cfg(windows)]
-            window_closed: renderer.as_ref().map(|r| r.closed.clone()).unwrap_or_default(),
+            window_closed: match &remote {
+                Some(r) => r.closed.clone(),
+                None => renderer.as_ref().map(|r| r.closed.clone()).unwrap_or_default(),
+            },
             #[cfg(windows)]
-            render: renderer.map(|r| r.stats).unwrap_or_default(),
+            video_failed: remote.as_ref().map(|r| r.failed.clone()).unwrap_or_default(),
+            #[cfg(windows)]
+            render: match &remote {
+                Some(r) => r.render.clone(),
+                None => renderer.map(|r| r.stats).unwrap_or_default(),
+            },
             #[cfg(windows)]
             window,
             relay,
@@ -322,6 +362,19 @@ impl Viewer {
             Some(v) => v.set_property("mute", on),
             None => eprintln!("viewer: no audio branch to mute yet"),
         }
+        // The video window's own controls show it (in a video process, they keep a copy).
+        #[cfg(windows)]
+        if let Some(w) = &self.window {
+            w.sync_audio(on, self.volume());
+        }
+    }
+
+    /// The video process crashed too often and gave up.
+    pub fn video_failed(&self) -> bool {
+        #[cfg(windows)]
+        return self.video_failed.load(Ordering::Relaxed);
+        #[cfg(not(windows))]
+        return false;
     }
 
     pub fn muted(&self) -> bool {
@@ -470,7 +523,7 @@ fn add_headless_video(pipeline: &gst::Pipeline, pad: &gst::Pad, encoding: &str) 
     link_branch(pipeline, pad, &[depay, make("fakesink")?])
 }
 
-fn make(factory: &str) -> Result<gst::Element, String> {
+pub(crate) fn make(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
         .map_err(|e| format!("{factory}: {e}"))
@@ -478,7 +531,7 @@ fn make(factory: &str) -> Result<gst::Element, String> {
 
 /// Elements after the decoder, ending in a sink. Windows: our own swapchain.
 #[cfg(windows)]
-fn video_tail(frames: Option<std::sync::mpsc::Sender<(gst_app::AppSink, gst::Element)>>) -> Result<Vec<gst::Element>, String> {
+pub(crate) fn video_tail(frames: Option<std::sync::mpsc::Sender<(gst_app::AppSink, gst::Element)>>) -> Result<Vec<gst::Element>, String> {
     let caps = gst::Caps::builder("video/x-raw")
         .features(["memory:D3D11Memory"])
         .field("format", "BGRA")
@@ -566,6 +619,97 @@ fn add_video(
         }
         gst::PadProbeReturn::Ok
     });
+    Ok(())
+}
+
+/// The video branch when a video process decodes and shows it: depayloader and parser here,
+/// each whole frame (compressed) to the process with the host time it was captured at. The
+/// process asks for keyframes through `remote`; they go to the streamer as from a decoder.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn add_remote_video(
+    pipeline: &gst::Pipeline,
+    pad: &gst::Pad,
+    encoding: &str,
+    cfg: &ViewerConfig,
+    clock: &HostClock,
+    stats: &ViewerStats,
+    started: Instant,
+    remote: &Arc<crate::videoproc::Remote>,
+    decoder: &str,
+) -> Result<(), String> {
+    let codec = crate::config::Codec::parse(encoding)?;
+    let depay = make(&format!("rtp{}depay", codec.short()))?;
+    if cfg.wait_keyframe {
+        depay.set_property("wait-for-keyframe", true);
+    }
+    depay.set_property("request-keyframe", true);
+    // Frames go to the video process straight from the depayloader; its own parser runs
+    // there. A parser here held each frame until the next one began (one frame, 16.7 ms at
+    // 60 fps: 34.3 ms from capture to sent against 17.5 ms out of the depayloader,
+    // 2026-11-22). STREAMER_DEBUG_VP_PARSE_HERE: the parser here (the spoiled variant).
+    let sink = gst_app::AppSink::builder().sync(false).max_buffers(30).drop(false).build();
+    let mut chain = vec![depay.clone()];
+    if std::env::var_os("STREAMER_DEBUG_VP_PARSE_HERE").is_some() {
+        chain.push(make(&format!("{}parse", codec.short()))?);
+    }
+    chain.push(sink.clone().upcast());
+    link_branch(pipeline, pad, &chain)?;
+    let by_pts = measure_in(&depay, 90_000, clock, started, Some(stats.video_before_decoder.clone()));
+    // A keyframe for the video process: the same ask a decoder makes, up to the streamer.
+    let sink_pad = sink.static_pad("sink").unwrap().downgrade();
+    remote.set_keyframe_request(Arc::new(move || {
+        if let Some(p) = sink_pad.upgrade() {
+            let s = gst::Structure::builder("GstForceKeyUnit").field("all-headers", true).build();
+            p.push_event(gst::event::CustomUpstream::new(s));
+        }
+    }));
+    let (r, clock, decoder) = (Arc::downgrade(remote), clock.clone(), decoder.to_string());
+    let caps_sent = Mutex::new(String::new());
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |s| {
+                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let Some(remote) = r.upgrade() else { return Err(gst::FlowError::Flushing) };
+                if let Some(c) = sample.caps().map(|c| c.to_string()) {
+                    let mut sent = caps_sent.lock().unwrap();
+                    if *sent != c {
+                        remote.set_stream(&c, &decoder);
+                        *sent = c;
+                    }
+                }
+                let Some(b) = sample.buffer() else { return Ok(gst::FlowSuccess::Ok) };
+                let pts = b.pts().map(|p| p.nseconds());
+                let sent_host = pts.and_then(|p| by_pts.lock().unwrap().iter().rev().find(|(k, _)| *k == p).map(|(_, v)| *v));
+                let host_minus_qpc = clock.host_now().map(|h| h as i64 - crate::videolink::qpc_ns() as i64);
+                // STREAMER_DEBUG_VP_TIMING: capture to sent to the video process, each 2 s.
+                if std::env::var_os("STREAMER_DEBUG_VP_TIMING").is_some() {
+                    static ACC: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+                    if let (Some(s), Some(h)) = (sent_host, clock.host_now()) {
+                        let mut a = ACC.lock().unwrap();
+                        a.push(h.saturating_sub(s) as f64 / 1e6);
+                        if a.len() >= 120 {
+                            a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                            eprintln!("video timing: capture to sent median {:.2} ms", a[a.len() / 2]);
+                            a.clear();
+                        }
+                    }
+                }
+                let data = b.map_readable().map(|m| m.to_vec()).unwrap_or_default();
+                remote.push(crate::videolink::Frame {
+                    pts,
+                    dts: b.dts().map(|p| p.nseconds()),
+                    duration: b.duration().map(|p| p.nseconds()),
+                    delta: b.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                    discont: b.flags().contains(gst::BufferFlags::DISCONT),
+                    sent_host,
+                    host_minus_qpc,
+                    data,
+                });
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
     Ok(())
 }
 
@@ -706,6 +850,26 @@ fn measure(
     before_decoder: Option<Series>,
     after_decoder: Series,
 ) {
+    let by_pts = measure_in(depay, clock_rate, clock, started, before_decoder);
+    let clock = clock.clone();
+    decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if started.elapsed().as_secs() < 3 {
+            return gst::PadProbeReturn::Ok;
+        }
+        let Some(pts) = info.buffer().and_then(|b| b.pts()).map(|p| p.nseconds()) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let sent = by_pts.lock().unwrap().iter().rev().find(|(k, _)| *k == pts).map(|(_, v)| *v);
+        if let (Some(sent), Some(now)) = (sent, clock.host_now()) {
+            after_decoder.push(now.saturating_sub(sent));
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// The depayloader's side of the latency measurement: network and jitterbuffer delay, and
+/// each frame's pts with the host time it was captured at.
+fn measure_in(depay: &gst::Element, clock_rate: u64, clock: &HostClock, started: Instant, before_decoder: Option<Series>) -> Arc<Mutex<VecDeque<(u64, u64)>>> {
     let last_rtp = Arc::new(AtomicU64::new(0));
     let rtp_in = last_rtp.clone();
     depay.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
@@ -735,19 +899,5 @@ fn measure(
         }
         gst::PadProbeReturn::Ok
     });
-
-    let clock = clock.clone();
-    decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        if started.elapsed().as_secs() < 3 {
-            return gst::PadProbeReturn::Ok;
-        }
-        let Some(pts) = info.buffer().and_then(|b| b.pts()).map(|p| p.nseconds()) else {
-            return gst::PadProbeReturn::Ok;
-        };
-        let sent = by_pts.lock().unwrap().iter().rev().find(|(k, _)| *k == pts).map(|(_, v)| *v);
-        if let (Some(sent), Some(now)) = (sent, clock.host_now()) {
-            after_decoder.push(now.saturating_sub(sent));
-        }
-        gst::PadProbeReturn::Ok
-    });
+    by_pts
 }

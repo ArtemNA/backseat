@@ -350,7 +350,7 @@ impl Session {
         let viewer = Arc::new(Viewer::new(cfg, clock.clone(), link.clone())?);
         viewer.start()?;
         #[cfg(windows)]
-        if let (Some(win), Some(p)) = (viewer.window, self.peers().into_iter().find(|p| p.id == streamer)) {
+        if let (Some(win), Some(p)) = (viewer.window.clone(), self.peers().into_iter().find(|p| p.id == streamer)) {
             win.set_title(&p.name);
         }
         let w = Arc::new(Watch {
@@ -369,6 +369,13 @@ impl Session {
             while !w2.stop.load(Ordering::SeqCst) {
                 w2.link.send("ping", &w2.clock.local_ns().to_string());
                 std::thread::sleep(Duration::from_millis(200));
+                // The video process crashed again and again: the watch ends, and says so.
+                if w2.viewer.video_failed() {
+                    if let Some(s) = weak.upgrade() {
+                        s.end_watch(w2.streamer, "the video stopped working", true);
+                    }
+                    return;
+                }
                 if w2.viewer.window_closed() {
                     if let Some(s) = weak.upgrade() {
                         s.end_watch(w2.streamer, "window closed", true);
@@ -406,7 +413,7 @@ impl Session {
         let _ = w.viewer.pipeline.set_state(gst::State::Null);
         // The video window goes with the watch.
         #[cfg(windows)]
-        if let Some(win) = w.viewer.window {
+        if let Some(win) = &w.viewer.window {
             win.close();
         }
         let _ = self.events.send(Event::WatchEnded { streamer, reason: reason.into() });

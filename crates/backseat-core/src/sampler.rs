@@ -112,7 +112,7 @@ impl Sampler {
         if let Some(s) = session {
             for w in s.watching() {
                 let Some(x) = watches.iter_mut().find(|x| x.streamer == w.streamer) else { continue };
-                if let Some(win) = w.viewer.window {
+                if let Some(win) = &w.viewer.window {
                     let st = win.state();
                     x.overlay = st.overlay;
                     x.badge = st.badge;
@@ -246,7 +246,7 @@ fn sample(inner: &Mutex<Inner>) {
             i.net.insert(w.streamer, n);
         }
         seen.push(w.streamer);
-        let st = w.viewer.window.map(|x| x.state()).unwrap_or_default();
+        let st = w.viewer.window.as_ref().map(|x| x.state()).unwrap_or_default();
         watches.push(WatchStats {
             mbit,
             loss_pct,
@@ -270,8 +270,8 @@ fn sample(inner: &Mutex<Inner>) {
             latency_ms: if lat.is_empty() { 0.0 } else { lat.ms(0.5) },
             window_closed: w.viewer.window_closed(),
             quality: w.quality.lock().unwrap().clone(),
-            fullscreen: w.viewer.window.map(|x| x.state().fullscreen).unwrap_or(false),
-            topmost: w.viewer.window.map(|x| x.state().topmost).unwrap_or(false),
+            fullscreen: w.viewer.window.as_ref().map(|x| x.state().fullscreen).unwrap_or(false),
+            topmost: w.viewer.window.as_ref().map(|x| x.state().topmost).unwrap_or(false),
             gap_p99_ms: if gaps.is_empty() { 0.0 } else { gaps.ms(0.99) },
             gap_max_ms: if gaps.is_empty() { 0.0 } else { gaps.ms(1.0) },
         });
@@ -283,7 +283,7 @@ fn sample(inner: &Mutex<Inner>) {
     }
     let names: HashMap<u64, String> = s.peers().into_iter().map(|p| (p.id, p.name)).collect();
     for w in s.watching() {
-        if let Some(win) = w.viewer.window {
+        if let Some(win) = &w.viewer.window {
             if w.viewer.stats.frames.load(Ordering::Relaxed) == 0 {
                 let name = names.get(&w.streamer).cloned().unwrap_or_default();
                 let p = match (w.viewer.ice_failed.load(Ordering::Relaxed), w.viewer.offered.load(Ordering::Relaxed)) {
@@ -297,10 +297,10 @@ fn sample(inner: &Mutex<Inner>) {
             }
         }
         let Some(st) = watches.iter().find(|x| x.streamer == w.streamer) else { continue };
-        if let (Some(win), true) = (w.viewer.window, st.overlay) {
+        if let (Some(win), true) = (&w.viewer.window, st.overlay) {
             win.set_overlay_text(&overlay_text(st));
         }
-        if let (Some(win), true) = (w.viewer.window, st.badge) {
+        if let (Some(win), true) = (&w.viewer.window, st.badge) {
             let codec = w.viewer.video_codec.lock().unwrap().as_ref().map(|(c, _)| c.clone()).unwrap_or_default();
             let size = *w.viewer.stats.video_size.lock().unwrap();
             let (text, ok) = badge_line(size, st, &codec);

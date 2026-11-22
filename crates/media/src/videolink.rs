@@ -34,10 +34,10 @@ const FRAME_HEADER: usize = 8 * 5 + 4 + 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum ToVideo {
-    /// First message: what comes and where to show it.
-    Start { caps: String, decoder: String, parent: isize, title: String },
-    /// The compressed stream's caps changed.
-    Caps { caps: String },
+    /// First message: the window (inside `parent`, the app's main window; 0: its own).
+    Start { parent: isize, title: String },
+    /// The compressed stream's caps and the decoder for it; again when they change.
+    Stream { caps: String, decoder: String },
     Place { rect: Option<(i32, i32, i32, i32)> },
     Hidden { on: bool },
     Popped { on: bool },
@@ -225,7 +225,8 @@ mod tests {
         let mut buf = Vec::new();
         let frames: Vec<Frame> = (0..20).map(|n| frame(n, n % 5 != 0)).collect();
         let cmds = vec![
-            ToVideo::Start { caps: "video/x-av1".into(), decoder: "d3d11av1dec".into(), parent: 123456, title: "Стрім — ü ✓".into() },
+            ToVideo::Start { parent: 123456, title: "Стрім — ü ✓".into() },
+            ToVideo::Stream { caps: "video/x-av1, stream-format=(string)obu-stream".into(), decoder: "d3d11av1dec".into() },
             ToVideo::Place { rect: Some((1, 2, 300, 200)) },
             ToVideo::Audio { muted: true, volume: 0.5 },
             ToVideo::Close,

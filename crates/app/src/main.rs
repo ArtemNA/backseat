@@ -356,6 +356,8 @@ fn show_main_window() {
 }
 
 fn main() {
+    #[cfg(windows)]
+    media::videoproc::run_if_asked();
     if core::testing() && std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
         // Test runs keep their saved rooms and settings out of the real app's profile.
         // Runs before any other thread starts.
