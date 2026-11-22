@@ -672,6 +672,7 @@ fn add_remote_video(
         }
     }));
     let (r, clock, decoder) = (Arc::downgrade(remote), clock.clone(), decoder.to_string());
+    let is_av1 = codec.short() == "av1";
     let caps_sent = Mutex::new(String::new());
     sink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
@@ -703,11 +704,29 @@ fn add_remote_video(
                     }
                 }
                 let data = b.map_readable().map(|m| m.to_vec()).unwrap_or_default();
+                // STREAMER_DEBUG_VP_DELTA: each 120 frames, how many the depayloader marked
+                // as not keyframes, and the sizes of those it did not (keyframes are big).
+                if std::env::var_os("STREAMER_DEBUG_VP_DELTA").is_some() {
+                    static ACC: Mutex<(u32, Vec<usize>)> = Mutex::new((0, Vec::new()));
+                    let mut a = ACC.lock().unwrap();
+                    let d = if is_av1 { !crate::videolink::av1_has_sequence_header(&data) } else { b.flags().contains(gst::BufferFlags::DELTA_UNIT) };
+                    if d {
+                        a.0 += 1;
+                    } else {
+                        a.1.push(data.len());
+                    }
+                    if a.0 as usize + a.1.len() >= 120 {
+                        eprintln!("video delta: {} marked delta, {} not, their sizes {:?}", a.0, a.1.len(), a.1);
+                        *a = (0, Vec::new());
+                    }
+                }
                 remote.push(crate::videolink::Frame {
                     pts,
                     dts: b.dts().map(|p| p.nseconds()),
                     duration: b.duration().map(|p| p.nseconds()),
-                    delta: b.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                    // rtpav1depay marks nothing as delta: AV1 keyframes are told by their
+                    // sequence header. STREAMER_DEBUG_VP_AV1_FLAGS: by the flag (the spoiled variant).
+                    delta: if is_av1 && std::env::var_os("STREAMER_DEBUG_VP_AV1_FLAGS").is_none() { !crate::videolink::av1_has_sequence_header(&data) } else { b.flags().contains(gst::BufferFlags::DELTA_UNIT) },
                     discont: b.flags().contains(gst::BufferFlags::DISCONT),
                     sent_host,
                     host_minus_qpc,

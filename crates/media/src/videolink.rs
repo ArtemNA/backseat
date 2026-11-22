@@ -123,7 +123,8 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> std::io::Result<()> {
     w.write_all(&head)?;
     // STREAMER_DEBUG_LINK_SLOW: 2 ms between header and data (the spoiled variant of the
     // link's delay test).
-    if std::env::var_os("STREAMER_DEBUG_LINK_SLOW").is_some() {
+    static SLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SLOW.get_or_init(|| std::env::var_os("STREAMER_DEBUG_LINK_SLOW").is_some()) {
         w.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -176,6 +177,39 @@ pub fn read<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> std::io::Result<
         KIND_JSON => serde_json::from_slice(&body).map(|m| Some(Msg::Json(m))).map_err(std::io::Error::other),
         k => Err(std::io::Error::other(format!("unknown message kind {k}"))),
     }
+}
+
+/// Whether an AV1 temporal unit (OBU stream) starts a keyframe: it carries a sequence header
+/// OBU, which encoders send with each keyframe. rtpav1depay marks no frame as a delta unit
+/// (seen 2026-11-22: 120 of 120 unmarked), so this tells them apart.
+pub fn av1_has_sequence_header(mut data: &[u8]) -> bool {
+    while let Some(&h) = data.first() {
+        let obu_type = (h >> 3) & 0x0F;
+        let ext = h & 0x04 != 0;
+        let has_size = h & 0x02 != 0;
+        if obu_type == 1 {
+            return true;
+        }
+        let mut i = 1 + ext as usize;
+        if !has_size {
+            // The last OBU runs to the end.
+            return false;
+        }
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let Some(&b) = data.get(i) else { return false };
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            if b & 0x80 == 0 || shift >= 56 {
+                break;
+            }
+            shift += 7;
+        }
+        let Some(rest) = data.get(i.saturating_add(size)..) else { return false };
+        data = rest;
+    }
+    false
 }
 
 /// A clock both processes share: the performance counter, in ns.
@@ -251,6 +285,20 @@ mod tests {
         let mut b = Vec::new();
         write_json(&mut b, &rep).unwrap();
         assert!(matches!(read::<FromVideo>(&mut b.as_slice()).unwrap(), Some(Msg::Json(x)) if x == rep));
+    }
+
+    #[test]
+    fn av1_keyframes_are_told_by_their_sequence_header() {
+        // Temporal delimiter (type 2, size 0), then a sequence header (type 1, 3 bytes).
+        assert!(av1_has_sequence_header(&[0x12, 0x00, 0x0A, 0x03, 1, 2, 3, 0x32, 0x01, 9]));
+        // Temporal delimiter, then a frame (type 6) of 200 bytes (two-byte size).
+        let mut delta = vec![0x12, 0x00, 0x32, 0xC8, 0x01];
+        delta.extend(std::iter::repeat_n(0u8, 200));
+        assert!(!av1_has_sequence_header(&delta));
+        // Cut short, empty, or a size past the end: not a keyframe, no panic.
+        assert!(!av1_has_sequence_header(&[0x32, 0xFF]));
+        assert!(!av1_has_sequence_header(&[]));
+        assert!(!av1_has_sequence_header(&[0x32, 0x7F, 1, 2]));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 fn main() {
+    // Each watch's video runs in a copy of this program started with --video-process.
+    media::videoproc::run_if_asked();
     let url = std::env::args().nth(1).unwrap_or("ws://127.0.0.1:7800/ws".into());
     media::init();
     let (s, _events) = Session::join(&url, "tw", "watcher").expect("join");

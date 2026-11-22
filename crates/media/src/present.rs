@@ -415,7 +415,10 @@ unsafe fn controls_mouse(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
         let over_panel = showing && crate::controls::hit(size, scale, p.x, p.y) != crate::controls::Hit::Outside;
         let mut map = WINDOWS.lock().unwrap();
         if let Some(st) = map.get_mut(&(hwnd.0 as isize)) {
-            if st.fullscreen.is_some() && !over_panel && size.0 > 0 && size.1 > 0 {
+            // Only with the cursor over the picture (the wheel can come to the focused window
+            // from a cursor on another monitor).
+            let inside = p.x >= 0 && p.y >= 0 && (p.x as u32) < size.0 && (p.y as u32) < size.1;
+            if st.fullscreen.is_some() && !over_panel && inside {
                 let notches = ((w.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
                 st.zoom = st.zoom.wheel(notches, (p.x as f32 / size.0 as f32, p.y as f32 / size.1 as f32));
                 return true;
@@ -598,7 +601,8 @@ unsafe fn blit(pdevice: &ID3D11Device, pcontext: &ID3D11DeviceContext, scaler: &
 /// shot-<n>.bmp there (a window drawn by a swapchain cannot be pictured from outside).
 unsafe fn debug_shot(device: &ID3D11Device, context: &ID3D11DeviceContext, back: &ID3D11Texture2D) {
     static NEXT: Mutex<Option<(std::time::Instant, u32)>> = Mutex::new(None);
-    let Some(dir) = std::env::var_os("STREAMER_DEBUG_SHOT") else { return };
+    static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("STREAMER_DEBUG_SHOT")).clone() else { return };
     let n = {
         let mut g = NEXT.lock().unwrap();
         match *g {
@@ -835,6 +839,7 @@ unsafe fn fullscreen_old(hwnd: HWND, mode: usize) {
         let _ = SetForegroundWindow(hwnd);
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
         st.fullscreen = Some((place, style));
+        st.zoom = Default::default();
     } else if st.fs_from_embedded {
         st.fullscreen = None;
         st.zoom = Default::default();
@@ -877,6 +882,7 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         // Marked first, so a `place` arriving meanwhile leaves the window alone.
         let mark = |f: &mut WinState| {
             f.fullscreen = Some((WINDOWPLACEMENT::default(), 0));
+            f.zoom = Default::default();
             f.fs_from_embedded = embedded;
         };
         if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
@@ -911,6 +917,7 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
         if let Some(st) = WINDOWS.lock().unwrap().get_mut(&(hwnd.0 as isize)) {
             st.fullscreen = Some((place, style));
+            st.zoom = Default::default();
         }
     } else {
         let (from_embedded, saved) = {
@@ -949,9 +956,27 @@ pub struct RenderStats {
 struct Send_<T>(T);
 unsafe impl<T> Send for Send_<T> {}
 
+/// Messages handled by the window thread, and its half-second timer: they go on inside the
+/// modal loop of a move or resize by the user (or the system menu), where the presentation
+/// loop's own count stands still. The video process's watchdog reads both
+/// (review 2026-11-22: holding a popped-out window's title bar for 5 s got it ended).
+static TICKS: AtomicU64 = AtomicU64::new(0);
+const TICK_TIMER: usize = 0x5EED;
+
+/// Signs of life of the video windows' thread: loop turns and messages handled.
+pub fn ticks() -> u64 {
+    // STREAMER_DEBUG_NO_TICK_TIMER: neither the timer nor the messages count (the old way).
+    if std::env::var_os("STREAMER_DEBUG_NO_TICK_TIMER").is_some() {
+        return 0;
+    }
+    TICKS.load(Ordering::Relaxed)
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    TICKS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         match msg {
+            WM_TIMER if w.0 == TICK_TIMER => LRESULT(0),
             WM_CLOSE => {
                 // The user closed a popped-out video: it goes back into the app.
                 let back = {
@@ -1266,6 +1291,11 @@ unsafe fn run(
         )
         .unwrap()
     };
+    // A message every 500 ms even inside a modal move/resize loop (see `TICKS`).
+    // STREAMER_DEBUG_NO_TICK_TIMER: none (the spoiled variant).
+    if std::env::var_os("STREAMER_DEBUG_NO_TICK_TIMER").is_none() {
+        SetTimer(Some(hwnd), TICK_TIMER, 500, None);
+    }
     // STREAMER_OVERLAY=1: windows open with the overlay on (diagnosis and tests).
     let overlay_on = std::env::var_os("STREAMER_OVERLAY").is_some() || OVERLAY.load(Ordering::Relaxed);
     WINDOWS.lock().unwrap().insert(
