@@ -225,7 +225,7 @@ impl Viewer {
             let media = s.get::<&str>("media").unwrap_or("");
             let encoding = s.get::<&str>("encoding-name").unwrap_or("").to_ascii_lowercase();
             let result = match media {
-                "video" if cfg2.headless => add_headless_video(&pipeline, pad, &encoding),
+                "video" if cfg2.headless => add_headless_video(&pipeline, pad, &encoding, &stats2),
                 #[cfg(windows)]
                 "video" if remote2.is_some() => {
                     let c = crate::config::Codec::parse(&encoding);
@@ -516,10 +516,17 @@ fn watch_transit(jb: &gst::Element, transit: Series, (lag, ask): LagHook) {
 
 /// Test-only video branch: depayloads and asks for keyframes on loss, like a decoder would,
 /// but never touches the GPU.
-fn add_headless_video(pipeline: &gst::Pipeline, pad: &gst::Pad, encoding: &str) -> Result<(), String> {
+fn add_headless_video(pipeline: &gst::Pipeline, pad: &gst::Pad, encoding: &str, stats: &ViewerStats) -> Result<(), String> {
     let codec = crate::config::Codec::parse(encoding)?;
     let depay = make(&format!("rtp{}depay", codec.short()))?;
     depay.set_property("request-keyframe", true);
+    // Whole frames out of the depayloader count as frames (nothing is decoded here), so the
+    // sound watch sees the picture going on.
+    let frames = stats.frames.clone();
+    depay.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        frames.fetch_add(1, Ordering::Relaxed);
+        gst::PadProbeReturn::Ok
+    });
     link_branch(pipeline, pad, &[depay, make("fakesink")?])
 }
 
@@ -811,6 +818,7 @@ fn add_audio(
     } else {
         None
     };
+    let own_sink = shared_tail.is_none().then(|| sink.clone());
     let chain = if let Some((tail, input)) = shared_tail {
         *audio.output.lock().unwrap() = Some(input);
         let mut c = vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume];
@@ -821,7 +829,74 @@ fn add_audio(
     };
     link_branch(pipeline, pad, &chain)?;
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
+    eprintln!("viewer: sound branch ready ({}, sync {audio_sync})", if own_sink.is_some() { "own output" } else { "shared output" });
+    // Tests only: STREAMER_DEBUG_SOUND_GONE_AFTER=N drops the decoded sound after N s (the
+    // sound watch must notice).
+    if let Some(n) = std::env::var("STREAMER_DEBUG_SOUND_GONE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) {
+        let t0 = Instant::now();
+        decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| if t0.elapsed().as_secs() >= n { gst::PadProbeReturn::Drop } else { gst::PadProbeReturn::Ok });
+    }
+    watch_sound(&depay, &decoder, own_sink, stats.frames.clone());
     Ok(())
+}
+
+/// Logs a stream's sound going missing while its picture goes on (reported 2026-11-22: a
+/// stream sometimes had no sound until watched again), with where it stops: packets in,
+/// decoded, played or dropped late by the output (own output only). Once when it goes, once
+/// when it comes back.
+fn watch_sound(depay: &gst::Element, decoder: &gst::Element, sink: Option<gst::Element>, frames: Arc<AtomicU64>) {
+    let counter = |e: &gst::Element, pad: &str| {
+        let n = Arc::new(AtomicU64::new(0));
+        let c = n.clone();
+        e.static_pad(pad).unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+        n
+    };
+    let (packets, decoded) = (counter(depay, "sink"), counter(decoder, "src"));
+    let (dw, sw) = (depay.downgrade(), sink.map(|s| s.downgrade()));
+    let stats = move || -> Option<(u64, u64)> {
+        let s = sw.as_ref()?.upgrade()?;
+        let st = s.property::<gst::Structure>("stats");
+        Some((st.get::<u64>("rendered").unwrap_or(0), st.get::<u64>("dropped").unwrap_or(0)))
+    };
+    let _ = std::thread::Builder::new().name("sound-watch".into()).spawn(move || {
+        let mut last = (packets.load(Ordering::Relaxed), decoded.load(Ordering::Relaxed), stats(), frames.load(Ordering::Relaxed));
+        let (mut quiet, mut told, mut first) = (0u32, false, true);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if dw.upgrade().is_none() {
+                return;
+            }
+            let now = (packets.load(Ordering::Relaxed), decoded.load(Ordering::Relaxed), stats(), frames.load(Ordering::Relaxed));
+            let (p, d) = (now.0 - last.0, now.1 - last.1);
+            let (r, dr) = match (now.2, last.2) {
+                (Some(a), Some(b)) => (Some(a.0.saturating_sub(b.0)), a.1.saturating_sub(b.1)),
+                _ => (None, 0),
+            };
+            let video = now.3 > last.3;
+            if first && d > 0 {
+                eprintln!("viewer: sound coming");
+                first = false;
+            }
+            // Played: by the own output's count, or (shared output) by what was decoded.
+            let playing = r.map_or(d > 0, |r| r > 0);
+            quiet = if playing || !video { 0 } else { quiet + 1 };
+            if quiet == 3 && !told {
+                told = true;
+                eprintln!(
+                    "viewer: no sound for 3 s while the picture goes on: audio packets in {p}/s, decoded {d}/s, played {}, dropped by the output {dr}/s",
+                    r.map(|r| format!("{r}/s")).unwrap_or("? (shared output)".into())
+                );
+            }
+            if playing && told {
+                told = false;
+                eprintln!("viewer: sound back");
+            }
+            last = now;
+        }
+    });
 }
 
 fn add_fakesink(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<(), String> {
