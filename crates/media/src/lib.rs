@@ -20,6 +20,7 @@ pub mod signal;
 pub mod stats;
 pub mod thumbs;
 pub mod viewer;
+pub mod videolink;
 pub mod voice;
 pub mod mictest;
 pub mod audio_apps;
