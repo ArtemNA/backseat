@@ -2,6 +2,15 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.19
+
+- **Video in its own process:** a friend's stream is decoded and shown by a separate process (`backseat.exe --video-process`). If the video decoder or driver crashes, only the video stops, never the whole app; it starts again by itself within 1–3 s. If it keeps failing (4 crashes in a minute, or 3 starts in a row without a picture), the watch ends with "The video stopped working". Latency is the same as before; it takes about 30 MB more memory.
+- **Zoom in fullscreen:** with the video itself in fullscreen, the mouse wheel over the picture zooms in (up to 4×) toward the cursor. Over the panel, or outside fullscreen, the wheel still sets the volume. Zoom resets when you leave fullscreen.
+- The video window is no longer offered as a source to stream.
+- A second click on Watch while the stream is opening no longer starts a second watch or shows an error.
+- Fullscreen and pop-out show their new state at once.
+- The log now says when the picture stops for a while or the stream's sound goes missing, to find those rare cases.
+
 ## 0.2.18
 
 - Closing the window you stream now ends the stream, and you are told why. Before, viewers kept its last frame, and changing the source afterwards showed them nothing.
