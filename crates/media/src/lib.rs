@@ -23,6 +23,7 @@ pub mod viewer;
 pub mod videolink;
 pub mod voice;
 pub mod mictest;
+pub mod denoise;
 pub mod audio_apps;
 
 #[cfg(windows)]
@@ -39,8 +40,6 @@ mod overlay;
 pub mod present;
 #[cfg(windows)]
 pub mod videoproc;
-#[cfg(windows)]
-pub mod denoise;
 
 pub fn init() {
     platform::init_timer();

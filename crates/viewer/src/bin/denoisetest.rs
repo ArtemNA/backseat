@@ -82,6 +82,8 @@ fn write(path: &str, x: &[f32]) {
 }
 
 fn main() {
+    // A file goes faster than real time: the denoiser must be ready before it starts.
+    std::env::set_var("STREAMER_DEBUG_DFN_WAIT_LOAD", "1");
     media::init();
     let a: Vec<String> = std::env::args().collect();
     let plain = media::voice::DspConfig { echo_cancel: false, noise: None, auto_gain: false, deepfilter: false, deepfilter_strength: 1 };

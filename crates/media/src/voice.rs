@@ -71,11 +71,24 @@ impl Default for DspConfig {
     }
 }
 
+/// webrtcdsp's noise suppression levels.
+pub const WEBRTC_LEVELS: [&str; 4] = ["low", "moderate", "high", "very-high"];
+
 impl DspConfig {
     /// Noise and gain on a webrtcdsp (echo cancelling is set by the caller). `tested`: a
     /// steady test tone, which both would take for noise: off.
     pub fn apply(&self, dsp: &gst::Element, tested: bool) {
         let noise = self.noise.as_deref().filter(|_| !tested);
+        // Only webrtcdsp's own level names: another (a newer version's choice in the shared
+        // settings) panicked inside GStreamer's setter and took the app down.
+        let noise = match noise {
+            // STREAMER_DEBUG_NOISE_UNCHECKED: no check, as before (a test's spoiled run).
+            Some(l) if !WEBRTC_LEVELS.contains(&l) && std::env::var_os("STREAMER_DEBUG_NOISE_UNCHECKED").is_none() => {
+                eprintln!("voice: unknown noise suppression level {l:?}, none");
+                None
+            }
+            n => n,
+        };
         dsp.set_property("noise-suppression", noise.is_some());
         if let Some(level) = noise {
             dsp.set_property_from_str("noise-suppression-level", level);
@@ -885,4 +898,23 @@ fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: P
         });
     }
     Ok((chain, mix_pad))
+}
+
+#[cfg(test)]
+mod tests {
+    use gst::prelude::*;
+
+    /// A noise choice webrtcdsp does not know (another version's, in the shared settings)
+    /// turns its noise suppression off instead of panicking in the setter.
+    #[test]
+    fn unknown_noise_level_is_ignored() {
+        crate::init();
+        let dsp = gst::ElementFactory::make("webrtcdsp").build().expect("webrtcdsp");
+        let cfg = super::DspConfig { noise: Some("deepfilter".into()), ..Default::default() };
+        cfg.apply(&dsp, false);
+        assert!(!dsp.property::<bool>("noise-suppression"));
+        let known = super::DspConfig { noise: Some("high".into()), ..Default::default() };
+        known.apply(&dsp, false);
+        assert!(dsp.property::<bool>("noise-suppression"));
+    }
 }

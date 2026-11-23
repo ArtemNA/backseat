@@ -1055,7 +1055,7 @@ impl Shell {
                     .flex_col()
                     .gap_2()
                     .child(field(tu("voice.noise"), pick(Some("voice"), "noise")))
-                    .when(matches!(pref("voice", "noise").as_str(), "" | "rnnoise" | "deepfilter"), |d| d.child(field(tu("voice.dfn"), pick(Some("voice"), "dfn"))))
+                    .when(crate::voice_ui::denoiser_on(&pref("voice", "noise")), |d| d.child(field(tu("voice.dfn"), pick(Some("voice"), "dfn"))))
                     .child(check("set-voice-echo", t("voice.echo"), "voiceEcho", true, cx))
                     .child(check("set-voice-gain", t("voice.gain"), "voiceGain", true, cx));
                 let sounds_col = div()

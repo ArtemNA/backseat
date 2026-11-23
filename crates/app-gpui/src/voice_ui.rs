@@ -30,6 +30,11 @@ fn flag(key: &str) -> bool {
     settings().get(key).and_then(|v| v.as_bool()) != Some(false)
 }
 
+/// Whether the saved noise choice means DeepFilterNet: all but "off" and the WebRTC levels.
+pub fn denoiser_on(noise: &str) -> bool {
+    noise != "off" && !media::voice::WEBRTC_LEVELS.contains(&noise)
+}
+
 /// The voice settings as saved, for the core.
 pub fn saved() -> core::VoiceSettings {
     let ptt = voice_pref("mode").as_deref() == Some("ptt");
@@ -45,14 +50,11 @@ pub fn saved() -> core::VoiceSettings {
         stream_echo: settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true),
         dsp: media::voice::DspConfig {
             echo_cancel: flag("voiceEcho"),
-            // Unset (and the former "rnnoise", "deepfilter"): DeepFilterNet; "off": none;
-            // else the WebRTC level.
-            noise: match voice_pref("noise").as_deref() {
-                None | Some("off") | Some("rnnoise") | Some("deepfilter") => None,
-                Some(v) => Some(v.to_string()),
-            },
+            // A WebRTC level by its name; "off": none; anything else (unset, the former
+            // "rnnoise", "deepfilter", a value from another version): DeepFilterNet.
+            noise: voice_pref("noise").filter(|v| media::voice::WEBRTC_LEVELS.contains(&v.as_str())),
             auto_gain: flag("voiceGain"),
-            deepfilter: matches!(voice_pref("noise").as_deref(), None | Some("rnnoise") | Some("deepfilter")),
+            deepfilter: denoiser_on(&voice_pref("noise").unwrap_or_default()),
             deepfilter_strength: match voice_pref("dfn").as_deref() {
                 Some("strong") => 0,
                 Some("soft") => 2,
@@ -283,5 +285,18 @@ pub fn test_volume(shell: &mut Shell) {
         core::set_peer_volume(&shell.core, p.id, v as f64 / 100.0);
         save_volume(name, v);
         eprintln!("test voice: volume of {name} set to {v}%");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn noise_choice_maps_to_the_denoiser() {
+        for v in ["", "rnnoise", "deepfilter", "something-newer"] {
+            assert!(super::denoiser_on(v), "{v:?} should mean DeepFilterNet");
+        }
+        for v in ["off", "low", "moderate", "high", "very-high"] {
+            assert!(!super::denoiser_on(v), "{v:?} should not mean DeepFilterNet");
+        }
     }
 }
