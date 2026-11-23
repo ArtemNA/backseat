@@ -2,6 +2,14 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.21
+
+- **A stream made fullscreen from inside the app no longer shows as a separate window** in Alt-Tab and the taskbar; Alt-Tab to Backseat brings it back. Back from fullscreen, it returns to its place in the app. A video popped out into its own window shows the app's icon.
+- **The go-live dialog shows your monitors as Windows lays them out**, to scale (side by side, above or below); click one to stream it. The primary monitor is picked first.
+- **A stream's sound plays on the speakers chosen for voice** (Settings → Voice) and moves with them when you change them while watching. If those speakers are not there, it plays on the default ones.
+- **Muting a stream or setting its volume is remembered**: every stream starts that way, also after a restart.
+- Settings → Updates has a **What's new** button that opens the release notes.
+
 ## 0.2.20
 
 - **The stream no longer freezes when a program whose sound you share closes.** Before, with "all sound" or one program's sound, closing that program could stop the picture and sound for every viewer.
