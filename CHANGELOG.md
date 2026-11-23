@@ -2,6 +2,13 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.20
+
+- **The stream no longer freezes when a program whose sound you share closes.** Before, with "all sound" or one program's sound, closing that program could stop the picture and sound for every viewer.
+- **Sound that goes silent comes back by itself.** With all sound shared, if a program plays but its captured sound is silent for 4 s, Backseat starts capturing it again; if every program is heard but the mix sent to viewers is silent, all of them start again. Before, the stream stayed silent until a viewer left and joined again.
+- The bitrate and loss on the stream badge no longer drop to 0 after a network stall of a few seconds.
+- The log now shows the level of each shared program and of the stream's sound once a minute, to find such cases.
+
 ## 0.2.19
 
 - **Video in its own process:** a friend's stream is decoded and shown by a separate process (`backseat.exe --video-process`). If the video decoder or driver crashes, only the video stops, never the whole app; it starts again by itself within 1–3 s. If it keeps failing (4 crashes in a minute, or 3 starts in a row without a picture), the watch ends with "The video stopped working". Latency is the same as before; it takes about 30 MB more memory.
