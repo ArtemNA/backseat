@@ -126,7 +126,14 @@ pub fn audio_apps() -> Vec<AudioApp> {
                     continue;
                 }
                 let active = ctl.GetState().is_ok_and(|s| s == AudioSessionStateActive);
-                let peak = ctl.cast::<windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation>().ok().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0);
+                let mut peak = ctl.cast::<windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation>().ok().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0);
+                // Muted (or at zero) in the Windows volume mixer: nothing to hear. A lower
+                // volume is left as it is: the meter may already show it.
+                if let Ok(v) = ctl.cast::<ISimpleAudioVolume>() {
+                    if v.GetMute().is_ok_and(|m| m.as_bool()) || v.GetMasterVolume().is_ok_and(|l| l < 0.01) {
+                        peak = 0.0;
+                    }
+                }
                 match out.iter_mut().find(|a| a.pid == pid) {
                     Some(a) => {
                         a.active |= active;

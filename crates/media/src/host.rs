@@ -279,19 +279,39 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     });
     let fake_started = std::time::Instant::now();
     let is_fake = fake.is_some();
+    let pid_secs = |name: &str| -> Option<(u32, f64)> {
+        let v = std::env::var(name).ok()?;
+        let mut it = v.split_whitespace();
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    };
     // Test only: STREAMER_DEBUG_SYSMIX_FAKE_STUCK="PID SECS": that fake program's first capture
     // gives silence from SECS s on (as a real program's capture did, reported 2026-11-23: the
     // stream went quiet until a viewer joined again and the capture started anew).
-    let stuck: Option<(u32, f64)> = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_STUCK").ok().and_then(|v| {
-        let mut it = v.split_whitespace();
-        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-    });
-    let stuck_used = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // What each program's capture gave since the last look: (sum of squares, samples).
+    let stuck = pid_secs("STREAMER_DEBUG_SYSMIX_FAKE_STUCK");
+    // Test only: STREAMER_DEBUG_SYSMIX_FAKE_LATE="PID SECS": that fake program's first capture
+    // stamps its sound 1 s in the past from SECS s on, so the mixer drops it as late (the mix
+    // goes silent while the capture is heard).
+    let late = pid_secs("STREAMER_DEBUG_SYSMIX_FAKE_LATE");
+    // Test only: STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED="PID": that fake program is a real capture
+    // (of this process's own sound: none), which can give the pipeline its clock.
+    let clocked: Option<u32> = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED").ok().and_then(|v| v.trim().parse().ok());
+    let (stuck_used, late_used) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    // What each program's capture gave since the last look, and the mix: (sum of squares, samples).
     let levels: Arc<Mutex<HashMap<u32, (f64, u64)>>> = Arc::default();
     let levels_in = levels.clone();
+    let mix_level: Arc<Mutex<(f64, u64)>> = Arc::default();
+    let ml = mix_level.clone();
+    mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+            let (sum, n) = sum_squares_f32(map.as_slice());
+            let mut a = ml.lock().unwrap();
+            a.0 += sum;
+            a.1 += n;
+        }
+        gst::PadProbeReturn::Ok
+    });
     let add = move |bin: &gst::Bin, app: &crate::audio_apps::AudioApp| -> Result<(), String> {
-        let src = if is_fake {
+        let src = if is_fake && clocked != Some(app.pid) {
             gst::ElementFactory::make("audiotestsrc")
                 .property("is-live", true)
                 .property("freq", 440.0 * app.pid as f64)
@@ -303,8 +323,14 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             let src = mk("wasapi2src")?;
             src.set_property("loopback", true);
             src.set_property("low-latency", true);
-            src.set_property("loopback-target-pid", app.pid);
+            src.set_property("loopback-target-pid", if is_fake { std::process::id() } else { app.pid });
             src.set_property_from_str("loopback-mode", "include-process-tree");
+            // Not the pipeline's clock: a program's capture leaves when the program ends (or
+            // starts again, below), and a pipeline whose clock left goes on a dead clock.
+            // STREAMER_DEBUG_SYSMIX_PROVIDE_CLOCK: as in 0.2.19 (the spoiled variant).
+            if std::env::var_os("STREAMER_DEBUG_SYSMIX_PROVIDE_CLOCK").is_none() && src.has_property("provide-clock") {
+                src.set_property("provide-clock", false);
+            }
             src
         };
         let conv = mk("audioconvert")?;
@@ -315,7 +341,7 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
         gst::Element::link_many([&src, &conv, &res, &cf]).map_err(|e| e.to_string())?;
         branch.add_pad(&gst::GhostPad::with_target(&cf.static_pad("src").unwrap()).unwrap()).unwrap();
         if let Some((pid, secs)) = stuck.filter(|(p, _)| is_fake && *p == app.pid) {
-            if !stuck_used.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if !stuck_used.swap(true, Ordering::SeqCst) {
                 let t0 = std::time::Instant::now();
                 eprintln!("host: test: the capture of fake{pid}.exe goes silent in {secs} s");
                 src.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
@@ -330,17 +356,29 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                 });
             }
         }
-        // The capture's level (F32 after the caps filter), for the watch below.
+        if let Some((pid, secs)) = late.filter(|(p, _)| is_fake && *p == app.pid) {
+            if !late_used.swap(true, Ordering::SeqCst) {
+                let t0 = std::time::Instant::now();
+                eprintln!("host: test: the capture of fake{pid}.exe is stamped late in {secs} s");
+                cf.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                    if t0.elapsed().as_secs_f64() >= secs {
+                        if let Some(b) = info.buffer_mut() {
+                            let b = b.make_mut();
+                            if let Some(p) = b.pts() {
+                                b.set_pts(p.saturating_sub(gst::ClockTime::from_seconds(1)));
+                            }
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
+        // The capture's level (F32 after the caps filter), for the watch below; its entry is
+        // made once the branch is in the mix.
         let (lv, pid) = (levels_in.clone(), app.pid);
-        lv.lock().unwrap().insert(pid, (0.0, 0));
         cf.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
-                let (mut sum, mut n) = (0f64, 0u64);
-                for c in map.as_slice().chunks_exact(4) {
-                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
-                    sum += v * v;
-                    n += 1;
-                }
+                let (sum, n) = sum_squares_f32(map.as_slice());
                 if let Some(e) = lv.lock().unwrap().get_mut(&pid) {
                     e.0 += sum;
                     e.1 += n;
@@ -372,22 +410,34 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             });
         }
         bin.add(&branch).map_err(|e| e.to_string())?;
-        let mixer = bin.by_name("sysmix").unwrap();
-        let pad = mixer.request_pad_simple("sink_%u").ok_or("mixer pad")?;
-        branch.static_pad("src").unwrap().link(&pad).map_err(|e| e.to_string())?;
-        if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
-            let (exe, n) = (app.exe.clone(), std::sync::atomic::AtomicU64::new(0));
-            pad.add_probe(gst::PadProbeType::BUFFER, move |p, info| {
-                let k = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if k % 100 == 0 {
-                    let nz = info.buffer().and_then(|b| b.map_readable().ok()).map(|m| m.as_slice().iter().filter(|x| **x != 0).count()).unwrap_or(0);
-                    eprintln!("host: mixer input {exe}: buffer {k}, nonzero bytes {nz}, caps {:?}, pts {:?}", p.current_caps().map(|c| c.to_string()), info.buffer().and_then(|b| b.pts()));
-                }
-                gst::PadProbeReturn::Ok
-            });
+        levels_in.lock().unwrap().insert(pid, (0.0, 0));
+        let linked = (|| -> Result<(), String> {
+            let mixer = bin.by_name("sysmix").ok_or("no mixer")?;
+            let pad = mixer.request_pad_simple("sink_%u").ok_or("mixer pad")?;
+            if let Err(e) = branch.static_pad("src").unwrap().link(&pad) {
+                mixer.release_request_pad(&pad);
+                return Err(e.to_string());
+            }
+            if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
+                let (exe, n) = (app.exe.clone(), std::sync::atomic::AtomicU64::new(0));
+                pad.add_probe(gst::PadProbeType::BUFFER, move |p, info| {
+                    let k = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k % 100 == 0 {
+                        let nz = info.buffer().and_then(|b| b.map_readable().ok()).map(|m| m.as_slice().iter().filter(|x| **x != 0).count()).unwrap_or(0);
+                        eprintln!("host: mixer input {exe}: buffer {k}, nonzero bytes {nz}, caps {:?}, pts {:?}", p.current_caps().map(|c| c.to_string()), info.buffer().and_then(|b| b.pts()));
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+            branch.sync_state_with_parent().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        // A half-made branch would stay under the program's name, and nothing would add it again.
+        if linked.is_err() {
+            levels_in.lock().unwrap().remove(&pid);
+            remove_app_branch_in_time(bin, branch.upcast_ref::<gst::Element>());
         }
-        branch.sync_state_with_parent().map_err(|e| e.to_string())?;
-        Ok(())
+        linked
     };
     // The programs to capture, and every program with sound (their meters).
     let wanted = move || -> (Vec<crate::audio_apps::AudioApp>, Vec<crate::audio_apps::AudioApp>) {
@@ -406,13 +456,14 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     };
     let (first, _) = wanted();
     eprintln!("host: system sound from {}", first.iter().map(|a| a.exe.as_str()).collect::<Vec<_>>().join(", "));
+    let mut watch = CaptureWatch::default();
     for a in &first {
-        if let Err(e) = add(&bin, a) {
-            eprintln!("host: sound of {}: {e}", a.exe);
+        match add(&bin, a) {
+            Ok(()) => watch.born(a.pid),
+            Err(e) => eprintln!("host: sound of {}: {e}", a.exe),
         }
     }
     let weak = bin.downgrade();
-    let mut watch = CaptureWatch::default();
     std::thread::Builder::new()
         .name("system-sound".into())
         .spawn(move || loop {
@@ -422,31 +473,79 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                 return;
             }
             let (now, all) = wanted();
-            // A program that plays while its capture gives silence: that capture starts anew.
             let heard: HashMap<u32, (f64, u64)> = levels.lock().unwrap().iter_mut().map(|(p, v)| (*p, std::mem::take(v))).collect();
+            let mix = std::mem::take(&mut *mix_level.lock().unwrap());
             let live = bin.current_state() == gst::State::Playing;
+            if !live {
+                watch.pause();
+            } else if watch.resumed(bin.base_time()) {
+                // Every capture starts anew with the pipeline (also when a viewer left and
+                // another came between two looks): each gets its grace again.
+                for a in &now {
+                    watch.regrace(a.pid);
+                }
+            }
             let parents = if is_fake { HashMap::new() } else { crate::audio_apps::parents() };
+            // A program that plays while its capture gives silence: that capture starts anew.
+            let mut again: Vec<&crate::audio_apps::AudioApp> = Vec::new();
+            let mut loudest = f64::NEG_INFINITY;
             for a in &now {
                 let peak = if is_fake { a.peak } else { crate::audio_apps::tree_peak(&all, &parents, a.pid) };
                 let (sum, n) = heard.get(&a.pid).copied().unwrap_or_default();
-                let db = if n > 0 && sum > 0.0 { 10.0 * (sum / n as f64).log10() } else { -150.0 };
-                if !live || !watch.restart_due(a, peak, db) {
+                let db = level_db(sum, n);
+                watch.minute_add(a.pid, sum, n, peak);
+                if watch.born_while(a.pid, CaptureWatch::GRACE) {
                     continue;
                 }
-                eprintln!("host: system sound starts the capture of {} again: it plays (meter {:.0} dB) but the capture gave {db:.0} dB", a.exe, 20.0 * (peak as f64).max(1e-9).log10());
-                if let Some(el) = bin.by_name(&format!("app{}", a.pid)) {
-                    remove_app_branch(&bin, &el);
-                }
-                if let Err(e) = add(&bin, a) {
-                    eprintln!("host: sound of {}: {e}", a.exe);
+                loudest = loudest.max(db);
+                if live && watch.restart_due(a.pid, peak, db) {
+                    eprintln!("host: system sound starts the capture of {} again: it plays (meter {:.0} dB) but the capture gave {db:.0} dB", a.exe, 20.0 * (peak as f64).max(1e-9).log10());
+                    again.push(a);
                 }
             }
-            watch.log_levels(live, &now, &all, &parents, &heard, is_fake);
-            for a in &now {
-                if bin.by_name(&format!("app{}", a.pid)).is_none() {
-                    eprintln!("host: system sound adds {}", a.exe);
-                    if let Err(e) = add(&bin, a) {
+            // Programs heard while the mix is silent: the mixer drops their sound (its timing
+            // went wrong); every capture starts anew, with fresh timestamps.
+            // No buffers out of the mixer at all counts as silent too.
+            let mix_db = level_db(mix.0, mix.1);
+            watch.mix_add(mix.0, mix.1);
+            if live && watch.mix_silent_due(loudest, mix_db) {
+                eprintln!("host: system sound: the mix gave {mix_db:.0} dB while a program's capture gave {loudest:.0} dB; every capture starts again");
+                again = now.iter().filter(|a| !watch.is_abandoned(a.pid) && watch.may_add(a.pid)).collect();
+            }
+            for a in again {
+                if let Some(el) = bin.by_name(&format!("app{}", a.pid)) {
+                    if !remove_app_branch_in_time(&bin, &el) {
+                        eprintln!("host: system sound: the capture of {} did not stop in 3 s; left as it is", a.exe);
+                        watch.abandon(a.pid);
+                        continue;
+                    }
+                }
+                match add(&bin, a) {
+                    Ok(()) => watch.born(a.pid),
+                    Err(e) => {
                         eprintln!("host: sound of {}: {e}", a.exe);
+                        watch.add_failed(a.pid);
+                        // Its half-made branch did not leave in time: not touched again.
+                        if bin.by_name(&format!("app{}", a.pid)).is_some() {
+                            watch.abandon(a.pid);
+                        }
+                    }
+                }
+            }
+            watch.log_levels(live, &now);
+            for a in &now {
+                if bin.by_name(&format!("app{}", a.pid)).is_none() && watch.may_add(a.pid) {
+                    eprintln!("host: system sound adds {}", a.exe);
+                    match add(&bin, a) {
+                        Ok(()) => watch.born(a.pid),
+                        Err(e) => {
+                            eprintln!("host: sound of {}: {e}", a.exe);
+                            watch.add_failed(a.pid);
+                            // Its half-made branch did not leave in time: not touched again.
+                            if bin.by_name(&format!("app{}", a.pid)).is_some() {
+                                watch.abandon(a.pid);
+                            }
+                        }
                     }
                 }
             }
@@ -457,13 +556,44 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                 if now.iter().any(|a| a.pid == pid) {
                     continue;
                 }
+                // Already asked to stop and hanging there: not again (each ask is a thread).
+                if watch.is_abandoned(pid) {
+                    continue;
+                }
                 eprintln!("host: system sound drops a program ({pid})");
                 levels.lock().unwrap().remove(&pid);
-                remove_app_branch(&bin, &el);
+                if remove_app_branch_in_time(&bin, &el) {
+                    watch.forget(pid);
+                } else {
+                    eprintln!("host: system sound: the capture of a program that left ({pid}) did not stop in 3 s");
+                    watch.abandon(pid);
+                }
             }
         })
         .map_err(|e| e.to_string())?;
     Ok(bin.upcast())
+}
+
+/// Sum of squares and count of F32LE samples.
+#[cfg(windows)]
+fn sum_squares_f32(bytes: &[u8]) -> (f64, u64) {
+    let (mut sum, mut n) = (0f64, 0u64);
+    for c in bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+        sum += v * v;
+        n += 1;
+    }
+    (sum, n)
+}
+
+/// RMS level in dB, or -150 for nothing or digital silence.
+#[cfg(windows)]
+fn level_db(sum: f64, n: u64) -> f64 {
+    if n > 0 && sum > 0.0 {
+        10.0 * (sum / n as f64).log10()
+    } else {
+        -150.0
+    }
 }
 
 /// Takes a program's capture out of the system sound mix.
@@ -478,74 +608,216 @@ fn remove_app_branch(bin: &gst::Bin, el: &gst::Element) {
     let _ = bin.remove(el);
 }
 
+/// As [`remove_app_branch`], on a thread of its own: false when it did not finish in 3 s (a
+/// capture that hangs in its stop must not stop the watch of all the others).
+#[cfg(windows)]
+fn remove_app_branch_in_time(bin: &gst::Bin, el: &gst::Element) -> bool {
+    let (tx, rx) = mpsc::channel();
+    let (b, e) = (bin.clone(), el.clone());
+    let spawned = std::thread::Builder::new().name("sound-branch-stop".into()).spawn(move || {
+        remove_app_branch(&b, &e);
+        let _ = tx.send(());
+    });
+    spawned.is_ok() && rx.recv_timeout(Duration::from_secs(3)).is_ok()
+}
+
 /// Watches each program's capture in the system sound mix against what Windows says the
-/// program plays: a capture can go silent while its program plays on (reported 2026-11-23,
-/// until a viewer joined again and the capture started anew). STREAMER_DEBUG_SYSMIX_NO_WATCH
+/// program plays, and the mix against its inputs: a stream went quiet until a viewer joined
+/// again and every capture started anew (reported 2026-11-23). STREAMER_DEBUG_SYSMIX_NO_WATCH
 /// turns the restarts off (the spoiled variant).
 #[cfg(windows)]
 #[derive(Default)]
 struct CaptureWatch {
     /// Looks in a row (2 s each) a program played while its capture was silent.
     silent: HashMap<u32, u32>,
-    /// Restarts of each program's capture that did not bring its sound back, and the last one.
+    /// Restarts of each program's capture since it was last heard, and the last one.
     restarts: HashMap<u32, (u32, std::time::Instant)>,
+    /// When each program's capture (re)started.
+    born: HashMap<u32, std::time::Instant>,
+    /// Captures that did not stop when asked: never touched again.
+    abandoned: std::collections::HashSet<u32>,
+    /// Looks in a row the mix was silent while a capture was heard, restarts of all since the
+    /// mix was last heard, and the last one.
+    mix_silent: u32,
+    mix_restarts: (u32, Option<std::time::Instant>),
+    /// This minute's sums: each capture's (sum of squares, samples, loudest meter), the mix's.
+    minute: HashMap<u32, (f64, u64, f32)>,
+    mix_minute: (f64, u64),
     last_log: Option<std::time::Instant>,
+    /// The pipeline was not playing at the last look.
+    paused: bool,
+    /// When adding a program's capture last failed (not again for a while).
+    failed: HashMap<u32, std::time::Instant>,
+    /// The pipeline's base time at the last look while playing.
+    base: Option<gst::ClockTime>,
 }
 
 #[cfg(windows)]
 impl CaptureWatch {
-    /// Louder than this on its meter, a program plays (-40 dB).
-    const PLAYS: f32 = 0.01;
-    /// Quieter than this, a capture is silent.
+    /// Louder than this on its meter, a program plays (-50 dB).
+    const PLAYS: f32 = 0.003;
+    /// Quieter than this, a capture or the mix is silent.
     const SILENT_DB: f64 = -80.0;
+    /// Louder than this, a capture is heard (for the mix check).
+    const HEARD_DB: f64 = -60.0;
     /// Looks in a row before a restart: 4 s.
     const LOOKS: u32 = 2;
-    /// Not sooner again for the same program, and at most this many restarts in a row.
-    const AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
-    const MAX_RESTARTS: u32 = 3;
+    /// A capture just started is left alone this long (its first sound may take a while).
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(6);
 
-    fn restart_due(&mut self, a: &crate::audio_apps::AudioApp, peak: f32, db: f64) -> bool {
+    /// Wait before the next restart after `n` in a row that did not help: 20 s, 40 s, 80 s,
+    /// then every 2 min (each restart costs only that program's sound, already silent).
+    fn backoff(n: u32) -> std::time::Duration {
+        std::time::Duration::from_secs((20u64 << n.saturating_sub(1).min(3)).min(120))
+    }
+
+    fn born(&mut self, pid: u32) {
+        self.born.insert(pid, std::time::Instant::now());
+        self.silent.remove(&pid);
+        self.abandoned.remove(&pid);
+        self.failed.remove(&pid);
+    }
+
+    fn is_abandoned(&self, pid: u32) -> bool {
+        self.abandoned.contains(&pid)
+    }
+
+    fn add_failed(&mut self, pid: u32) {
+        self.failed.insert(pid, std::time::Instant::now());
+    }
+
+    /// A program whose capture could not be added is tried again after 6 s, not every look.
+    fn may_add(&self, pid: u32) -> bool {
+        self.failed.get(&pid).is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(6))
+    }
+
+    /// Playing again after a pause, or started anew between two looks (a new base time):
+    /// true once.
+    fn resumed(&mut self, base: Option<gst::ClockTime>) -> bool {
+        let new_start = self.base.is_some() && base != self.base;
+        self.base = base;
+        std::mem::replace(&mut self.paused, false) || new_start
+    }
+
+    /// A fresh grace period, as at a start; an abandoned capture stays abandoned.
+    fn regrace(&mut self, pid: u32) {
+        self.born.insert(pid, std::time::Instant::now());
+        self.silent.remove(&pid);
+    }
+
+    fn born_while(&self, pid: u32, d: std::time::Duration) -> bool {
+        self.born.get(&pid).is_some_and(|t| t.elapsed() < d)
+    }
+
+    fn abandon(&mut self, pid: u32) {
+        self.abandoned.insert(pid);
+    }
+
+    fn forget(&mut self, pid: u32) {
+        self.silent.remove(&pid);
+        self.restarts.remove(&pid);
+        self.born.remove(&pid);
+        self.abandoned.remove(&pid);
+        self.minute.remove(&pid);
+        self.failed.remove(&pid);
+    }
+
+    /// Not live (no viewer): nothing flows, the counts start over.
+    fn pause(&mut self) {
+        self.silent.clear();
+        self.restarts.clear();
+        self.mix_silent = 0;
+        self.mix_restarts = (0, None);
+        self.paused = true;
+    }
+
+    fn due(restarts: Option<(u32, std::time::Instant)>) -> bool {
+        restarts.is_none_or(|(n, at)| at.elapsed() >= Self::backoff(n))
+    }
+
+    fn restart_due(&mut self, pid: u32, peak: f32, db: f64) -> bool {
         if db >= Self::SILENT_DB {
             // Heard: any restarts so far helped, the count starts over.
-            self.silent.remove(&a.pid);
-            self.restarts.remove(&a.pid);
+            self.silent.remove(&pid);
+            self.restarts.remove(&pid);
             return false;
         }
-        if peak < Self::PLAYS {
-            self.silent.remove(&a.pid);
+        if peak < Self::PLAYS || self.abandoned.contains(&pid) {
+            self.silent.remove(&pid);
             return false;
         }
-        let k = self.silent.entry(a.pid).or_default();
+        let k = self.silent.entry(pid).or_default();
         *k += 1;
-        if *k < Self::LOOKS || std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_WATCH").is_some() {
+        if *k < Self::LOOKS || std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_WATCH").is_some() || !Self::due(self.restarts.get(&pid).copied()) {
             return false;
         }
-        let (n, at) = self.restarts.get(&a.pid).copied().unwrap_or((0, std::time::Instant::now() - Self::AGAIN_AFTER));
-        if n >= Self::MAX_RESTARTS || at.elapsed() < Self::AGAIN_AFTER {
-            return false;
-        }
-        if n + 1 == Self::MAX_RESTARTS {
-            eprintln!("host: system sound: last try for {} (its capture stays silent)", a.exe);
-        }
-        self.restarts.insert(a.pid, (n + 1, std::time::Instant::now()));
-        self.silent.remove(&a.pid);
+        let n = self.restarts.get(&pid).map_or(0, |r| r.0);
+        self.restarts.insert(pid, (n + 1, std::time::Instant::now()));
+        self.silent.remove(&pid);
         true
     }
 
-    /// Once a minute while live: each program's capture level and what its meter shows.
-    fn log_levels(&mut self, live: bool, now: &[crate::audio_apps::AudioApp], all: &[crate::audio_apps::AudioApp], parents: &HashMap<u32, u32>, heard: &HashMap<u32, (f64, u64)>, fake: bool) {
-        if !live || self.last_log.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
+    fn mix_silent_due(&mut self, loudest_input_db: f64, mix_db: f64) -> bool {
+        if mix_db >= Self::SILENT_DB {
+            self.mix_silent = 0;
+            self.mix_restarts = (0, None);
+            return false;
+        }
+        if loudest_input_db < Self::HEARD_DB {
+            self.mix_silent = 0;
+            return false;
+        }
+        self.mix_silent += 1;
+        let (n, at) = self.mix_restarts;
+        if self.mix_silent < Self::LOOKS || std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_WATCH").is_some() || !Self::due(at.map(|t| (n, t))) {
+            return false;
+        }
+        self.mix_restarts = (n + 1, Some(std::time::Instant::now()));
+        self.mix_silent = 0;
+        true
+    }
+
+    fn minute_add(&mut self, pid: u32, sum: f64, n: u64, peak: f32) {
+        let e = self.minute.entry(pid).or_default();
+        e.0 += sum;
+        e.1 += n;
+        e.2 = e.2.max(peak);
+    }
+
+    fn mix_add(&mut self, sum: f64, n: u64) {
+        self.mix_minute.0 += sum;
+        self.mix_minute.1 += n;
+    }
+
+    /// Once a minute while live: each program's capture level over the minute and the loudest
+    /// its meter showed, and the mix's level.
+    fn log_levels(&mut self, live: bool, now: &[crate::audio_apps::AudioApp]) {
+        if !live {
+            self.minute.clear();
+            self.mix_minute = (0.0, 0);
+            self.last_log = None;
+            return;
+        }
+        let Some(t) = self.last_log else {
+            self.last_log = Some(std::time::Instant::now());
+            return;
+        };
+        if t.elapsed() < std::time::Duration::from_secs(60) {
             return;
         }
         self.last_log = Some(std::time::Instant::now());
-        let row = |a: &crate::audio_apps::AudioApp| {
-            let peak = if fake { a.peak } else { crate::audio_apps::tree_peak(all, parents, a.pid) };
-            let (sum, n) = heard.get(&a.pid).copied().unwrap_or_default();
-            let db = if n == 0 { "nothing".to_string() } else if sum > 0.0 { format!("{:.0}", 10.0 * (sum / n as f64).log10()) } else { "silent".into() };
-            let name = if a.exe.is_empty() { format!("pid {}", a.pid) } else { a.exe.clone() };
-            format!("{name} {db} (meter {:.0})", 20.0 * (peak as f64).max(1e-9).log10())
-        };
-        eprintln!("host: system sound levels, dB: {}", now.iter().map(row).collect::<Vec<_>>().join(", "));
+        let db = |sum: f64, n: u64| if n == 0 { "nothing".to_string() } else if sum > 0.0 { format!("{:.0}", 10.0 * (sum / n as f64).log10()) } else { "silent".into() };
+        let rows: Vec<String> = now
+            .iter()
+            .map(|a| {
+                let (sum, n, peak) = self.minute.get(&a.pid).copied().unwrap_or_default();
+                let name = if a.exe.is_empty() { format!("pid {}", a.pid) } else { a.exe.clone() };
+                format!("{name} {} (meter up to {:.0})", db(sum, n), 20.0 * (peak as f64).max(1e-9).log10())
+            })
+            .collect();
+        eprintln!("host: system sound over the last minute, dB: mix {}; {}", db(self.mix_minute.0, self.mix_minute.1), rows.join(", "));
+        self.minute.clear();
+        self.mix_minute = (0.0, 0);
     }
 }
 
@@ -580,6 +852,11 @@ fn audio_source(cfg: &HostConfig) -> Result<gst::Element, String> {
                 Some(pid) => {
                     src.set_property_from_str("loopback-mode", "include-process-tree");
                     src.set_property("loopback-target-pid", pid);
+                    // Not the pipeline's clock either: the program may end mid-stream.
+                    // STREAMER_DEBUG_SYSMIX_PROVIDE_CLOCK: as in 0.2.19 (the spoiled variant).
+                    if std::env::var_os("STREAMER_DEBUG_SYSMIX_PROVIDE_CLOCK").is_none() && src.has_property("provide-clock") {
+                        src.set_property("provide-clock", false);
+                    }
                 }
                 // Everything but our own playback, one program at a time (sound routers would
                 // bring ours back). STREAMER_DEBUG_SYSTEM_EXCLUDE_SELF: one capture of all but
@@ -1227,6 +1504,14 @@ impl Host {
             self.pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|e| format!("cannot start capture and encoding: {e}"))?;
+            let p = self.pipeline.downgrade();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                if let Some(p) = p.upgrade() {
+                    let c = p.clock();
+                    eprintln!("host: pipeline clock {} ({})", c.as_ref().map(|c| c.name().to_string()).unwrap_or("none".into()), c.as_ref().map(|c| c.type_().name()).unwrap_or(""));
+                }
+            });
         }
         for e in std::iter::once(&branch.webrtc).chain(&branch.elements) {
             e.sync_state_with_parent().map_err(|e| e.to_string())?;
