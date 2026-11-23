@@ -236,9 +236,12 @@ impl Viewer {
                 }
                 if muted.is_some() || volume.is_some() {
                     eprintln!("viewer: sound {} at {}%", if a.muted.load(Ordering::SeqCst) { "muted" } else { "on" }, a.volume.load(Ordering::SeqCst));
+                    sound_changed(a.muted.load(Ordering::SeqCst), a.volume.load(Ordering::SeqCst));
                 }
                 (a.muted.load(Ordering::SeqCst), a.volume.load(Ordering::SeqCst) as f32 / 100.0)
             }));
+            // Its controls start as the saved sound, not at full volume.
+            w.sync_audio(audio.muted.load(Ordering::SeqCst), audio.volume.load(Ordering::SeqCst) as f32 / 100.0);
         }
         webrtc.connect_pad_added(move |_, pad| {
             if pad.direction() != gst::PadDirection::Src {
@@ -410,6 +413,7 @@ impl Viewer {
     /// Turns this stream's sound off or on, now and for an audio branch made later.
     pub fn set_muted(&self, on: bool) {
         self.audio.muted.store(on, Ordering::SeqCst);
+        sound_changed(on, self.audio.volume.load(Ordering::SeqCst));
         match self.pipeline.by_name(AUDIO_VOLUME) {
             Some(v) => v.set_property("mute", on || std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some()),
             None => eprintln!("viewer: no audio branch to mute yet"),
@@ -823,8 +827,32 @@ struct Audio {
 }
 
 impl Default for Audio {
+    /// As the user last left a stream's sound (kept between runs by the app).
     fn default() -> Self {
-        Self { muted: false.into(), volume: 100.into(), output: Mutex::new(None) }
+        let (muted, volume) = *SOUND.lock().unwrap();
+        Self { muted: muted.into(), volume: volume.into(), output: Mutex::new(None) }
+    }
+}
+
+/// A new watch's sound: muted, volume in percent. The last change on any stream (2026-11-23:
+/// muted once, every stream should stay muted, also after a restart).
+static SOUND: Mutex<(bool, u32)> = Mutex::new((false, 100));
+static ON_SOUND: std::sync::OnceLock<Box<dyn Fn(bool, u32) + Send + Sync>> = std::sync::OnceLock::new();
+
+/// The sound new watches start with (the app sets what it saved).
+pub fn set_sound_default(muted: bool, volume: u32) {
+    *SOUND.lock().unwrap() = (muted, volume.min(100));
+}
+
+/// Called after every change of a stream's sound, to save it. Set once.
+pub fn on_sound_change(f: Box<dyn Fn(bool, u32) + Send + Sync>) {
+    let _ = ON_SOUND.set(f);
+}
+
+fn sound_changed(muted: bool, volume: u32) {
+    *SOUND.lock().unwrap() = (muted, volume);
+    if let Some(f) = ON_SOUND.get() {
+        f(muted, volume);
     }
 }
 
@@ -871,6 +899,14 @@ fn add_audio(
     if sink.has_property("continue-on-error") {
         sink.set_property("continue-on-error", true);
     }
+    // On the speakers chosen for voice, and moved with them. STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS:
+    // always the system's default, as before (the spoiled variant).
+    let follow = crate::playback::device_by_id(&sink) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
+    if follow {
+        if let Some(d) = crate::playback::present_device(crate::playback::device()) {
+            sink.set_property("device", d);
+        }
+    }
     if sink.has_property("buffer-time") {
         // Microseconds: a small device buffer, as latency matters more than gap-free audio.
         sink.set_property("buffer-time", 40_000i64);
@@ -911,6 +947,9 @@ fn add_audio(
         None
     };
     let own_sink = shared_tail.is_none().then(|| sink.clone());
+    if let (Some(s), true) = (&own_sink, follow) {
+        crate::playback::follow(s);
+    }
     let chain = if let Some((tail, input)) = shared_tail {
         *audio.output.lock().unwrap() = Some(input);
         let mut c = vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume];
@@ -924,7 +963,13 @@ fn add_audio(
         debug_sink_probe(pipeline, &decoder, s);
     }
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
-    eprintln!("viewer: sound branch ready ({}, sync {audio_sync})", if own_sink.is_some() { "own output" } else { "shared output" });
+    eprintln!(
+        "viewer: sound branch ready ({}, sync {audio_sync}, {} at {}%{})",
+        if own_sink.is_some() { "own output" } else { "shared output" },
+        if audio.muted.load(Ordering::SeqCst) { "muted" } else { "on" },
+        audio.volume.load(Ordering::SeqCst),
+        if follow { if crate::playback::device().is_some() { ", on the speakers chosen for voice" } else { ", on the default speakers as voice" } } else { "" }
+    );
     // Tests only: STREAMER_DEBUG_SOUND_GONE_AFTER=N drops the decoded sound after N s (the
     // sound watch must notice).
     if let Some(n) = std::env::var("STREAMER_DEBUG_SOUND_GONE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -940,7 +985,6 @@ fn add_audio(
 /// buffer reaches the sink against the pipeline clock (min/max ms; positive = late) and the
 /// sink's rendered/dropped counters, to see whether the device takes the sound in time.
 fn debug_sink_probe(pipeline: &gst::Pipeline, decoder: &gst::Element, sink: &gst::Element) {
-    let _ = pipeline;
     let level = Arc::new(Mutex::new((0f64, 0u64)));
     let l = level.clone();
     decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
@@ -970,18 +1014,20 @@ fn debug_sink_probe(pipeline: &gst::Pipeline, decoder: &gst::Element, sink: &gst
         }
         gst::PadProbeReturn::Ok
     });
-    let sw = sink.downgrade();
+    // The sink in use now (it is replaced when the speakers change), by its factory.
+    let (pw, factory) = (pipeline.downgrade(), sink.factory().map(|f| f.name().to_string()).unwrap_or_default());
     let _ = std::thread::Builder::new().name("sink-probe".into()).spawn(move || {
         let mut last = (0u64, 0u64);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            let Some(s) = sw.upgrade() else { return };
+            let Some(p) = pw.upgrade() else { return };
+            let Some(s) = p.iterate_recurse().into_iter().flatten().find(|e| e.factory().is_some_and(|f| f.name() == factory.as_str())) else { continue };
             let st = s.property::<gst::Structure>("stats");
             let (r, d) = (st.get::<u64>("rendered").unwrap_or(0), st.get::<u64>("dropped").unwrap_or(0));
             let (sum, n) = std::mem::take(&mut *level.lock().unwrap());
             let db = if n > 0 { 20.0 * (sum / n as f64).sqrt().max(1e-9).log10() } else { f64::NAN };
             let (lo, hi, k) = std::mem::replace(&mut *late.lock().unwrap(), (i64::MAX, i64::MIN, 0));
-            eprintln!("audio sink: level {db:.1} dB, {k} buffers late {lo}..{hi} ms, rendered {}/s dropped {}/s", r - last.0, d - last.1);
+            eprintln!("audio sink: level {db:.1} dB, {k} buffers late {lo}..{hi} ms, rendered {}/s dropped {}/s", r.saturating_sub(last.0), d.saturating_sub(last.1));
             last = (r, d);
         }
     });

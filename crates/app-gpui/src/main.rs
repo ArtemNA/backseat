@@ -149,6 +149,13 @@ impl Shell {
         let join = join::Join::new(window, cx);
         let mut shell = Shell { core, snap, rooms, current: None, joining: false, error: None, reported: String::new(), join, prev_direct: None, reset_pending: false, room: room::Room::default(), error_since: None, dialogs: Default::default(), subs: vec![], ticks: 0, room_menu: None, update: None, installing: None, update_hidden: false, voice_menu: None, volumes_for: vec![], ended: vec![] };
         voice_ui::apply_settings(&shell.core);
+        // Streams start with the sound as it was last left (muted stays muted after a restart).
+        {
+            let st = settings();
+            let muted = st.get("watch.muted").and_then(|v| v.as_bool()).unwrap_or(false);
+            let volume = st.get("watch.volume").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            core::stream_sound_init(muted, volume);
+        }
         // Tests only: STREAMER_APP_TEST_UPDATE_BAR=installing|available shows that bar with a
         // made-up version (no download).
         match std::env::var("STREAMER_APP_TEST_UPDATE_BAR").as_deref() {
@@ -195,6 +202,11 @@ impl Shell {
             cx.background_executor().timer(Duration::from_millis(150)).await;
             let alive = this.update_in(cx, |s, window, cx| {
                 s.sync_preview(window, cx);
+                // A stream's sound changed (here or in its video window): saved for the next ones.
+                if let Some((muted, volume)) = core::take_stream_sound_change() {
+                    set_setting("watch.muted", serde_json::Value::Bool(muted));
+                    set_setting("watch.volume", serde_json::Value::from(volume));
+                }
                 // The voice tab's meter moves with the microphone: redrawn while in voice or
                 // while the microphone test runs (outside voice it stood still until the mouse
                 // moved).

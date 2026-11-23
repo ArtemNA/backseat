@@ -515,7 +515,15 @@ unsafe fn apply_place(hwnd: HWND) {
         return;
     }
     let parent_hwnd = HWND(parent as *mut c_void);
-    let is_child = GetParent(hwnd).map(|p| p == parent_hwnd).unwrap_or(false);
+    // Really a child of the main window: GetParent also gives the owner of a popup (the
+    // fullscreen video is owned by the main window), which then stayed a popup at the slot's
+    // client coordinates taken as screen ones. STREAMER_DEBUG_IS_CHILD_BY_PARENT: as before
+    // (the spoiled variant).
+    let is_child = if std::env::var_os("STREAMER_DEBUG_IS_CHILD_BY_PARENT").is_some() {
+        GetParent(hwnd).map(|p| p == parent_hwnd).unwrap_or(false)
+    } else {
+        GetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD.0 as i32 != 0 && GetAncestor(hwnd, GA_PARENT) == parent_hwnd
+    };
     if std::env::var_os("STREAMER_DEBUG_PLACE").is_some() {
         eprintln!("place: popped {popped} hidden {hidden} child {is_child} slot {:?}", slot.map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top)));
     }
@@ -543,8 +551,10 @@ unsafe fn apply_place(hwnd: HWND) {
         }
     } else if is_child || GetWindowLongW(hwnd, GWL_STYLE) & WS_POPUP.0 as i32 != 0 {
         // Out into its own window, near the main window, 1280x720 of picture (also when
-        // it was popped out while fullscreen from inside the app).
+        // it was popped out while fullscreen from inside the app). A window of its own, in
+        // Alt-Tab and the taskbar: no owner (fullscreen from inside the app gave it one).
         let _ = SetParent(hwnd, None);
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
         SetWindowLongW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as i32);
         let mut pr = RECT::default();
         let _ = GetWindowRect(parent_hwnd, &mut pr);
@@ -881,7 +891,7 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
     if std::env::var_os("STREAMER_DEBUG_FS_OLD").is_some() {
         return fullscreen_old(hwnd, mode);
     }
-    let (on, embedded) = {
+    let (on, embedded, parent) = {
         let map = WINDOWS.lock().unwrap();
         let Some(st) = map.get(&(hwnd.0 as isize)) else { return };
         let on = match mode {
@@ -892,7 +902,7 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
         if on == st.fullscreen.is_some() {
             return;
         }
-        (on, st.parent != 0 && !st.popped)
+        (on, st.parent != 0 && !st.popped, st.parent)
     };
     if on {
         // Marked first, so a `place` arriving meanwhile leaves the window alone.
@@ -919,6 +929,12 @@ unsafe fn fullscreen(hwnd: HWND, mode: usize) {
             let style = if std::env::var_os("STREAMER_DEBUG_FS_FRAMED").is_some() { WS_OVERLAPPEDWINDOW | WS_VISIBLE } else { WS_POPUP | WS_VISIBLE };
             SetWindowLongW(hwnd, GWL_STYLE, style.0 as i32);
             let _ = SetParent(hwnd, None);
+            // Still part of the app, not a window of its own: owned by the main window, it
+            // stays out of Alt-Tab and the taskbar, and comes back with the app (it showed as
+            // a second window there; Windows left it without an owner, a test here got one).
+            // STREAMER_DEBUG_FS_UNOWNED: no owner, as seen then (the spoiled variant).
+            let owner = if std::env::var_os("STREAMER_DEBUG_FS_UNOWNED").is_some() { 0 } else { parent };
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
         }
         let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         let _ = GetWindowPlacement(hwnd, &mut place);
@@ -1264,6 +1280,10 @@ unsafe fn run(
         // Double click toggles fullscreen.
         style: CS_DBLCLKS,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        // The app's icon (resource 1 of backseat.exe, which runs the video process too) for a
+        // popped-out window's title bar, the taskbar and Alt-Tab; none in the test programs.
+        // STREAMER_DEBUG_NO_WINDOW_ICON: none (the spoiled variant).
+        hIcon: if std::env::var_os("STREAMER_DEBUG_NO_WINDOW_ICON").is_some() { Default::default() } else { LoadIconW(Some(instance.into()), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default() },
         // Black until the first frame; the default was white, which looked like a fault.
         hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH).0),
         ..Default::default()

@@ -1111,7 +1111,17 @@ pub fn sources() -> Sources {
     // Tests only: a moving test pattern instead of a real screen, so test runs never
     // capture the user's desktop. Its id is 0.
     if dev_sources() {
-        monitors = vec![media::platform::MonitorInfo { handle: 0, name: "Test pattern".into(), width: 1920, height: 1080, primary: true }];
+        monitors = vec![media::platform::MonitorInfo { handle: 0, name: "Test pattern".into(), width: 1920, height: 1080, primary: true, x: 0, y: 0 }];
+        // Tests only: STREAMER_APP_DEV_MONITORS="X,Y,W,H;..." adds monitors (picker layout
+        // only; they cannot be streamed).
+        if let Ok(v) = std::env::var("STREAMER_APP_DEV_MONITORS") {
+            for (i, m) in v.split(';').enumerate() {
+                let n: Vec<i32> = m.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let [x, y, width, height] = n[..] {
+                    monitors.push(media::platform::MonitorInfo { handle: i as u64 + 1, name: format!("Test monitor {}", i + 2), width, height, primary: false, x, y });
+                }
+            }
+        }
     }
     // Test runs show test entries only, never the user's own window titles.
     let windows = if dev_sources() {
@@ -1158,6 +1168,24 @@ pub fn video_place(app: &App, streamer: u64, rect: Option<(i32, i32, i32, i32)>)
     }
     let Some(w) = video_window(app, streamer) else { return };
     w.place(rect);
+}
+
+static STREAM_SOUND_CHANGED: Mutex<Option<(bool, u32)>> = Mutex::new(None);
+
+/// The sound new watches start with (muted, volume in percent), and from now on every change
+/// of a stream's sound is kept for `take_stream_sound_change`.
+pub fn stream_sound_init(muted: bool, volume: u32) {
+    media::viewer::set_sound_default(muted, volume);
+    media::viewer::on_sound_change(Box::new(|m, v| *STREAM_SOUND_CHANGED.lock().unwrap() = Some((m, v))));
+}
+
+/// The last change of a stream's sound since the previous call, to save.
+pub fn take_stream_sound_change() -> Option<(bool, u32)> {
+    // STREAMER_DEBUG_NO_SOUND_SAVE: never saved (the spoiled variant).
+    if std::env::var_os("STREAMER_DEBUG_NO_SOUND_SAVE").is_some() {
+        return None;
+    }
+    STREAM_SOUND_CHANGED.lock().unwrap().take()
 }
 
 /// Sound of one watched stream off or on.
@@ -1413,8 +1441,17 @@ pub fn automate(app: &Arc<App>) {
                         match s.watch(p.id, viewer_config(&app), quality.clone()) {
                             Ok(w) => {
                                 test_window_actions(w.viewer.window.clone());
+                                // Tests only: STREAMER_APP_TEST_MUTE=keep mutes at +4 s, as the tile's
+                                // button does, and leaves it muted.
+                                if std::env::var("STREAMER_APP_TEST_MUTE").as_deref() == Ok("keep") {
+                                    let (app, id) = (app.clone(), p.id);
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(4));
+                                        let r = set_muted(&app, id, true);
+                                        eprintln!("test: muted {r:?}");
+                                    });
                                 // Tests only: STREAMER_APP_TEST_MUTE mutes at +8 s and unmutes at +14 s.
-                                if std::env::var_os("STREAMER_APP_TEST_MUTE").is_some() {
+                                } else if std::env::var_os("STREAMER_APP_TEST_MUTE").is_some() {
                                     let w = w.clone();
                                     std::thread::spawn(move || {
                                         std::thread::sleep(std::time::Duration::from_secs(8));
@@ -1479,6 +1516,22 @@ fn test_window_actions(w: Option<media::videoproc::VideoWindow>) {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = spam.join();
             eprintln!("test: fsloop done");
+        });
+        return;
+    }
+    // "embedfs": fullscreen straight from inside the app at +6 s (never popped out before, as a
+    // user does), back at +12 s, popped out at +18 s, back in at +24 s.
+    if mode == "embedfs" {
+        std::thread::spawn(move || {
+            let step = |secs| std::thread::sleep(std::time::Duration::from_secs(secs));
+            step(6);
+            w.set_fullscreen(true);
+            step(6);
+            w.set_fullscreen(false);
+            step(6);
+            w.set_popped(true);
+            step(6);
+            w.set_popped(false);
         });
         return;
     }

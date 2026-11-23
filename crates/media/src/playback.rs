@@ -58,12 +58,112 @@ pub fn get() -> Result<Arc<Playback>, String> {
 }
 
 /// The speakers to play on (a device id from `devices`), None for the system's default.
-/// Takes effect at once if the output already runs.
+/// Takes effect at once if the output already runs, and for the streams' own outputs.
 pub fn set_device(id: Option<String>) {
     *WANT_DEVICE.lock().unwrap() = id.clone();
     if let Some(p) = SHARED.get() {
-        p.switch_device(id);
+        p.switch_device(id.clone());
     }
+    let followers: Vec<gst::Element> = {
+        let mut f = FOLLOWERS.lock().unwrap();
+        f.retain(|w| w.upgrade().is_some());
+        f.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    // Off the caller's thread (the UI's): each switch opens a device and waits for a gap
+    // between buffers.
+    if !followers.is_empty() {
+        std::thread::spawn(move || {
+            for s in followers {
+                switch_sink(&s, &id);
+            }
+        });
+    }
+}
+
+/// The speakers chosen for voice (None: the system's default), which streams play on too.
+pub fn device() -> Option<String> {
+    WANT_DEVICE.lock().unwrap().clone()
+}
+
+/// The sink takes a device id as text (wasapi2sink; macOS's sink takes a number: left alone).
+pub fn device_by_id(sink: &gst::Element) -> bool {
+    sink.find_property("device").is_some_and(|p| p.value_type() == String::static_type())
+}
+
+/// `id` if it is a speaker present now, else None (the system's default): chosen speakers
+/// unplugged would leave a new stream silent.
+pub fn present_device(id: Option<String>) -> Option<String> {
+    let id = id?;
+    if devices(false).iter().any(|d| d.id == id) {
+        Some(id)
+    } else {
+        eprintln!("viewer: the speakers chosen for voice are not there; the stream plays on the default ones");
+        None
+    }
+}
+
+/// Streams' own sound outputs, moved with the voice's speakers (2026-11-23: voice played on
+/// the chosen speakers, streams on the system default).
+static FOLLOWERS: Mutex<Vec<gst::glib::WeakRef<gst::Element>>> = Mutex::new(Vec::new());
+
+/// A stream's own output (made with `device()`), switched along with the voice's speakers.
+pub fn follow(sink: &gst::Element) {
+    FOLLOWERS.lock().unwrap().push(sink.downgrade());
+}
+
+/// Moves a stream's own output to other speakers: a new sink like it opens first, the sound
+/// moves over between buffers, then the old one closes (as the shared output does).
+fn switch_sink(old: &gst::Element, id: &Option<String>) {
+    if !device_by_id(old) || old.property::<Option<String>>("device") == *id {
+        return;
+    }
+    let (Some(parent), Some(factory)) = (old.parent().and_then(|p| p.downcast::<gst::Bin>().ok()), old.factory()) else { return };
+    let Some(before) = old.static_pad("sink").and_then(|p| p.peer()) else { return };
+    let Ok(new) = factory.create().build() else { return };
+    for p in ["sync", "low-latency", "continue-on-error", "buffer-time", "latency-time"] {
+        if new.has_property(p) {
+            new.set_property_from_value(p, &old.property_value(p));
+        }
+    }
+    new.set_property("device", id.clone());
+    if parent.add(&new).is_err() {
+        return;
+    }
+    if new.set_state(gst::State::Playing) == Err(gst::StateChangeError) {
+        let _ = new.set_state(gst::State::Null);
+        let _ = parent.remove(&new);
+        eprintln!("viewer: the chosen speakers do not open for the stream; it stays where it was");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (o, n) = (old.clone(), new.clone());
+    before.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+        if let (Some(os), Some(ns)) = (o.static_pad("sink"), n.static_pad("sink")) {
+            let _ = pad.unlink(&os);
+            let ok = pad.link(&ns).is_ok();
+            // The new one would not take it: back to the old speakers.
+            if !ok {
+                let _ = pad.link(&os);
+            }
+            let _ = tx.send(ok);
+        }
+        gst::PadProbeReturn::Remove
+    });
+    let linked = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false);
+    let (keep, drop) = if linked { (&new, old) } else { (old, &new) };
+    let _ = drop.set_state(gst::State::Null);
+    let _ = parent.remove(drop);
+    follow(keep);
+    // The new device's latency counts from now on.
+    let mut up = keep.parent();
+    while let Some(o) = up {
+        if let Some(p) = o.downcast_ref::<gst::Pipeline>() {
+            let _ = p.recalculate_latency();
+            break;
+        }
+        up = o.parent();
+    }
+    eprintln!("viewer: stream sound moved to the {} speakers{}", if id.is_some() { "chosen" } else { "default" }, if linked { "" } else { " (failed)" });
 }
 
 /// An audio device the user can pick.

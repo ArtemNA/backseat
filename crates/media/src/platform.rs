@@ -186,6 +186,9 @@ pub struct MonitorInfo {
     pub width: i32,
     pub height: i32,
     pub primary: bool,
+    /// Top-left corner on the desktop (the primary monitor's is 0,0), for the picker's layout.
+    pub x: i32,
+    pub y: i32,
 }
 
 /// A window a host can stream, for a source picker.
@@ -222,6 +225,8 @@ pub fn monitors() -> Vec<MonitorInfo> {
                 width: r.right - r.left,
                 height: r.bottom - r.top,
                 primary: info.monitorInfo.dwFlags & 1 != 0,
+                x: r.left,
+                y: r.top,
             });
         }
         true.into()

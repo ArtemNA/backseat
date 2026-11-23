@@ -183,6 +183,22 @@ fn main() {
             if parent.len() == 5 {
                 media::present::set_default_parent(parent[0] as isize);
             }
+            // Test only: STREAMER_DEBUG_SPEAKERS_CYCLE=SECS: voice's speakers set to the first
+            // output device now and to the second SECS s later (as a change in the settings);
+            // the stream's own output must follow.
+            if let Some(secs) = std::env::var("STREAMER_DEBUG_SPEAKERS_CYCLE").ok().and_then(|v| v.parse::<u64>().ok()) {
+                let outs = media::playback::devices(false);
+                eprintln!("test: {} output devices", outs.len());
+                if outs.len() >= 2 {
+                    media::playback::set_device(Some(outs[0].id.clone()));
+                    let next = outs[1].id.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(secs));
+                        eprintln!("test: speakers changed");
+                        media::playback::set_device(Some(next));
+                    });
+                }
+            }
             let w = s.watch(streamer, cfg, if late { None } else { quality.clone() }).unwrap_or_else(|e| {
                 eprintln!("viewer: {e}");
                 std::process::exit(1);

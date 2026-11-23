@@ -43,6 +43,10 @@ impl Audio {
     }
 }
 
+/// The largest the monitor layout may be in the go-live dialog (its inner width).
+const MONITORS_W: f32 = 800.0;
+const MONITORS_H: f32 = 240.0;
+
 /// A source in the picker.
 #[derive(Clone, Debug)]
 struct Src {
@@ -52,6 +56,9 @@ struct Src {
     minimized: bool,
     pid: Option<u32>,
     height: i32,
+    /// A monitor's place on the desktop (x, y, width, height), for the layout.
+    rect: Option<(i32, i32, i32, i32)>,
+    primary: bool,
 }
 
 pub struct GoLiveState {
@@ -326,9 +333,12 @@ impl Shell {
         let Some(g) = &self.dialogs.golive else { return vec![] };
         let Some(s) = &g.sources else { return vec![] };
         if g.screen {
-            s.monitors.iter().map(|m| Src { id: m.handle, title: format!("{}{}", m.name.trim_start_matches(r"\\.\"), if m.primary { format!(" · {}", t("golive.primary")) } else { String::new() }), sub: format!("{}×{}", m.width, m.height), minimized: false, pid: None, height: m.height as i32 }).collect()
+            let mut v: Vec<Src> = s.monitors.iter().map(|m| Src { id: m.handle, title: format!("{}{}", m.name.trim_start_matches(r"\\.\"), if m.primary { format!(" · {}", t("golive.primary")) } else { String::new() }), sub: format!("{}×{}", m.width, m.height), minimized: false, pid: None, height: m.height as i32, rect: Some((m.x, m.y, m.width, m.height)), primary: m.primary }).collect();
+            // As Windows lays them out: left to right, then top to bottom.
+            v.sort_by_key(|x| x.rect.map(|r| (r.0, r.1)));
+            v
         } else {
-            s.windows.iter().map(|w| Src { id: w.hwnd, title: w.title.clone(), sub: w.exe.clone(), minimized: w.minimized, pid: Some(w.pid), height: w.height as i32 }).collect()
+            s.windows.iter().map(|w| Src { id: w.hwnd, title: w.title.clone(), sub: w.exe.clone(), minimized: w.minimized, pid: Some(w.pid), height: w.height as i32, rect: None, primary: false }).collect()
         }
     }
 
@@ -338,7 +348,7 @@ impl Shell {
         let list = self.golive_list();
         let Some(g) = self.dialogs.golive.as_mut() else { return };
         if !list.iter().any(|x| Some(x.id) == g.pick) {
-            g.pick = if g.screen { list.first().map(|x| x.id) } else { None };
+            g.pick = if g.screen { list.iter().find(|x| x.primary).or(list.first()).map(|x| x.id) } else { None };
         }
         if let Some(p) = list.iter().find(|x| Some(x.id) == g.pick) {
             if !g.res_picked && p.height > 0 {
@@ -499,6 +509,64 @@ impl Shell {
                 }))
         };
         let sources: Vec<AnyElement> = list.iter().map(|x| source(x, cx).into_any_element()).collect();
+        // The monitors as Windows lays them out, to scale (side by side, one above another);
+        // a click on one picks it.
+        let layout: Option<AnyElement> = (screen && !list.is_empty() && list.iter().all(|x| x.rect.is_some())).then(|| {
+            let rects: Vec<(i32, i32, i32, i32)> = list.iter().filter_map(|x| x.rect).collect();
+            let x0 = rects.iter().map(|r| r.0).min().unwrap_or(0);
+            let y0 = rects.iter().map(|r| r.1).min().unwrap_or(0);
+            let x1 = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(1);
+            let y1 = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(1);
+            let (bw, bh) = ((x1 - x0).max(1) as f32, (y1 - y0).max(1) as f32);
+            let scale = (MONITORS_W / bw).min(MONITORS_H / bh);
+            let gap = 3.0;
+            let tiles: Vec<AnyElement> = list
+                .iter()
+                .map(|x| {
+                    let (rx, ry, rw, rh) = x.rect.unwrap_or_default();
+                    let id = x.id;
+                    let on = g.pick == Some(id);
+                    let (image, _) = thumbs.get(&(screen, id)).cloned().unwrap_or((None, None));
+                    div()
+                        .id(SharedString::from(format!("mon-{id}")))
+                        .absolute()
+                        .left(px((rx - x0) as f32 * scale + gap))
+                        .top(px((ry - y0) as f32 * scale + gap))
+                        .w(px((rw as f32 * scale - 2.0 * gap).max(8.0)))
+                        .h(px((rh as f32 * scale - 2.0 * gap).max(8.0)))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .bg(rgb(0x000000))
+                        .border_2()
+                        .border_color(rgb(if on { 0x3b6fd8 } else { color::RAIL }))
+                        .hover(|s| s.border_color(rgb(0x3b6fd8)))
+                        .when_some(image, |d, i| d.child(img(i).absolute().inset_0().size_full().object_fit(ObjectFit::Cover)))
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .px_2()
+                                .py_1()
+                                .bg(rgba(if on { 0x2d4f8fe0 } else { 0x000000b0 }))
+                                .flex()
+                                .flex_col()
+                                .child(div().text_color(rgb(color::BRIGHT)).whitespace_nowrap().overflow_hidden().child(x.title.clone()))
+                                .child(small(x.sub.clone())),
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if let Some(g) = s.dialogs.golive.as_mut() {
+                                g.pick = Some(id);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            div().id("monitors").relative().mx_auto().w(px(bw * scale)).h(px(bh * scale)).children(tiles).into_any_element()
+        });
         let set = |f: fn(&mut GoLiveState)| move |s: &mut Shell, _: &ClickEvent, _: &mut Window, cx: &mut Context<Shell>| {
             if let Some(g) = s.dialogs.golive.as_mut() {
                 f(g);
@@ -593,7 +661,10 @@ impl Shell {
                         .flex_col()
                         .gap_4()
                         .child(seg_bar().child(seg("tab-screen", t("golive.screen"), screen, false).on_click(cx.listener(set(|g| g.screen = true)))).child(seg("tab-window", t("golive.window"), !screen, false).on_click(cx.listener(set(|g| g.screen = false)))))
-                        .child(div().flex().flex_wrap().gap_2p5().children(sources))
+                        .map(|d| match layout {
+                            Some(l) => d.child(l),
+                            None => d.child(div().flex().flex_wrap().gap_2p5().children(sources)),
+                        })
                         .child(div().flex().flex_col().gap_2().child(legend(tu("golive.audio"))).child(audio_row))
                         .child(
                             div()
