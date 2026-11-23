@@ -78,7 +78,8 @@ fn switch_followers(id: Option<String>) {
         let parallel = std::env::var_os("STREAMER_DEBUG_SWITCH_PARALLEL").is_some();
         std::thread::spawn(move || {
             let _one = if parallel { None } else { Some(SWITCHING.lock().unwrap()) };
-            let id = if parallel { id } else { device() };
+            // The speakers wanted by then, or the default ones if those are not there.
+            let id = if parallel { id } else { present_device(device()) };
             let followers: Vec<gst::Element> = {
                 let mut f = FOLLOWERS.lock().unwrap();
                 f.retain(|w| w.upgrade().is_some());
@@ -195,7 +196,7 @@ fn switch_sink(old: &gst::Element, id: &Option<String>) {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let (o, n) = (old.clone(), new.clone());
-    before.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+    let probe = before.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
         if let (Some(os), Some(ns)) = (o.static_pad("sink"), n.static_pad("sink")) {
             let _ = pad.unlink(&os);
             let ok = pad.link(&ns).is_ok();
@@ -207,7 +208,17 @@ fn switch_sink(old: &gst::Element, id: &Option<String>) {
         }
         gst::PadProbeReturn::Remove
     });
-    let linked = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false);
+    let linked = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(l) => l,
+        // No gap in 2 s: the probe goes, so it cannot move the sound later onto a sink that
+        // is gone by then (it could have run meanwhile: then its answer is waiting).
+        Err(_) => {
+            if let Some(id) = probe {
+                before.remove_probe(id);
+            }
+            rx.try_recv().unwrap_or(false)
+        }
+    };
     let (keep, drop) = if linked { (&new, old) } else { (old, &new) };
     let _ = drop.set_state(gst::State::Null);
     let _ = parent.remove(drop);
