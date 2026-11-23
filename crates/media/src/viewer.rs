@@ -901,7 +901,8 @@ fn add_audio(
     }
     // On the speakers chosen for voice, and moved with them. STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS:
     // always the system's default, as before (the spoiled variant).
-    let follow = crate::playback::device_by_id(&sink) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
+    // (Through the shared output the sound is already on voice's speakers.)
+    let follow = crate::playback::device_by_id(&sink) && !(shared_audio && cfg!(windows)) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
     if follow {
         if let Some(d) = crate::playback::present_device(crate::playback::device()) {
             sink.set_property("device", d);

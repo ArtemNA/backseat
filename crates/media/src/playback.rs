@@ -64,15 +64,21 @@ pub fn set_device(id: Option<String>) {
     if let Some(p) = SHARED.get() {
         p.switch_device(id.clone());
     }
-    let followers: Vec<gst::Element> = {
-        let mut f = FOLLOWERS.lock().unwrap();
-        f.retain(|w| w.upgrade().is_some());
-        f.iter().filter_map(|w| w.upgrade()).collect()
-    };
     // Off the caller's thread (the UI's): each switch opens a device and waits for a gap
-    // between buffers.
-    if !followers.is_empty() {
+    // between buffers. One at a time, to the speakers wanted by then and on the outputs as
+    // they are by then: quick changes in a row end on the last one chosen.
+    if !FOLLOWERS.lock().unwrap().is_empty() {
+        // STREAMER_DEBUG_SWITCH_PARALLEL: each change on its own, to the id it was given (the
+        // spoiled variant: quick changes could end on an earlier one).
+        let parallel = std::env::var_os("STREAMER_DEBUG_SWITCH_PARALLEL").is_some();
         std::thread::spawn(move || {
+            let _one = if parallel { None } else { Some(SWITCHING.lock().unwrap()) };
+            let id = if parallel { id } else { device() };
+            let followers: Vec<gst::Element> = {
+                let mut f = FOLLOWERS.lock().unwrap();
+                f.retain(|w| w.upgrade().is_some_and(|e| e.parent().is_some()));
+                f.iter().filter_map(|w| w.upgrade()).collect()
+            };
             for s in followers {
                 switch_sink(&s, &id);
             }
@@ -90,11 +96,16 @@ pub fn device_by_id(sink: &gst::Element) -> bool {
     sink.find_property("device").is_some_and(|p| p.value_type() == String::static_type())
 }
 
-/// `id` if it is a speaker present now, else None (the system's default): chosen speakers
-/// unplugged would leave a new stream silent.
+/// The speakers found by the last `devices(false)` (the app lists them at start and when the
+/// settings open), so a new stream need not list them on its streaming thread (~0.7 s).
+static OUTPUTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// `id` unless the last listing of speakers lacks it, then None (the system's default):
+/// chosen speakers unplugged would leave a new stream silent.
 pub fn present_device(id: Option<String>) -> Option<String> {
     let id = id?;
-    if devices(false).iter().any(|d| d.id == id) {
+    let known = OUTPUTS.lock().unwrap().as_ref().is_none_or(|l| l.contains(&id));
+    if known {
         Some(id)
     } else {
         eprintln!("viewer: the speakers chosen for voice are not there; the stream plays on the default ones");
@@ -106,9 +117,21 @@ pub fn present_device(id: Option<String>) -> Option<String> {
 /// the chosen speakers, streams on the system default).
 static FOLLOWERS: Mutex<Vec<gst::glib::WeakRef<gst::Element>>> = Mutex::new(Vec::new());
 
+static SWITCHING: Mutex<()> = Mutex::new(());
+
+/// Tests: whether every stream's own output is on the speakers wanted now (None: no outputs).
+pub fn followers_on_wanted() -> Option<bool> {
+    let want = device();
+    let f: Vec<gst::Element> = FOLLOWERS.lock().unwrap().iter().filter_map(|w| w.upgrade()).filter(|e| e.parent().is_some()).collect();
+    (!f.is_empty()).then(|| f.iter().all(|e| device_by_id(e) && e.property::<Option<String>>("device") == want))
+}
+
 /// A stream's own output (made with `device()`), switched along with the voice's speakers.
 pub fn follow(sink: &gst::Element) {
-    FOLLOWERS.lock().unwrap().push(sink.downgrade());
+    let mut f = FOLLOWERS.lock().unwrap();
+    if !f.iter().any(|w| w.upgrade().as_ref() == Some(sink)) {
+        f.push(sink.downgrade());
+    }
 }
 
 /// Moves a stream's own output to other speakers: a new sink like it opens first, the sound
@@ -181,7 +204,7 @@ pub fn devices(input: bool) -> Vec<Device> {
     if m.start().is_err() {
         return vec![];
     }
-    let out = m
+    let out: Vec<Device> = m
         .devices()
         .into_iter()
         .filter_map(|d| {
@@ -202,6 +225,9 @@ pub fn devices(input: bool) -> Vec<Device> {
         })
         .collect();
     m.stop();
+    if !input {
+        *OUTPUTS.lock().unwrap() = Some(out.iter().map(|d: &Device| d.id.clone()).collect());
+    }
     out
 }
 

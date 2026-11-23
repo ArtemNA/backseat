@@ -189,13 +189,29 @@ fn main() {
             if let Some(secs) = std::env::var("STREAMER_DEBUG_SPEAKERS_CYCLE").ok().and_then(|v| v.parse::<u64>().ok()) {
                 let outs = media::playback::devices(false);
                 eprintln!("test: {} output devices", outs.len());
-                if outs.len() >= 2 {
+                if outs.len() >= 3 {
                     media::playback::set_device(Some(outs[0].id.clone()));
-                    let next = outs[1].id.clone();
+                    let ids: Vec<String> = outs.iter().map(|d| d.id.clone()).collect();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(secs));
                         eprintln!("test: speakers changed");
-                        media::playback::set_device(Some(next));
+                        media::playback::set_device(Some(ids[1].clone()));
+                        // STREAMER_DEBUG_SPEAKERS_QUICK=MS: then 5 times three changes MS apart, each
+                        // ending on another device; checked 1.5 s after each.
+                        if let Some(ms) = std::env::var("STREAMER_DEBUG_SPEAKERS_QUICK").ok().and_then(|v| v.parse::<u64>().ok()) {
+                            std::thread::sleep(Duration::from_secs(2));
+                            for round in 0..5usize {
+                                for k in 0..3usize {
+                                    media::playback::set_device(Some(ids[(round + k) % 3].clone()));
+                                    std::thread::sleep(Duration::from_millis(ms));
+                                }
+                                std::thread::sleep(Duration::from_millis(1500));
+                                eprintln!("test: stream output on the wanted speakers: {:?}", media::playback::followers_on_wanted());
+                            }
+                        } else {
+                            std::thread::sleep(Duration::from_secs(4));
+                            eprintln!("test: stream output on the wanted speakers: {:?}", media::playback::followers_on_wanted());
+                        }
                     });
                 }
             }

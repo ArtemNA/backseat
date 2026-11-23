@@ -529,6 +529,8 @@ unsafe fn apply_place(hwnd: HWND) {
     }
     if !popped {
         if !is_child {
+            // No owner left over from fullscreen (then the style turns it into a child).
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
             SetWindowLongW(hwnd, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS).0 as i32);
             SetWindowLongW(hwnd, GWL_EXSTYLE, WS_EX_NOPARENTNOTIFY.0 as i32);
             let _ = SetParent(hwnd, Some(parent_hwnd));
