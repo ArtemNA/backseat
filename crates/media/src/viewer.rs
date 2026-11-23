@@ -901,13 +901,6 @@ fn add_audio(
     }
     // On the speakers chosen for voice, and moved with them. STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS:
     // always the system's default, as before (the spoiled variant).
-    // (Through the shared output the sound is already on voice's speakers.)
-    let follow = crate::playback::device_by_id(&sink) && !(shared_audio && cfg!(windows)) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
-    if follow {
-        if let Some(d) = crate::playback::present_device(crate::playback::device()) {
-            sink.set_property("device", d);
-        }
-    }
     if sink.has_property("buffer-time") {
         // Microseconds: a small device buffer, as latency matters more than gap-free audio.
         sink.set_property("buffer-time", 40_000i64);
@@ -948,8 +941,14 @@ fn add_audio(
         None
     };
     let own_sink = shared_tail.is_none().then(|| sink.clone());
+    // Its own output on the speakers chosen for voice (through the shared output it is there
+    // already), and moved with them once in the pipeline. STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS:
+    // always the system's default, as before (the spoiled variant).
+    let follow = own_sink.as_ref().is_some_and(crate::playback::device_by_id) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
     if let (Some(s), true) = (&own_sink, follow) {
-        crate::playback::follow(s);
+        if let Some(d) = crate::playback::present_device(crate::playback::device()) {
+            s.set_property("device", d);
+        }
     }
     let chain = if let Some((tail, input)) = shared_tail {
         *audio.output.lock().unwrap() = Some(input);
@@ -960,6 +959,9 @@ fn add_audio(
         vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume, make("audioresample")?, sink]
     };
     link_branch(pipeline, pad, &chain)?;
+    if let (Some(s), true) = (&own_sink, follow) {
+        crate::playback::follow(s);
+    }
     if let (Some(s), true) = (&own_sink, std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some()) {
         debug_sink_probe(pipeline, &decoder, s);
     }

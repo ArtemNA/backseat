@@ -76,7 +76,7 @@ pub fn set_device(id: Option<String>) {
             let id = if parallel { id } else { device() };
             let followers: Vec<gst::Element> = {
                 let mut f = FOLLOWERS.lock().unwrap();
-                f.retain(|w| w.upgrade().is_some_and(|e| e.parent().is_some()));
+                f.retain(|w| w.upgrade().is_some());
                 f.iter().filter_map(|w| w.upgrade()).collect()
             };
             for s in followers {
@@ -96,16 +96,13 @@ pub fn device_by_id(sink: &gst::Element) -> bool {
     sink.find_property("device").is_some_and(|p| p.value_type() == String::static_type())
 }
 
-/// The speakers found by the last `devices(false)` (the app lists them at start and when the
-/// settings open), so a new stream need not list them on its streaming thread (~0.7 s).
-static OUTPUTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
-
-/// `id` unless the last listing of speakers lacks it, then None (the system's default):
-/// chosen speakers unplugged would leave a new stream silent.
+/// `id` if Windows has those speakers active now, else None (the system's default): chosen
+/// speakers unplugged would leave a new stream silent. One lookup by id (milliseconds), not
+/// a listing of every device (~0.7 s on a streaming thread). STREAMER_DEBUG_NO_PRESENCE_CHECK:
+/// the id as it is (the spoiled variant).
 pub fn present_device(id: Option<String>) -> Option<String> {
     let id = id?;
-    let known = OUTPUTS.lock().unwrap().as_ref().is_none_or(|l| l.contains(&id));
-    if known {
+    if std::env::var_os("STREAMER_DEBUG_NO_PRESENCE_CHECK").is_some() || speaker_active(&id) {
         Some(id)
     } else {
         eprintln!("viewer: the speakers chosen for voice are not there; the stream plays on the default ones");
@@ -113,11 +110,34 @@ pub fn present_device(id: Option<String>) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn speaker_active(id: &str) -> bool {
+    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // Cannot ask: trust the choice.
+        let Ok(e) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return true };
+        let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        e.GetDevice(windows::core::PCWSTR(wide.as_ptr())).and_then(|d| d.GetState()).is_ok_and(|s| s == DEVICE_STATE_ACTIVE)
+    }
+}
+
+#[cfg(not(windows))]
+fn speaker_active(_: &str) -> bool {
+    true
+}
+
 /// Streams' own sound outputs, moved with the voice's speakers (2026-11-23: voice played on
 /// the chosen speakers, streams on the system default).
 static FOLLOWERS: Mutex<Vec<gst::glib::WeakRef<gst::Element>>> = Mutex::new(Vec::new());
 
 static SWITCHING: Mutex<()> = Mutex::new(());
+
+/// Tests: the device each stream's own output is set to (None: the system's default).
+pub fn followers_devices() -> Vec<Option<String>> {
+    FOLLOWERS.lock().unwrap().iter().filter_map(|w| w.upgrade()).filter(|e| e.parent().is_some() && device_by_id(e)).map(|e| e.property::<Option<String>>("device")).collect()
+}
 
 /// Tests: whether every stream's own output is on the speakers wanted now (None: no outputs).
 pub fn followers_on_wanted() -> Option<bool> {
@@ -225,9 +245,6 @@ pub fn devices(input: bool) -> Vec<Device> {
         })
         .collect();
     m.stop();
-    if !input {
-        *OUTPUTS.lock().unwrap() = Some(out.iter().map(|d: &Device| d.id.clone()).collect());
-    }
     out
 }
 

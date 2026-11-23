@@ -215,6 +215,16 @@ fn main() {
                     });
                 }
             }
+            // Test only: STREAMER_DEBUG_SPEAKERS_MISSING: voice's speakers set to an id no
+            // device has (unplugged); the stream must play on the default ones.
+            if std::env::var_os("STREAMER_DEBUG_SPEAKERS_MISSING").is_some() {
+                media::playback::set_device(Some("{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}".into()));
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let d = media::playback::followers_devices();
+                    eprintln!("test: stream outputs {}, on a set device {}", d.len(), d.iter().filter(|x| x.is_some()).count());
+                });
+            }
             let w = s.watch(streamer, cfg, if late { None } else { quality.clone() }).unwrap_or_else(|e| {
                 eprintln!("viewer: {e}");
                 std::process::exit(1);
