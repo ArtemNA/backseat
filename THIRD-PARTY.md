@@ -27,6 +27,13 @@ from gst-plugins-rs, whose plugins are under the MIT, Apache 2.0 or LGPL 2.1-or-
 license (texts in `licenses/gst-plugins-rs`). They are used unmodified, from the same
 GStreamer 1.28.8 build; source: <https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs>.
 
+## Voice noise suppression
+
+The microphone's denoiser is DeepFilterNet3 by Hendrik Schröter
+(<https://github.com/Rikorose/DeepFilterNet>, tag `v0.5.6`), MIT or Apache 2.0 (texts in
+`licenses/DeepFilterNet`). Its `libDF` code, trimmed to real-time inference, and its
+DeepFilterNet3 model are built into `backseat.exe` (`crates/deep_filter` in this repository).
+
 ## Other native libraries
 
 | Library | DLL | License |

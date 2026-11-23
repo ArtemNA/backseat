@@ -98,6 +98,9 @@ while ($todo.Count) {
 
 foreach ($l in $licenses) { Copy-Item "$Gst\share\licenses\$l" "$Out\licenses\" -Recurse }
 Copy-Item "$root\THIRD-PARTY.md" "$Out\licenses\"
+# The voice denoiser (crates/deep_filter): its own license texts.
+New-Item -ItemType Directory "$Out\licenses\DeepFilterNet" -Force | Out-Null
+Copy-Item "$root\crates\deep_filter\LICENSE*" "$Out\licenses\DeepFilterNet\"
 # Every crate compiled into backseat.exe for Windows, with its license.
 $crates = cargo tree -p app-gpui --target x86_64-pc-windows-msvc -e normal --prefix none --format '{p}  {l}' 2>$null |
   ForEach-Object { $_ -replace ' \(.*?\)', '' -replace ' \(\*\)$', '' } | Sort-Object -Unique

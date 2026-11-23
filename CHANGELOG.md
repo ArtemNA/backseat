@@ -2,6 +2,13 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.22
+
+- **New noise suppression: DeepFilterNet3**, a neural network that keeps the voice natural and removes noise, hums and whines much better than RNNoise did. It replaces RNNoise and is the default; a saved RNNoise choice switches to it, and a chosen WebRTC level (Low…Very high) stays until you pick *Neural*. Your voice reaches others 20 ms later than with RNNoise (streams are not affected); it takes about 4% of one CPU core on a recent processor.
+- **How hard it cuts** (*Settings → Voice*, under the noise suppression): *Medium* by default; *Strong* removes the most noise but may swallow quiet word ends; *Soft* keeps quiet speech and leaves a little noise. It changes at once, also in voice, without rejoining.
+- *Remove the whine* and *Cut high frequencies* are gone: the new denoiser handles both better. Cuts they made before no longer apply.
+- Changing voice settings twice quickly no longer loses the second change, and leaving voice or switching rooms while voice rejoins after a settings change no longer leaves the microphone open or a room online.
+
 ## 0.2.21
 
 - **A stream made fullscreen from inside the app no longer shows as a separate window** in Alt-Tab and the taskbar; Alt-Tab to Backseat brings it back. Back from fullscreen, it returns to its place in the app. A video popped out into its own window shows the app's icon.
