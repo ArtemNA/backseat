@@ -1147,6 +1147,7 @@ impl Shell {
                         .flex()
                         .gap_2()
                         .child(Button::new("set-check").cursor_pointer().label(t("set.check")).on_click(cx.listener(|s, _, _, cx| s.check_update(cx))))
+                        .child(Button::new("set-whatsnew").cursor_pointer().ghost().label(t("set.whats_new")).on_click(cx.listener(|_, _, _, cx| cx.open_url(core::update::RELEASES_PAGE))))
                         .when(st.update.is_some(), |d| d.child(Button::new("set-install").cursor_pointer().primary().label(t("set.install")).on_click(cx.listener(|s, _, _, cx| s.install_update(cx))))),
                 )
                 .child(small(st.status.clone()))

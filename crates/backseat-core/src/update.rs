@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 const LATEST: &str = "https://api.github.com/repos/ArtemNA/backseat/releases/latest";
+/// Every release with its notes ("what's new"), for the settings' link.
+pub const RELEASES_PAGE: &str = "https://github.com/ArtemNA/backseat/releases";
 const AGENT: &str = concat!("Backseat/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Default, Serialize)]
