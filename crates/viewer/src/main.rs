@@ -241,6 +241,7 @@ fn main() {
     let mut last_frames = 0;
     let mut last_presented = 0;
     let mut last_t = Instant::now();
+    let mut last_net: Option<media::viewer::NetCounters> = None;
     loop {
         let tick = Instant::now() + Duration::from_secs(report_secs);
         while Instant::now() < tick && !gone.load(Ordering::SeqCst) && !viewer.window_closed() {
@@ -248,6 +249,16 @@ fn main() {
         }
         let frames = st.frames.load(Ordering::Relaxed);
         let dt = last_t.elapsed().as_secs_f64();
+        // What the app's badge shows, worked out the same way.
+        let net = viewer.net();
+        let (mbit, loss) = match (net, last_net) {
+            (Some(n), Some(n0)) => n.rate(&n0, dt),
+            _ => (0.0, 0.0),
+        };
+        if net.is_some() {
+            last_net = net;
+        }
+        eprintln!("viewer net | {mbit:.1} Mbit/s loss {loss:.1}%");
         let (iv, lat, pre, alat) = (
             st.frame_interval.take(),
             st.video_latency.take(),

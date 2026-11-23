@@ -12,6 +12,29 @@ pub struct AudioApp {
     pub exe: String,
     /// Some session of it is playing now.
     pub active: bool,
+    /// Loudest of its sessions' meters right now, 0..1 (what it plays, as Windows sees it).
+    pub peak: f32,
+}
+
+/// Whether `pid` is `root` or one of its descendants, by `parents`.
+pub fn under(parents: &std::collections::HashMap<u32, u32>, pid: u32, root: u32) -> bool {
+    let mut p = pid;
+    for _ in 0..64 {
+        if p == root {
+            return true;
+        }
+        match parents.get(&p) {
+            Some(&q) if q != p && q != 0 => p = q,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The loudest meter among `root`'s sessions and those of its descendants: what a capture
+/// of its process tree should hear.
+pub fn tree_peak(all: &[AudioApp], parents: &std::collections::HashMap<u32, u32>, root: u32) -> f32 {
+    all.iter().filter(|a| under(parents, a.pid, root)).map(|a| a.peak).fold(0.0, f32::max)
 }
 
 /// Programs that play other programs' sound as their own (virtual devices, mixers). Their
@@ -103,9 +126,13 @@ pub fn audio_apps() -> Vec<AudioApp> {
                     continue;
                 }
                 let active = ctl.GetState().is_ok_and(|s| s == AudioSessionStateActive);
+                let peak = ctl.cast::<windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation>().ok().and_then(|m| m.GetPeakValue().ok()).unwrap_or(0.0);
                 match out.iter_mut().find(|a| a.pid == pid) {
-                    Some(a) => a.active |= active,
-                    None => out.push(AudioApp { pid, exe: exe_name(pid), active }),
+                    Some(a) => {
+                        a.active |= active;
+                        a.peak = a.peak.max(peak);
+                    }
+                    None => out.push(AudioApp { pid, exe: exe_name(pid), active, peak }),
                 }
             }
         }
@@ -121,19 +148,7 @@ pub fn audio_apps() -> Vec<AudioApp> {
 pub fn to_capture(apps: &[AudioApp]) -> Vec<AudioApp> {
     let me = std::process::id();
     let parents = parents();
-    let under = |pid: u32, root: u32| {
-        let mut p = pid;
-        for _ in 0..64 {
-            if p == root {
-                return true;
-            }
-            match parents.get(&p) {
-                Some(&q) if q != p && q != 0 => p = q,
-                _ => return false,
-            }
-        }
-        false
-    };
+    let under = |pid: u32, root: u32| under(&parents, pid, root);
     let routers = std::env::var_os("STREAMER_DEBUG_CAPTURE_ROUTERS").is_none();
     // Another copy of this app (by its file name) is Backseat too.
     let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase())).unwrap_or_default();

@@ -23,7 +23,7 @@ pub struct Impairment {
 
 impl Impairment {
     pub fn active(&self) -> bool {
-        self.loss_pct > 0.0 || self.cap_kbit > 0 || self.delay_ms > 0
+        self.loss_pct > 0.0 || self.cap_kbit > 0 || self.delay_ms > 0 || blackout().is_some()
     }
 }
 
@@ -47,6 +47,26 @@ pub struct LossRelay {
     pub overflow: AtomicU64,
     /// Largest queueing delay seen, in microseconds.
     pub max_queue_us: AtomicU64,
+}
+
+/// Test only: STREAMER_DEBUG_NET_BLACKOUT="START SECS[;START SECS...]" drops every packet both
+/// ways (RTP, RTCP, STUN, DTLS) from START s after the relay starts, for SECS s: a network
+/// that stops.
+fn blackout() -> Option<Vec<(Duration, Duration)>> {
+    let v = std::env::var("STREAMER_DEBUG_NET_BLACKOUT").ok()?;
+    let w: Vec<_> = v
+        .split(';')
+        .filter_map(|w| {
+            let mut it = w.split_whitespace().filter_map(|x| x.parse::<f64>().ok());
+            let (a, b) = (it.next()?, it.next()?);
+            Some((Duration::from_secs_f64(a), Duration::from_secs_f64(a + b)))
+        })
+        .collect();
+    (!w.is_empty()).then_some(w)
+}
+
+fn blacked_out(started: Instant, windows: &Option<Vec<(Duration, Duration)>>) -> bool {
+    windows.as_ref().is_some_and(|w| w.iter().any(|(a, b)| (*a..*b).contains(&started.elapsed())))
 }
 
 fn is_rtp(b: &[u8]) -> bool {
@@ -136,8 +156,12 @@ impl LossRelay {
         let started = Instant::now();
         let shaped = self.imp.cap_kbit > 0 || self.imp.delay_ms > 0;
         let mut link_free = Instant::now();
+        let dark = blackout();
         loop {
             let Ok(n) = self.host_side.recv(&mut buf) else { continue };
+            if blacked_out(started, &dark) {
+                continue;
+            }
             let marker = n > 1 && buf[1] & 0x80 != 0;
             if is_rtp(&buf[..n]) && !(spare_marker && marker) {
                 rng ^= rng << 13;
@@ -175,8 +199,12 @@ impl LossRelay {
 
     fn pump_from_viewer(&self) {
         let mut buf = vec![0u8; 2048];
+        let (started, dark) = (Instant::now(), blackout());
         loop {
             let Ok(n) = self.viewer_side.recv(&mut buf) else { continue };
+            if blacked_out(started, &dark) {
+                continue;
+            }
             if let Some(to) = *self.host_addr.lock().unwrap() {
                 let _ = self.host_side.send_to(&buf[..n], to);
             }

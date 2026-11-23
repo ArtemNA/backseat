@@ -87,7 +87,7 @@ struct Inner {
     /// Per watch: frames decoded and presented at the last sample.
     last: HashMap<u64, (u64, u64, Instant)>,
     /// Per watch: video bytes, packets received and lost at the last sample.
-    net: HashMap<u64, (i64, i64, i64)>,
+    net: HashMap<u64, media::viewer::NetCounters>,
     /// Per viewer of our stream: bytes sent at the last sample.
     sent: HashMap<u64, (u64, Instant)>,
     marker: Marker,
@@ -230,16 +230,13 @@ fn sample(inner: &Mutex<Inner>) {
         let shown = w.viewer.render_report().map(|r| r.presented).unwrap_or(0);
         let lat = w.viewer.stats.video_latency.take();
         let gaps = w.viewer.stats.frame_interval.take();
-        let net = w.viewer.inbound().map(|n| (n.bytes, n.received, n.lost));
+        let net = w.viewer.net();
         let mut i = inner.lock().unwrap();
         let (f0, p0, t0) = i.last.get(&w.streamer).copied().unwrap_or((frames, shown, now));
         let dt = now.duration_since(t0).as_secs_f64().max(0.001);
         i.last.insert(w.streamer, (frames, shown, now));
-        let (mbit, loss_pct) = match (net, i.net.get(&w.streamer).copied()) {
-            (Some((b, r, l)), Some((b0, r0, l0))) => {
-                let (dr, dl) = ((r - r0).max(0) as f64, (l - l0).max(0) as f64);
-                ((b - b0).max(0) as f64 * 8.0 / dt / 1e6, if dr + dl > 0.0 { dl * 100.0 / (dr + dl) } else { 0.0 })
-            }
+        let (mbit, loss_pct) = match (net, i.net.get(&w.streamer)) {
+            (Some(n), Some(n0)) => n.rate(n0, dt),
             _ => (0.0, 0.0),
         };
         if let Some(n) = net {

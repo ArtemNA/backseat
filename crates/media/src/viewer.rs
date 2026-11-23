@@ -68,6 +68,9 @@ pub struct Viewer {
     /// The video codec and the decoder in use ("AV1", "dav1ddec"), once video arrives.
     pub video_codec: Arc<Mutex<Option<(String, String)>>>,
     jitterbuffers: Arc<Mutex<Vec<gst::Element>>>,
+    /// Video RTP bytes and packets out of webrtcbin, counted here: webrtcbin's own statistics
+    /// lose the stream after a network stall of a few seconds (the session drops its sources).
+    video_rtp: Arc<(AtomicU64, AtomicU64)>,
     /// How far behind the video is, and catch-up requests sent.
     pub lag: Arc<crate::catchup::LagWatch>,
     never_answer: bool,
@@ -84,6 +87,26 @@ pub struct Inbound {
     pub pli: i64,
     /// Video payload bytes received.
     pub bytes: i64,
+}
+
+/// Receive counters since the watch started, from the viewer's own counting (see
+/// [`Viewer::net`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NetCounters {
+    /// Video RTP bytes received.
+    pub bytes: u64,
+    /// RTP packets that came out of the jitter buffers, all streams.
+    pub received: u64,
+    /// RTP packets the jitter buffers gave up on, all streams.
+    pub lost: u64,
+}
+
+impl NetCounters {
+    /// Mbit/s and loss in percent between `before` and now, `secs` apart.
+    pub fn rate(&self, before: &NetCounters, secs: f64) -> (f64, f64) {
+        let (dr, dl) = (self.received.saturating_sub(before.received) as f64, self.lost.saturating_sub(before.lost) as f64);
+        (self.bytes.saturating_sub(before.bytes) as f64 * 8.0 / secs.max(0.001) / 1e6, if dr + dl > 0.0 { dl * 100.0 / (dr + dl) } else { 0.0 })
+    }
 }
 
 /// Presentation counters since start, and the longest Present and lock hold since last call.
@@ -186,6 +209,8 @@ impl Viewer {
         let audio2 = audio.clone();
         let video_codec: Arc<Mutex<Option<(String, String)>>> = Arc::default();
         let video_codec2 = video_codec.clone();
+        let video_rtp: Arc<(AtomicU64, AtomicU64)> = Arc::default();
+        let video_rtp2 = video_rtp.clone();
         #[cfg(windows)]
         let frames_tx = renderer.as_ref().map(|r| r.frames.clone());
         #[cfg(windows)]
@@ -224,6 +249,19 @@ impl Viewer {
             let s = caps.structure(0).unwrap();
             let media = s.get::<&str>("media").unwrap_or("");
             let encoding = s.get::<&str>("encoding-name").unwrap_or("").to_ascii_lowercase();
+            if media == "video" {
+                let n = video_rtp2.clone();
+                pad.add_probe(gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST, move |_, info| {
+                    let (bytes, packets) = match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => (b.size() as u64, 1),
+                        Some(gst::PadProbeData::BufferList(l)) => (l.iter().map(|b| b.size() as u64).sum(), l.len() as u64),
+                        _ => (0, 0),
+                    };
+                    n.0.fetch_add(bytes, Ordering::Relaxed);
+                    n.1.fetch_add(packets, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+            }
             let result = match media {
                 "video" if cfg2.headless => add_headless_video(&pipeline, pad, &encoding, &stats2),
                 #[cfg(windows)]
@@ -278,6 +316,7 @@ impl Viewer {
             audio,
             video_codec,
             jitterbuffers,
+            video_rtp,
             lag,
             never_answer: cfg.debug_never_answer,
             no_ice: cfg.debug_no_ice,
@@ -299,6 +338,19 @@ impl Viewer {
             r.late += s.get::<u64>("num-late").unwrap_or(0);
         }
         r
+    }
+
+    /// Receive counters that survive a network stall: video bytes counted on webrtcbin's
+    /// output, packets and losses from the jitter buffers (a new one per source comes along).
+    /// STREAMER_DEBUG_NET_FROM_STATS: from webrtcbin's statistics, as before (the spoiled
+    /// variant: after a stall of a few seconds they show nothing, the badge 0 Mbit/s).
+    pub fn net(&self) -> Option<NetCounters> {
+        if std::env::var_os("STREAMER_DEBUG_NET_FROM_STATS").is_some() {
+            return self.inbound().map(|i| NetCounters { bytes: i.bytes.max(0) as u64, received: i.received.max(0) as u64, lost: i.lost.max(0) as u64 });
+        }
+        let j = self.jitter_report();
+        let bytes = self.video_rtp.0.load(Ordering::Relaxed);
+        (bytes > 0).then_some(NetCounters { bytes, received: j.pushed, lost: j.lost })
     }
 
     /// Video receive counters from webrtcbin, or None before the stream starts.
@@ -359,7 +411,7 @@ impl Viewer {
     pub fn set_muted(&self, on: bool) {
         self.audio.muted.store(on, Ordering::SeqCst);
         match self.pipeline.by_name(AUDIO_VOLUME) {
-            Some(v) => v.set_property("mute", on),
+            Some(v) => v.set_property("mute", on || std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some()),
             None => eprintln!("viewer: no audio branch to mute yet"),
         }
         // The video window's own controls show it (in a video process, they keep a copy).
@@ -779,7 +831,7 @@ impl Default for Audio {
 impl Audio {
     fn apply(&self, pipeline: &gst::Pipeline) {
         if let Some(v) = pipeline.by_name(AUDIO_VOLUME) {
-            v.set_property("mute", self.muted.load(Ordering::SeqCst));
+            v.set_property("mute", self.muted.load(Ordering::SeqCst) || std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some());
             v.set_property("volume", self.volume.load(Ordering::SeqCst) as f64 / 100.0);
         }
     }
@@ -806,7 +858,8 @@ fn add_audio(
     // see change. The stream keeps coming, so unmuting is instant and stays in sync.
     let volume = make("volume")?;
     volume.set_property("name", AUDIO_VOLUME);
-    volume.set_property("mute", audio.muted.load(Ordering::SeqCst));
+    // STREAMER_DEBUG_AUDIO_SINK_PROBE: muted from the first sample, nothing is heard.
+    volume.set_property("mute", audio.muted.load(Ordering::SeqCst) || std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some());
     volume.set_property("volume", audio.volume.load(Ordering::SeqCst) as f64 / 100.0);
     // With sync the sink follows the stream timing and corrects clock drift between the
     // machines; without it audio piles up in front of the device (stage 1 on macOS: ~300 ms).
@@ -867,6 +920,9 @@ fn add_audio(
         vec![depay.clone(), decoder.clone(), make("audioconvert")?, volume, make("audioresample")?, sink]
     };
     link_branch(pipeline, pad, &chain)?;
+    if let (Some(s), true) = (&own_sink, std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some()) {
+        debug_sink_probe(pipeline, &decoder, s);
+    }
     measure(&depay, &decoder, 48_000, clock, started, None, stats.audio_latency.clone());
     eprintln!("viewer: sound branch ready ({}, sync {audio_sync})", if own_sink.is_some() { "own output" } else { "shared output" });
     // Tests only: STREAMER_DEBUG_SOUND_GONE_AFTER=N drops the decoded sound after N s (the
@@ -877,6 +933,58 @@ fn add_audio(
     }
     watch_sound(&depay, &decoder, own_sink, stats.frames.clone());
     Ok(())
+}
+
+/// Test only (STREAMER_DEBUG_AUDIO_SINK_PROBE): the real sink with the stream muted at the
+/// volume element (nothing heard), printing once a second the decoded level, how late each
+/// buffer reaches the sink against the pipeline clock (min/max ms; positive = late) and the
+/// sink's rendered/dropped counters, to see whether the device takes the sound in time.
+fn debug_sink_probe(pipeline: &gst::Pipeline, decoder: &gst::Element, sink: &gst::Element) {
+    let _ = pipeline;
+    let level = Arc::new(Mutex::new((0f64, 0u64)));
+    let l = level.clone();
+    decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+            let mut a = l.lock().unwrap();
+            for s in map.as_slice().as_chunks::<2>().0 {
+                let v = i16::from_le_bytes(*s) as f64 / 32768.0;
+                a.0 += v * v;
+                a.1 += 1;
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    let late = Arc::new(Mutex::new((i64::MAX, i64::MIN, 0u64)));
+    let lt = late.clone();
+    let el = sink.downgrade();
+    sink.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let (Some(b), Some(e)) = (info.buffer(), el.upgrade()) else { return gst::PadProbeReturn::Ok };
+        let seg = pad.sticky_event::<gst::event::Segment>(0);
+        let rt = seg.and_then(|s| s.segment().downcast_ref::<gst::ClockTime>().and_then(|s| b.pts().and_then(|p| s.to_running_time(p))));
+        if let (Some(rt), Some(now)) = (rt, e.current_running_time()) {
+            let d = (now.nseconds() as i64 - rt.nseconds() as i64) / 1_000_000;
+            let mut a = lt.lock().unwrap();
+            a.0 = a.0.min(d);
+            a.1 = a.1.max(d);
+            a.2 += 1;
+        }
+        gst::PadProbeReturn::Ok
+    });
+    let sw = sink.downgrade();
+    let _ = std::thread::Builder::new().name("sink-probe".into()).spawn(move || {
+        let mut last = (0u64, 0u64);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(s) = sw.upgrade() else { return };
+            let st = s.property::<gst::Structure>("stats");
+            let (r, d) = (st.get::<u64>("rendered").unwrap_or(0), st.get::<u64>("dropped").unwrap_or(0));
+            let (sum, n) = std::mem::take(&mut *level.lock().unwrap());
+            let db = if n > 0 { 20.0 * (sum / n as f64).sqrt().max(1e-9).log10() } else { f64::NAN };
+            let (lo, hi, k) = std::mem::replace(&mut *late.lock().unwrap(), (i64::MAX, i64::MIN, 0));
+            eprintln!("audio sink: level {db:.1} dB, {k} buffers late {lo}..{hi} ms, rendered {}/s dropped {}/s", r - last.0, d - last.1);
+            last = (r, d);
+        }
+    });
 }
 
 /// Logs a stream's sound going missing while its picture goes on (reported 2026-11-22: a
@@ -894,6 +1002,24 @@ fn watch_sound(depay: &gst::Element, decoder: &gst::Element, sink: Option<gst::E
         n
     };
     let (packets, decoded) = (counter(depay, "sink"), counter(decoder, "src"));
+    // The decoded level over each minute, for the log: a stream that sends silence shows here.
+    let level = Arc::new(Mutex::new((0f64, 0u64)));
+    let lv = level.clone();
+    decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+            let (mut sum, mut n) = (0f64, 0u64);
+            // opusdec gives interleaved S16LE.
+            for s in map.as_slice().as_chunks::<2>().0 {
+                let v = i16::from_le_bytes(*s) as f64 / 32768.0;
+                sum += v * v;
+                n += 1;
+            }
+            let mut a = lv.lock().unwrap();
+            a.0 += sum;
+            a.1 += n;
+        }
+        gst::PadProbeReturn::Ok
+    });
     let (dw, sw) = (depay.downgrade(), sink.map(|s| s.downgrade()));
     let stats = move || -> Option<(u64, u64)> {
         let s = sw.as_ref()?.upgrade()?;
@@ -902,7 +1028,7 @@ fn watch_sound(depay: &gst::Element, decoder: &gst::Element, sink: Option<gst::E
     };
     let _ = std::thread::Builder::new().name("sound-watch".into()).spawn(move || {
         let mut last = (packets.load(Ordering::Relaxed), decoded.load(Ordering::Relaxed), stats(), frames.load(Ordering::Relaxed));
-        let (mut quiet, mut told, mut first) = (0u32, false, true);
+        let (mut quiet, mut told, mut first, mut ticks) = (0u32, false, true, 0u64);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if dw.upgrade().is_none() {
@@ -934,6 +1060,12 @@ fn watch_sound(depay: &gst::Element, decoder: &gst::Element, sink: Option<gst::E
                 eprintln!("viewer: sound back");
             }
             last = now;
+            ticks += 1;
+            if ticks % 60 == 0 {
+                let (sum, n) = std::mem::take(&mut *level.lock().unwrap());
+                let db = if n > 0 && sum > 0.0 { format!("{:.0} dB", 10.0 * (sum / n as f64).log10()) } else if n > 0 { "silent".into() } else { "nothing decoded".into() };
+                eprintln!("viewer: sound over the last minute: {db}, audio packets in {p}/s, decoded {d}/s");
+            }
         }
     });
 }
