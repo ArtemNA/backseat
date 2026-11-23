@@ -10,9 +10,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// How hard the network cuts: (lowest local SNR it still works on, dB; the most it takes
-/// away, dB). Below that SNR a 10 ms step counts as no speech and is muted outright, which
-/// cut quiet word ends at -15 by ear; the limit mixes that much of the input back in.
 /// The strength the workers follow: set by the voice settings, applied from the next step
 /// without rebuilding anything (a rebuild rejoined voice: the others heard you leave and
 /// come back).
@@ -20,9 +17,19 @@ static STRENGTH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(
 
 /// Every running denoiser takes this strength from its next 10 ms step.
 pub fn set_strength(s: u8) {
+    // STREAMER_DEBUG_DFN_STRENGTH_FIXED: ignored (a test's spoiled run).
+    if std::env::var_os("STREAMER_DEBUG_DFN_STRENGTH_FIXED").is_some() {
+        return;
+    }
     STRENGTH.store(s, Ordering::SeqCst);
 }
 
+/// The strength a worker last applied (tests).
+static APPLIED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+/// How hard the network cuts: (lowest local SNR it still works on, dB; the most it takes
+/// away, dB). Below that SNR a 10 ms step counts as no speech and is muted outright, which
+/// cut quiet word ends at -15 by ear; the limit mixes that much of the input back in.
 fn strength(s: u8) -> (f32, f32, &'static str) {
     match s {
         0 => (-15.0, 100.0, "strong"),
@@ -59,11 +66,14 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8,
     // STREAMER_DEBUG_DFN_NO_GUARD: neither (the spoiled variant).
     let guard = std::env::var_os("STREAMER_DEBUG_DFN_NO_GUARD").is_none();
     let mut cur = s;
+    // A network that keeps failing (steps or reloads) is given up: the input then passes as
+    // it is, instead of silence or a 0.15-0.4 s reload on every step stalling the microphone.
+    let mut broken = false;
     // The network skips a step whose mean square is below 1e-7 (about -70 dBFS): it outputs
     // zeros without moving its buffers, so the 30 ms still in them were lost (word ends cut)
     // and came back stale when sound did (a piece of the last word, a click). Such a step
     // (digital silence: a muted or gated microphone, the echo canceller) gets a faint noise
-    // (about -68 dBFS) it then removes. STREAMER_DEBUG_DFN_NO_DITHER: none (spoiled run).
+    // (about -68 dBFS) it then removes; steps under twice that cut-off get it, for margin. STREAMER_DEBUG_DFN_NO_DITHER: none (spoiled run).
     let dither = std::env::var_os("STREAMER_DEBUG_DFN_NO_DITHER").is_none();
     let mut seed = 0x2545_f491_u32;
     while let Ok(mut buf) = rx.recv() {
@@ -75,6 +85,7 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8,
                 let (min_db, limit, name) = strength(cur);
                 model.min_db_thresh = min_db;
                 model.set_atten_lim(limit);
+                APPLIED.store(cur, Ordering::SeqCst);
                 eprintln!("voice: DeepFilterNet now {name}");
             }
             for (d, s) in noisy.iter_mut().zip(inq.drain(..hop)) {
@@ -94,6 +105,11 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8,
                     *v = if v.is_finite() { v.clamp(-4.0, 4.0) } else { 0.0 };
                 }
             }
+            if broken {
+                enh.assign(&noisy);
+                outq.extend(enh.iter());
+                continue;
+            }
             // A failed step gives silence, not the raw input: that would jump 30 ms ahead.
             if model.process(noisy.view(), enh.view_mut()).is_err() {
                 errors += 1;
@@ -103,14 +119,20 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8,
                 resets += 1;
                 enh.fill(0.0);
                 match std::panic::catch_unwind(|| load(s)) {
-                    Ok(Ok(m)) => {
+                    Ok(Ok(m)) if resets <= 3 => {
                         model = m;
                         let (min_db, limit, _) = strength(cur);
                         model.min_db_thresh = min_db;
                         model.set_atten_lim(limit);
                     }
-                    _ => eprintln!("voice: DeepFilterNet could not be reloaded"),
+                    _ => broken = true,
                 }
+            }
+            if errors > 50 {
+                broken = true;
+            }
+            if broken {
+                eprintln!("voice: DeepFilterNet keeps failing ({errors} steps, {resets} reloads): the sound passes as it is");
             }
             outq.extend(enh.iter());
         }
@@ -133,10 +155,11 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8,
 /// meanwhile cut from live sound to the network's first 30 ms of zeros, a click mid-word.
 /// If it fails to load, the sound passes as it is.
 pub fn element(s: u8) -> Result<gst::Element, String> {
-    element_with(s, load)
+    element_with(s, load).map(|(e, _)| e)
 }
 
-fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<gst::Element, String> {
+/// The element and its "network ready" flag.
+fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<(gst::Element, Arc<AtomicBool>), String> {
     let (to_w, w_rx) = channel::<Vec<f32>>();
     let (w_tx, from_w) = channel::<Vec<f32>>();
     let ready = Arc::new(AtomicBool::new(false));
@@ -173,6 +196,7 @@ fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<gst::E
     let el = gst::ElementFactory::make("identity").name("deepfilter").build().map_err(|e| e.to_string())?;
     // STREAMER_DEBUG_DFN_PASS: the samples go through untouched (a gate's spoiled run).
     let pass = std::env::var_os("STREAMER_DEBUG_DFN_PASS").is_some();
+    let ready_out = ready.clone();
     let link = Mutex::new((to_w, from_w));
     el.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         if pass || failed.load(Ordering::SeqCst) {
@@ -200,11 +224,46 @@ fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<gst::E
         }
         gst::PadProbeReturn::Ok
     });
-    Ok(el)
+    Ok((el, ready_out))
 }
 
 #[cfg(test)]
 mod tests {
+    fn wait_ready(ready: &std::sync::atomic::AtomicBool) {
+        let t0 = std::time::Instant::now();
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "the network did not load");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A running denoiser takes a new strength from its next step. Spoiled:
+    /// STREAMER_DEBUG_DFN_STRENGTH_FIXED (set_strength ignored).
+    #[test]
+    fn a_running_denoiser_takes_a_new_strength() {
+        use gst::prelude::*;
+        crate::init();
+        let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
+        let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let (el, ready) = super::element_with(1, super::load).expect("element");
+        wait_ready(&ready);
+        let p = gst::Pipeline::new();
+        p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        let tone = || -> Vec<u8> { (0..480).flat_map(|n| (0.3 * ((n as f32) * 0.05).sin()).to_le_bytes()).collect() };
+        src.push_buffer(gst::Buffer::from_slice(tone())).unwrap();
+        sink.pull_sample().expect("sample");
+        super::set_strength(2);
+        src.push_buffer(gst::Buffer::from_slice(tone())).unwrap();
+        sink.pull_sample().expect("sample");
+        let applied = super::APPLIED.load(std::sync::atomic::Ordering::SeqCst);
+        super::set_strength(1);
+        p.set_state(gst::State::Null).unwrap();
+        assert_eq!(applied, 2, "the running denoiser kept its strength");
+    }
+
     /// The real load, 2 s late: the tests do not depend on how fast the machine loads it.
     fn slow_load(s: u8) -> Result<super::DfTract, String> {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -219,7 +278,7 @@ mod tests {
         crate::init();
         // A load that takes 2 s: the element must come back long before it ends.
         let t0 = std::time::Instant::now();
-        let el = super::element_with(1, slow_load).expect("element");
+        let (el, _) = super::element_with(1, slow_load).expect("element");
         let took = t0.elapsed();
         drop(el);
         assert!(took < std::time::Duration::from_millis(1000), "element() took {took:?}");
@@ -234,7 +293,7 @@ mod tests {
         let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
         let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
         let sink = gst_app::AppSink::builder().sync(false).build();
-        let el = super::element_with(1, |_| panic!("test: the network does not load")).expect("element");
+        let (el, _) = super::element_with(1, |_| panic!("test: the network does not load")).expect("element");
         let p = gst::Pipeline::new();
         p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
         gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
@@ -265,8 +324,8 @@ mod tests {
         let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
         let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
         let sink = gst_app::AppSink::builder().sync(false).build();
-        let el = super::element_with(1, super::load).expect("element");
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let (el, ready) = super::element_with(1, super::load).expect("element");
+        wait_ready(&ready);
         let p = gst::Pipeline::new();
         p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
         gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
@@ -305,7 +364,7 @@ mod tests {
         let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
         let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
         let sink = gst_app::AppSink::builder().sync(false).build();
-        let el = super::element_with(1, slow_load).expect("element");
+        let (el, _) = super::element_with(1, slow_load).expect("element");
         let p = gst::Pipeline::new();
         p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
         gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
