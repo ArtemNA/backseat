@@ -86,20 +86,37 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>) {
 
 /// An `identity` that denoises what passes through it (F32LE, mono, 48 kHz). The network
 /// loads on the worker (0.15-0.4 s) while the caller goes on (the settings' "Hear yourself"
-/// is built on the UI thread); until it is ready, or if it fails, the sound passes as it is.
+/// is built on the UI thread). Until it is ready the output is silence: passing the sound on
+/// meanwhile cut from live sound to the network's first 30 ms of zeros, a click mid-word.
+/// If it fails to load, the sound passes as it is.
 pub fn element(s: u8) -> Result<gst::Element, String> {
+    element_with(s, load)
+}
+
+fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<gst::Element, String> {
     let (to_w, w_rx) = channel::<Vec<f32>>();
     let (w_tx, from_w) = channel::<Vec<f32>>();
     let ready = Arc::new(AtomicBool::new(false));
-    let r2 = ready.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let (r2, f2) = (ready.clone(), failed.clone());
     std::thread::Builder::new()
         .name("deepfilter".into())
-        .spawn(move || match load(s) {
+        // The library panics on some failures (unwrap) instead of returning them: caught, so
+        // that a failed load lets the sound through instead of leaving the microphone silent.
+        // STREAMER_DEBUG_DFN_NO_CATCH: not caught, as before (the spoiled variant).
+        .spawn(move || match if std::env::var_os("STREAMER_DEBUG_DFN_NO_CATCH").is_some() {
+            load(s)
+        } else {
+            std::panic::catch_unwind(|| load(s)).unwrap_or_else(|_| Err("the network panicked while loading".into()))
+        } {
             Ok(m) => {
                 r2.store(true, Ordering::SeqCst);
                 work(m, w_rx, w_tx);
             }
-            Err(e) => eprintln!("voice: no denoiser: {e}"),
+            Err(e) => {
+                f2.store(true, Ordering::SeqCst);
+                eprintln!("voice: no denoiser: {e}");
+            }
         })
         .map_err(|e| e.to_string())?;
     // STREAMER_DEBUG_DFN_WAIT_LOAD: wait here until the network is ready (a file pushed
@@ -115,12 +132,19 @@ pub fn element(s: u8) -> Result<gst::Element, String> {
     let pass = std::env::var_os("STREAMER_DEBUG_DFN_PASS").is_some();
     let link = Mutex::new((to_w, from_w));
     el.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-        if pass || !ready.load(Ordering::SeqCst) {
+        if pass || failed.load(Ordering::SeqCst) {
             return gst::PadProbeReturn::Ok;
         }
         let Some(b) = info.buffer_mut() else { return gst::PadProbeReturn::Ok };
         let Ok(mut m) = b.make_mut().map_writable() else { return gst::PadProbeReturn::Ok };
         let data = m.as_mut_slice();
+        // STREAMER_DEBUG_DFN_LIVE_UNTIL_READY: the sound passes until ready, as before (spoiled).
+        if !ready.load(Ordering::SeqCst) {
+            if std::env::var_os("STREAMER_DEBUG_DFN_LIVE_UNTIL_READY").is_none() {
+                data.fill(0);
+            }
+            return gst::PadProbeReturn::Ok;
+        }
         let samples: Vec<f32> = data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let l = link.lock().unwrap();
         if l.0.send(samples).is_err() {
@@ -138,16 +162,80 @@ pub fn element(s: u8) -> Result<gst::Element, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The real load, 2 s late: the tests do not depend on how fast the machine loads it.
+    fn slow_load(s: u8) -> Result<super::DfTract, String> {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        super::load(s)
+    }
+
     /// The element comes back at once and the network loads behind it: "Hear yourself" is
     /// built on the UI thread, which a 0.15-0.4 s load froze. Spoiled:
     /// STREAMER_DEBUG_DFN_WAIT_LOAD (waits for the load, as before).
     #[test]
     fn element_does_not_wait_for_the_network() {
         crate::init();
+        // A load that takes 2 s: the element must come back long before it ends.
         let t0 = std::time::Instant::now();
-        let el = super::element(1).expect("element");
+        let el = super::element_with(1, slow_load).expect("element");
         let took = t0.elapsed();
         drop(el);
-        assert!(took < std::time::Duration::from_millis(50), "element() took {took:?}");
+        assert!(took < std::time::Duration::from_millis(1000), "element() took {took:?}");
+    }
+
+    /// A network that panics while loading lets the sound through (the library unwraps):
+    /// before, the worker died with "ready" never set and the microphone stayed silent.
+    #[test]
+    fn a_panicking_load_lets_the_sound_through() {
+        use gst::prelude::*;
+        crate::init();
+        let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
+        let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let el = super::element_with(1, |_| panic!("test: the network does not load")).expect("element");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let p = gst::Pipeline::new();
+        p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        let tone: Vec<u8> = (0..480).flat_map(|n| (0.5 * ((n as f32) * 0.1).sin()).to_le_bytes()).collect();
+        src.push_buffer(gst::Buffer::from_slice(tone)).unwrap();
+        let s = sink.pull_sample().expect("sample");
+        let m = s.buffer().unwrap().map_readable().unwrap();
+        let loud = m.as_slice().chunks_exact(4).filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 1e-6).count();
+        drop(m);
+        p.set_state(gst::State::Null).unwrap();
+        assert!(loud > 400, "only {loud} of 480 samples came through");
+    }
+
+    /// Until the network is ready the element gives silence, not the live sound: the switch
+    /// from live sound to the network's first 30 ms of zeros was a click. Spoiled:
+    /// STREAMER_DEBUG_DFN_LIVE_UNTIL_READY.
+    #[test]
+    fn silent_until_the_network_is_ready() {
+        use gst::prelude::*;
+        crate::init();
+        let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
+        let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let el = super::element_with(1, slow_load).expect("element");
+        let p = gst::Pipeline::new();
+        p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        // 10 steps of a loud tone, pushed at once: well before the (2 s) load ends.
+        for i in 0..10u64 {
+            let tone: Vec<u8> = (0..480).flat_map(|n| (0.5 * ((n as f32) * 0.1).sin()).to_le_bytes()).collect();
+            let mut b = gst::Buffer::from_slice(tone);
+            b.get_mut().unwrap().set_pts(gst::ClockTime::from_mseconds(i * 10));
+            src.push_buffer(b).unwrap();
+        }
+        let mut loud = 0;
+        for _ in 0..10 {
+            let s = sink.pull_sample().expect("sample");
+            let m = s.buffer().unwrap().map_readable().unwrap();
+            loud += m.as_slice().chunks_exact(4).filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 1e-6).count();
+        }
+        p.set_state(gst::State::Null).unwrap();
+        assert_eq!(loud, 0, "{loud} samples came through before the network was ready");
     }
 }

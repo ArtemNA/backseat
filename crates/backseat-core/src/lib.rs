@@ -40,6 +40,8 @@ pub struct App {
     voice_settings: Mutex<VoiceSettings>,
     /// "Hear yourself" in the settings, while on.
     mic_test: Mutex<Option<media::mictest::MicTest>>,
+    /// The microphone and its processing the running voice was built with.
+    voice_built: Mutex<Option<(Option<String>, media::voice::DspConfig)>>,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -261,6 +263,7 @@ fn join_voice_in(app: &Arc<App>, s: Arc<Session>) -> Result<(), String> {
         let st = app.voice_settings.lock().unwrap();
         (st.mic.clone(), st.dsp.clone())
     };
+    let built = (mic.clone(), dsp.clone());
     let mut cfg = media::voice::VoiceConfig { mic, dsp, ..Default::default() };
     // Tests only: STREAMER_APP_TEST_VOICE=<Hz> sends a tone instead of the microphone and
     // plays nothing.
@@ -271,6 +274,7 @@ fn join_voice_in(app: &Arc<App>, s: Arc<Session>) -> Result<(), String> {
     let (mic, deaf) = *app.voice_prefs.lock().unwrap();
     s.set_voice_state(mic || deaf, deaf);
     let v = s.join_voice(cfg).inspect_err(|e| eprintln!("voice failed: {e}"))?;
+    *app.voice_built.lock().unwrap() = Some(built);
     v.set_mic_muted(mic || deaf);
     v.set_deafened(deaf);
     let st = app.voice_settings.lock().unwrap().clone();
@@ -472,7 +476,26 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
             let a = app.clone();
             let open_room = std::env::var_os("STREAMER_DEBUG_REJOIN_OPEN_ROOM").is_some();
             std::thread::spawn(move || {
-                let r = if open_room { join_voice(&a) } else { join_voice_in(&a, s) };
+                let mut r = if open_room { join_voice(&a) } else { join_voice_in(&a, s.clone()) };
+                // A change made while this joined found no voice to rejoin and was lost: the
+                // voice ran with the earlier settings. Join again until it has the current
+                // ones. STREAMER_DEBUG_NO_REJOIN_RECHECK: no check (the spoiled variant).
+                let recheck = !open_room && std::env::var_os("STREAMER_DEBUG_NO_REJOIN_RECHECK").is_none();
+                for _ in 0..5 {
+                    if r.is_err() || !recheck || s.voice().is_none() {
+                        break;
+                    }
+                    let now = {
+                        let st = a.voice_settings.lock().unwrap();
+                        (st.mic.clone(), st.dsp.clone())
+                    };
+                    if a.voice_built.lock().unwrap().as_ref() == Some(&now) {
+                        break;
+                    }
+                    eprintln!("voice: settings changed while rejoining, again");
+                    s.leave_voice();
+                    r = join_voice_in(&a, s.clone());
+                }
                 if let Err(e) = r {
                     a.notify(format!("error:{e}"));
                 }
@@ -1614,6 +1637,13 @@ mod switch_tests {
 mod voice_room_tests {
     use std::time::Duration;
 
+    /// One voice at a time in this process, as in the app: two at once (the test harness
+    /// runs tests in parallel) share the echo probe and the sound output and crashed.
+    fn one_voice() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn wait_for(what: &str, f: impl Fn() -> bool) {
         for _ in 0..100 {
             if f() {
@@ -1624,6 +1654,29 @@ mod voice_room_tests {
         panic!("{what}: not within 10 s");
     }
 
+    /// STREAMER_TEST_SERVER and STREAMER_APP_TEST_VOICE: two settings changes in a row while
+    /// in voice. The second comes while the first rejoins (no voice to rejoin then); the
+    /// voice still ends up built with it. Spoiled: STREAMER_DEBUG_NO_REJOIN_RECHECK.
+    #[test]
+    fn quick_second_change_reaches_the_voice() {
+        let (Ok(url), Ok(_)) = (std::env::var("STREAMER_TEST_SERVER"), std::env::var("STREAMER_APP_TEST_VOICE")) else { return };
+        let _one = one_voice();
+        media::init();
+        let app = std::sync::Arc::new(super::App::default());
+        super::connect(&app, &url, "vroom-q", "Tester", None).expect("join");
+        super::join_voice(&app).expect("voice");
+        let mut st = app.voice_settings.lock().unwrap().clone();
+        st.dsp.deepfilter_strength = 0;
+        super::set_voice_settings(&app, st.clone());
+        st.dsp.deepfilter_strength = 2;
+        super::set_voice_settings(&app, st.clone());
+        let want = (st.mic.clone(), st.dsp.clone());
+        wait_for("the voice built with the second change", || app.voice_built.lock().unwrap().as_ref() == Some(&want));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(app.voice_built.lock().unwrap().as_ref(), Some(&want), "changed back afterwards");
+        super::leave_everything(&app, Duration::from_millis(300));
+    }
+
     /// STREAMER_TEST_SERVER (a running server) and STREAMER_APP_TEST_VOICE (a tone, silent):
     /// in voice in room A, then room B opens (A stays in the background for its voice). A
     /// settings change that joins voice again does it in A, not in B; leaving voice then
@@ -1632,6 +1685,7 @@ mod voice_room_tests {
     #[test]
     fn voice_stays_in_its_room() {
         let (Ok(url), Ok(_)) = (std::env::var("STREAMER_TEST_SERVER"), std::env::var("STREAMER_APP_TEST_VOICE")) else { return };
+        let _one = one_voice();
         media::init();
         let app = std::sync::Arc::new(super::App::default());
         super::connect(&app, &url, "vroom-a", "Tester", None).expect("join A");

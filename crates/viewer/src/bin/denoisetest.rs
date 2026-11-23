@@ -48,6 +48,7 @@ fn si_sdr(s: &[f32], e: &[f32]) -> f64 {
 }
 
 fn best(c: &[f32], e: &[f32]) -> (f64, i64) {
+    assert!(c.len() > 9600 && e.len() > 9600, "recordings too short to compare ({} / {} samples)", c.len(), e.len());
     let at = |lag: i64| {
         let (cs, es): (&[f32], &[f32]) = if lag >= 0 { (&c[..c.len() - lag as usize], &e[lag as usize..]) } else { (&c[(-lag) as usize..], &e[..e.len() - (-lag) as usize]) };
         si_sdr(cs, es)
@@ -107,4 +108,7 @@ fn main() {
     // Passes when every strength gains at least 5 dB over the noisy input.
     let ok = scores[1..].iter().all(|v| *v >= scores[0] + 5.0);
     println!("DENOISE GATE: {} (none {:.2}, strong {:.2}, medium {:.2}, soft {:.2})", if ok { "PASS" } else { "FAIL" }, scores[0], scores[1], scores[2], scores[3]);
+    if !ok {
+        std::process::exit(1);
+    }
 }
