@@ -772,7 +772,7 @@ impl Shell {
             (Some("voice"), "out", devices(false)),
             (Some("voice"), "mode", rows(&[("", t("voice.mode_va")), ("ptt", t("voice.mode_ptt"))])),
             (Some("voice"), "noise", rows(&[("", t("voice.noise_deepfilter")), ("off", t("voice.noise_off")), ("low", t("voice.noise_low")), ("moderate", t("voice.noise_moderate")), ("high", t("voice.noise_high")), ("very-high", t("voice.noise_very_high"))])),
-            (Some("voice"), "dfn", rows(&[("", t("voice.dfn_medium")), ("strong", t("voice.dfn_strong")), ("soft", t("voice.dfn_soft"))])),
+            (Some("voice"), "dfn", rows(&[("strong", t("voice.dfn_strong")), ("", t("voice.dfn_medium")), ("soft", t("voice.dfn_soft"))])),
             (Some("voice"), "key", rows(&crate::voice_ui::PTT_KEYS.map(|(k, n)| (k, plain(n))))),
         ];
         let mut prefs = vec![];

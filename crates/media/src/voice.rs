@@ -104,6 +104,7 @@ impl DspConfig {
         if !self.deepfilter || tested {
             return Ok(vec![]);
         }
+        crate::denoise::set_strength(self.deepfilter_strength);
         let dfn = match crate::denoise::element(self.deepfilter_strength) {
             Ok(e) => e,
             Err(e) => {

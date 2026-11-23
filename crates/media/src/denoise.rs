@@ -13,6 +13,16 @@ use std::sync::{Arc, Mutex};
 /// How hard the network cuts: (lowest local SNR it still works on, dB; the most it takes
 /// away, dB). Below that SNR a 10 ms step counts as no speech and is muted outright, which
 /// cut quiet word ends at -15 by ear; the limit mixes that much of the input back in.
+/// The strength the workers follow: set by the voice settings, applied from the next step
+/// without rebuilding anything (a rebuild rejoined voice: the others heard you leave and
+/// come back).
+static STRENGTH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Every running denoiser takes this strength from its next 10 ms step.
+pub fn set_strength(s: u8) {
+    STRENGTH.store(s, Ordering::SeqCst);
+}
+
 fn strength(s: u8) -> (f32, f32, &'static str) {
     match s {
         0 => (-15.0, 100.0, "strong"),
@@ -37,12 +47,18 @@ fn load(s: u8) -> Result<DfTract, String> {
 /// The worker: takes buffers of samples, returns as many denoised ones. The output runs
 /// behind by the model's own delay; samples not processed yet (the start, when buffers are
 /// shorter than 10 ms) come out as zeros.
-fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>) {
+fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>, s: u8, load: fn(u8) -> Result<DfTract, String>) {
     let hop = model.hop_size;
     let (mut inq, mut outq) = (VecDeque::<f32>::new(), VecDeque::<f32>::new());
     let mut noisy = ndarray::Array2::<f32>::zeros((1, hop));
     let mut enh = ndarray::Array2::<f32>::zeros((1, hop));
-    let (mut short, mut errors, mut dithered) = (0u64, 0u64, 0u64);
+    let (mut short, mut errors, mut dithered, mut resets) = (0u64, 0u64, 0u64, 0u64);
+    // One NaN or infinity in the network's state stays there for good (its running means and
+    // recurrent state): the microphone would stay silent or noisy until rebuilt. The input is
+    // made finite and bounded; an output that is not finite anyway reloads the network.
+    // STREAMER_DEBUG_DFN_NO_GUARD: neither (the spoiled variant).
+    let guard = std::env::var_os("STREAMER_DEBUG_DFN_NO_GUARD").is_none();
+    let mut cur = s;
     // The network skips a step whose mean square is below 1e-7 (about -70 dBFS): it outputs
     // zeros without moving its buffers, so the 30 ms still in them were lost (word ends cut)
     // and came back stale when sound did (a piece of the last word, a click). Such a step
@@ -53,6 +69,14 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>) {
     while let Ok(mut buf) = rx.recv() {
         inq.extend(buf.iter().copied());
         while inq.len() >= hop {
+            let want = STRENGTH.load(Ordering::SeqCst);
+            if want != cur {
+                cur = want;
+                let (min_db, limit, name) = strength(cur);
+                model.min_db_thresh = min_db;
+                model.set_atten_lim(limit);
+                eprintln!("voice: DeepFilterNet now {name}");
+            }
             for (d, s) in noisy.iter_mut().zip(inq.drain(..hop)) {
                 *d = s;
             }
@@ -65,9 +89,28 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>) {
                     *v += (seed as f32 / u32::MAX as f32 * 2.0 - 1.0) * 7e-4;
                 }
             }
+            if guard {
+                for v in noisy.iter_mut() {
+                    *v = if v.is_finite() { v.clamp(-4.0, 4.0) } else { 0.0 };
+                }
+            }
+            // A failed step gives silence, not the raw input: that would jump 30 ms ahead.
             if model.process(noisy.view(), enh.view_mut()).is_err() {
                 errors += 1;
-                enh.assign(&noisy);
+                enh.fill(0.0);
+            }
+            if guard && enh.iter().any(|v| !v.is_finite()) {
+                resets += 1;
+                enh.fill(0.0);
+                match std::panic::catch_unwind(|| load(s)) {
+                    Ok(Ok(m)) => {
+                        model = m;
+                        let (min_db, limit, _) = strength(cur);
+                        model.min_db_thresh = min_db;
+                        model.set_atten_lim(limit);
+                    }
+                    _ => eprintln!("voice: DeepFilterNet could not be reloaded"),
+                }
             }
             outq.extend(enh.iter());
         }
@@ -81,7 +124,7 @@ fn work(mut model: DfTract, rx: Receiver<Vec<f32>>, tx: Sender<Vec<f32>>) {
             break;
         }
     }
-    eprintln!("voice: DeepFilterNet stopped ({short} samples before the first 10 ms, {errors} failed steps, {dithered} silent steps)");
+    eprintln!("voice: DeepFilterNet stopped ({short} samples before the first 10 ms, {errors} failed steps, {dithered} silent steps, {resets} reloads)");
 }
 
 /// An `identity` that denoises what passes through it (F32LE, mono, 48 kHz). The network
@@ -111,7 +154,7 @@ fn element_with(s: u8, load: fn(u8) -> Result<DfTract, String>) -> Result<gst::E
         } {
             Ok(m) => {
                 r2.store(true, Ordering::SeqCst);
-                work(m, w_rx, w_tx);
+                work(m, w_rx, w_tx, s, load);
             }
             Err(e) => {
                 f2.store(true, Ordering::SeqCst);
@@ -192,19 +235,64 @@ mod tests {
         let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
         let sink = gst_app::AppSink::builder().sync(false).build();
         let el = super::element_with(1, |_| panic!("test: the network does not load")).expect("element");
-        std::thread::sleep(std::time::Duration::from_millis(300));
         let p = gst::Pipeline::new();
         p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
         gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
         p.set_state(gst::State::Playing).unwrap();
-        let tone: Vec<u8> = (0..480).flat_map(|n| (0.5 * ((n as f32) * 0.1).sin()).to_le_bytes()).collect();
-        src.push_buffer(gst::Buffer::from_slice(tone)).unwrap();
-        let s = sink.pull_sample().expect("sample");
-        let m = s.buffer().unwrap().map_readable().unwrap();
-        let loud = m.as_slice().chunks_exact(4).filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 1e-6).count();
-        drop(m);
+        // Steps until one comes through (the failure is noticed on the worker), up to 5 s.
+        let mut loud = 0;
+        for _ in 0..500 {
+            let tone: Vec<u8> = (0..480).flat_map(|n| (0.5 * ((n as f32) * 0.1).sin()).to_le_bytes()).collect();
+            src.push_buffer(gst::Buffer::from_slice(tone)).unwrap();
+            let s = sink.pull_sample().expect("sample");
+            let m = s.buffer().unwrap().map_readable().unwrap();
+            loud = m.as_slice().chunks_exact(4).filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 1e-6).count();
+            if loud > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         p.set_state(gst::State::Null).unwrap();
         assert!(loud > 400, "only {loud} of 480 samples came through");
+    }
+
+    /// NaN and infinite samples do not poison the network: after them a tone comes through
+    /// again. Spoiled: STREAMER_DEBUG_DFN_NO_GUARD.
+    #[test]
+    fn nan_input_does_not_silence_the_microphone() {
+        use gst::prelude::*;
+        crate::init();
+        let caps = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", 48000i32).field("channels", 1i32).field("layout", "interleaved").build();
+        let src = gst_app::AppSrc::builder().caps(&caps).format(gst::Format::Time).build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let el = super::element_with(1, super::load).expect("element");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let p = gst::Pipeline::new();
+        p.add_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &el, sink.upcast_ref()]).unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        let step = |f: &dyn Fn(usize) -> f32| -> Vec<u8> { (0..480).flat_map(|n| f(n).to_le_bytes()).collect() };
+        let mut steps = vec![];
+        for i in 0..100 {
+            let bad = (20..23).contains(&i);
+            steps.push(step(&|n| if bad { if n % 2 == 0 { f32::NAN } else { f32::INFINITY } } else { 0.3 * ((n as f32) * 0.05).sin() + 0.05 * ((n * 7919 % 97) as f32 / 97.0 - 0.5) }));
+        }
+        for s in steps {
+            src.push_buffer(gst::Buffer::from_slice(s)).unwrap();
+        }
+        let (mut bad, mut last_loud) = (0usize, 0f32);
+        for i in 0..100 {
+            let s = sink.pull_sample().expect("sample");
+            let m = s.buffer().unwrap().map_readable().unwrap();
+            let v: Vec<f32> = m.as_slice().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            bad += v.iter().filter(|x| !x.is_finite()).count();
+            if i >= 90 {
+                last_loud = last_loud.max(v.iter().map(|x| if x.is_finite() { x.abs() } else { 0.0 }).fold(0.0, f32::max));
+            }
+        }
+        p.set_state(gst::State::Null).unwrap();
+        assert_eq!(bad, 0, "{bad} samples were not finite");
+        assert!(last_loud > 1e-4, "the microphone stayed silent after the bad samples (peak {last_loud})");
     }
 
     /// Until the network is ready the element gives silence, not the live sound: the switch
