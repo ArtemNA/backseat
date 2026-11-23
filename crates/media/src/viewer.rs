@@ -945,8 +945,10 @@ fn add_audio(
     // already), and moved with them once in the pipeline. STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS:
     // always the system's default, as before (the spoiled variant).
     let follow = own_sink.as_ref().is_some_and(crate::playback::device_by_id) && std::env::var_os("STREAMER_DEBUG_STREAM_DEFAULT_SPEAKERS").is_none();
+    let mut set_to: Option<String> = None;
     if let (Some(s), true) = (&own_sink, follow) {
-        if let Some(d) = crate::playback::present_device(crate::playback::device()) {
+        set_to = crate::playback::present_device(crate::playback::device());
+        if let Some(d) = &set_to {
             s.set_property("device", d);
         }
     }
@@ -960,7 +962,7 @@ fn add_audio(
     };
     link_branch(pipeline, pad, &chain)?;
     if let (Some(s), true) = (&own_sink, follow) {
-        crate::playback::follow(s);
+        crate::playback::follow_new(s, &set_to);
     }
     if let (Some(s), true) = (&own_sink, std::env::var_os("STREAMER_DEBUG_AUDIO_SINK_PROBE").is_some()) {
         debug_sink_probe(pipeline, &decoder, s);
@@ -971,7 +973,7 @@ fn add_audio(
         if own_sink.is_some() { "own output" } else { "shared output" },
         if audio.muted.load(Ordering::SeqCst) { "muted" } else { "on" },
         audio.volume.load(Ordering::SeqCst),
-        if follow { if crate::playback::device().is_some() { ", on the speakers chosen for voice" } else { ", on the default speakers as voice" } } else { "" }
+        if follow { if set_to.is_some() { ", on the speakers chosen for voice" } else { ", on the default speakers" } } else { "" }
     );
     // Tests only: STREAMER_DEBUG_SOUND_GONE_AFTER=N drops the decoded sound after N s (the
     // sound watch must notice).

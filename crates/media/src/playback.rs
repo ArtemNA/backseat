@@ -64,9 +64,14 @@ pub fn set_device(id: Option<String>) {
     if let Some(p) = SHARED.get() {
         p.switch_device(id.clone());
     }
-    // Off the caller's thread (the UI's): each switch opens a device and waits for a gap
-    // between buffers. One at a time, to the speakers wanted by then and on the outputs as
-    // they are by then: quick changes in a row end on the last one chosen.
+    switch_followers(id);
+}
+
+/// Moves every stream's own output to the speakers wanted (`id` only for the spoiled test).
+/// Off the caller's thread (the UI's): each switch opens a device and waits for a gap
+/// between buffers. One at a time, to the speakers wanted by then and on the outputs as
+/// they are by then: quick changes in a row end on the last one chosen.
+fn switch_followers(id: Option<String>) {
     if !FOLLOWERS.lock().unwrap().is_empty() {
         // STREAMER_DEBUG_SWITCH_PARALLEL: each change on its own, to the id it was given (the
         // spoiled variant: quick changes could end on an earlier one).
@@ -151,6 +156,16 @@ pub fn follow(sink: &gst::Element) {
     let mut f = FOLLOWERS.lock().unwrap();
     if !f.iter().any(|w| w.upgrade().as_ref() == Some(sink)) {
         f.push(sink.downgrade());
+    }
+}
+
+/// `follow` for a new stream's output, set to `set_to` before: if the speakers changed
+/// meanwhile (before it was in the list), it is moved now.
+pub fn follow_new(sink: &gst::Element, set_to: &Option<String>) {
+    follow(sink);
+    let want = device();
+    if want != *set_to && present_device(want.clone()) != *set_to {
+        switch_followers(want);
     }
 }
 
