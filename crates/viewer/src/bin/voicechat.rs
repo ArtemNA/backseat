@@ -71,8 +71,6 @@ fn main() {
             "--watch" => watch = Some(val),
             "--voice-after" => voice_after = val.parse().unwrap_or(0),
             "--threshold" => threshold = val.parse().ok(),
-            // A whine cut at this frequency (as "Remove the whine" sets).
-            "--notch" => cfg.dsp.notches.push(val.parse().unwrap_or(1000.0)),
             "--seconds" => seconds = val.parse().unwrap_or(0),
             "--leave-after" => leave_after = val.parse().unwrap_or(0),
             "--stun" => cfg.ice = IceConfig { stun: (val != "none").then_some(val), turn: None },

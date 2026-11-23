@@ -6,5 +6,6 @@ publish.workspace = true
 
 [dependencies]
 gst.workspace = true
+gst-app.workspace = true
 media.workspace = true
 protocol = { path = "../protocol" }

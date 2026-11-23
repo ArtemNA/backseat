@@ -17,6 +17,9 @@ flate2 = "1"
 base64 = "0.22"
 # wss:// for a signaling server behind TLS, using the system's own TLS stack.
 tungstenite = { version = "0.30", features = ["native-tls"] }
+# The voice denoiser: DeepFilterNet3, its model built in (crates/deep_filter).
+deep_filter = { path = "../deep_filter" }
+ndarray = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

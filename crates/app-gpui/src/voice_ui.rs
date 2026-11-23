@@ -45,27 +45,21 @@ pub fn saved() -> core::VoiceSettings {
         stream_echo: settings().get("voiceStreamEcho").and_then(|v| v.as_bool()) == Some(true),
         dsp: media::voice::DspConfig {
             echo_cancel: flag("voiceEcho"),
-            // Unset: the usual middle level; "off": none.
-            // Unset: RNNoise (the strongest on whines and hums); "off": none; else the WebRTC level.
+            // Unset (and the former "rnnoise", "deepfilter"): DeepFilterNet; "off": none;
+            // else the WebRTC level.
             noise: match voice_pref("noise").as_deref() {
-                None | Some("off") | Some("rnnoise") => None,
+                None | Some("off") | Some("rnnoise") | Some("deepfilter") => None,
                 Some(v) => Some(v.to_string()),
             },
             auto_gain: flag("voiceGain"),
-            rnnoise: matches!(voice_pref("noise").as_deref(), None | Some("rnnoise")),
-            notches: notches(),
-            high_cut: settings().get("voiceHighCut").and_then(|v| v.as_bool()) == Some(true),
+            deepfilter: matches!(voice_pref("noise").as_deref(), None | Some("rnnoise") | Some("deepfilter")),
+            deepfilter_strength: match voice_pref("dfn").as_deref() {
+                Some("strong") => 0,
+                Some("soft") => 2,
+                _ => 1,
+            },
         },
     }
-}
-
-/// The whine's frequencies cut from the microphone (Hz), from "Remove the whine".
-pub fn notches() -> Vec<f32> {
-    settings().get("voiceNotches").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect()).unwrap_or_default()
-}
-
-pub fn set_notches(list: &[f32]) {
-    crate::set_setting("voiceNotches", serde_json::Value::Array(list.iter().map(|f| serde_json::json!(f)).collect()));
 }
 
 /// The lowest end of the threshold slider means "off".

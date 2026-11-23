@@ -1,0 +1,37 @@
+# DeepFilterNet's libDF (https://github.com/Rikorose/DeepFilterNet, tag v0.5.6, commit
+# 978576aa8400552a4ce9730838c635aa30db5e61), trimmed to the real-time inference: tract, the STFT transforms and the
+# DeepFilterNet3 model (model/, built in). Dual-licensed MIT or Apache-2.0 as the original.
+# Changes: the dataset, C API, WAV and test code is left out; the low-latency model is not
+# shipped; the default model is always built in.
+[package]
+name = "deep_filter"
+version = "0.5.6"
+authors = ["Hendrik Schröter"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "df"
+path = "src/lib.rs"
+
+[features]
+timings = []
+
+[dependencies]
+rustfft = "6.1"
+realfft = "3.1"
+itertools = "0.10"
+num-complex = { version = "0.4", features = ["serde"] }
+log = { version = "0.4", features = ["std"] }
+thiserror = "1.0"
+anyhow = "1.0"
+ndarray = { version = "0.15", features = ["serde"] }
+rubato = "0.14"
+rust-ini = "0.19"
+tract-core = "0.19.4"
+tract-onnx = "0.19.4"
+tract-pulse = "0.19.4"
+tract-hir = "0.19.4"
+flate2 = "1.0.24"
+tar = "0.4.38"

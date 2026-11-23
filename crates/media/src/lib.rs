@@ -39,6 +39,8 @@ mod overlay;
 pub mod present;
 #[cfg(windows)]
 pub mod videoproc;
+#[cfg(windows)]
+pub mod denoise;
 
 pub fn init() {
     platform::init_timer();

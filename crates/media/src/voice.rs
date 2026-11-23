@@ -55,27 +55,21 @@ pub struct DspConfig {
     /// Takes what the speakers play out of the microphone.
     pub echo_cancel: bool,
     /// Noise suppression level as webrtcdsp names it ("low", "moderate", "high",
-    /// "very-high"); None: off.
+    /// "very-high"), in place of DeepFilterNet; None: none of webrtcdsp's.
     pub noise: Option<String>,
     /// Evens out the microphone's loudness.
     pub auto_gain: bool,
-    /// The RNNoise denoiser (a small neural network) after the processing, in place of the
-    /// noise suppression above: stronger on whines and hums that are not like hiss.
-    pub rnnoise: bool,
-    /// Narrow cuts at these frequencies (Hz): a whine's tones, found by `mictest::find_whine`.
-    pub notches: Vec<f32>,
-    /// Everything above 8 kHz cut (speech needs little of it; a high whine sits there).
-    pub high_cut: bool,
+    /// The DeepFilterNet3 denoiser (a neural network) after the processing.
+    pub deepfilter: bool,
+    /// How hard it cuts: 0 strong, 1 medium, 2 soft (`denoise::strength`).
+    pub deepfilter_strength: u8,
 }
 
 impl Default for DspConfig {
     fn default() -> Self {
-        Self { echo_cancel: true, noise: Some("moderate".into()), auto_gain: true, rnnoise: false, notches: vec![], high_cut: false }
+        Self { echo_cancel: true, noise: None, auto_gain: true, deepfilter: true, deepfilter_strength: 1 }
     }
 }
-
-/// Half the width of a notch, Hz: narrow enough to leave a voice as it is.
-const NOTCH_HALF: f32 = 12.0;
 
 impl DspConfig {
     /// Noise and gain on a webrtcdsp (echo cancelling is set by the caller). `tested`: a
@@ -90,48 +84,25 @@ impl DspConfig {
         dsp.set_property("high-pass-filter", true);
     }
 
-    /// The elements after webrtcdsp (S16LE mono in, S16LE mono out): RNNoise when chosen,
-    /// else none. `tested`: a steady test tone, which it would take for noise: none.
+    /// The elements after webrtcdsp (S16LE mono in, S16LE mono out): DeepFilterNet when
+    /// chosen, else none. `tested`: a steady test tone, which it would take for noise: none.
+    /// The network not loading leaves the voice as it is (logged), not without a microphone.
     pub fn after(&self, tested: bool) -> Result<Vec<gst::Element>, String> {
-        let rnnoise = self.rnnoise && !tested;
-        if !rnnoise && self.notches.is_empty() && !self.high_cut {
+        if !self.deepfilter || tested {
             return Ok(vec![]);
         }
+        let dfn = match crate::denoise::element(self.deepfilter_strength) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("voice: no denoiser: {e}");
+                return Ok(vec![]);
+            }
+        };
         let mk = |f: &str| gst::ElementFactory::make(f).build().map_err(|e| format!("{f}: {e}"));
         let f32 = gst::Caps::builder("audio/x-raw").field("format", "F32LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
         let s16 = gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
         let cf = |c: gst::Caps| gst::ElementFactory::make("capsfilter").property("caps", c).build().unwrap();
-        let mut out = vec![mk("audioconvert")?, cf(f32)];
-        // The whine first: RNNoise then has less to guess about.
-        // Each tone cut twice: one 4-pole cut took a tone down 25 dB, two about twice that;
-        // steeper single cuts went unstable (12 poles) or shallower (8). STREAMER_DEBUG_NOTCH_ONCE: one.
-        let times = if std::env::var_os("STREAMER_DEBUG_NOTCH_ONCE").is_some() { 1 } else { 2 };
-        for &f in self.notches.iter().flat_map(|f| std::iter::repeat_n(f, times)) {
-            let n = mk("audiochebband")?;
-            n.set_property_from_str("mode", "band-reject");
-            n.set_property("poles", std::env::var("STREAMER_DEBUG_NOTCH_POLES").ok().and_then(|v| v.parse().ok()).unwrap_or(4i32));
-            n.set_property("lower-frequency", (f - NOTCH_HALF).max(10.0));
-            n.set_property("upper-frequency", (f + NOTCH_HALF).min(RATE as f32 / 2.0 - 10.0));
-            out.push(n);
-        }
-        if self.high_cut {
-            let lp = mk("audiocheblimit")?;
-            lp.set_property_from_str("mode", "low-pass");
-            lp.set_property("cutoff", 8000.0f32);
-            lp.set_property("poles", 4i32);
-            out.push(lp.clone());
-            // Twice, as the notches: steeper above 8 kHz without the instability of more poles.
-            let lp2 = mk("audiocheblimit")?;
-            lp2.set_property_from_str("mode", "low-pass");
-            lp2.set_property("cutoff", 8000.0f32);
-            lp2.set_property("poles", 4i32);
-            out.push(lp2);
-        }
-        if rnnoise {
-            out.push(mk("audiornnoise")?);
-        }
-        out.extend([mk("audioconvert")?, cf(s16)]);
-        Ok(out)
+        Ok(vec![mk("audioconvert")?, cf(f32), dfn, mk("audioconvert")?, cf(s16)])
     }
 }
 
@@ -443,6 +414,9 @@ impl Voice {
         dsp.set_property("echo-cancel", cfg.dsp.echo_cancel && std::env::var_os("STREAMER_DEBUG_VOICE_NO_AEC").is_none());
         let tested = cfg.test_tone.is_some() || room;
         cfg.dsp.apply(&dsp, tested);
+        // STREAMER_DEBUG_VOICE_DENOISE_TONE: the denoiser stays on for a test tone (which it
+        // takes for noise and removes): proves it runs in the live microphone pipeline.
+        let tested = tested && !(cfg.test_tone.is_some() && std::env::var_os("STREAMER_DEBUG_VOICE_DENOISE_TONE").is_some());
         let mute = gst::ElementFactory::make("volume").build().unwrap();
         let opus = make("opusenc")?;
         opus.set_property_from_str("audio-type", "voice");
@@ -486,8 +460,8 @@ impl Voice {
         gst::Element::link_many(&send).map_err(|e| e.to_string())?;
         let mic_level = Arc::new(Level::default());
         mic_level.watch(&mute.static_pad("src").unwrap());
-        // The voice activity gate, after all the processing (canceller, RNNoise, the whine's
-        // cuts, the high cut) and before mute: it opened on a whine the processing removes.
+        // The voice activity gate, after all the processing (canceller, denoiser) and before
+        // mute: it opened on a whine the processing removes.
         // STREAMER_DEBUG_GATE_BEFORE_PROCESSING: right after the canceller, as before.
         let gate = Arc::new(Gate::default());
         let g = gate.clone();

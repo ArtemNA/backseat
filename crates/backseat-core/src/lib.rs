@@ -40,9 +40,6 @@ pub struct App {
     voice_settings: Mutex<VoiceSettings>,
     /// "Hear yourself" in the settings, while on.
     mic_test: Mutex<Option<media::mictest::MicTest>>,
-    /// The microphone test was paused for "Remove the whine" and comes back after it, unless
-    /// the settings closed meanwhile (`stop_mic_test`).
-    mic_test_paused: std::sync::atomic::AtomicBool,
 }
 
 /// Runs a closure on the UI's main thread; set by the UI at start (tests use it).
@@ -386,35 +383,9 @@ pub fn sounding_programs() -> Vec<String> {
     vec![]
 }
 
-/// Listens to the chosen microphone for 3 s (the user stays quiet) and returns a steady
-/// whine's frequencies, to cut. The microphone test pauses meanwhile. Blocks.
-pub fn find_whine(app: &App) -> Result<Vec<f32>, String> {
-    use std::sync::atomic::Ordering;
-    if mic_test_on(app) {
-        app.mic_test_paused.store(true, Ordering::SeqCst);
-    }
-    let _ = set_mic_test(app, false);
-    let mic = app.voice_settings.lock().unwrap().mic.clone();
-    let tone = std::env::var("STREAMER_APP_TEST_VOICE").ok().and_then(|v| v.parse().ok());
-    let r = media::mictest::find_whine(mic, 3, tone);
-    // Back on only if nothing stopped it meanwhile (the settings closed: the microphone
-    // stays closed). STREAMER_DEBUG_WHINE_RESUMES_TEST: back on anyway, as before.
-    let resume = app.mic_test_paused.swap(false, Ordering::SeqCst) || (std::env::var_os("STREAMER_DEBUG_WHINE_RESUMES_TEST").is_some());
-    if resume {
-        let _ = set_mic_test(app, true);
-    }
-    r
-}
-
-/// The settings closed (or the window went to the tray): the microphone test stops and does
-/// not come back after a whine search that is still listening.
+/// The settings closed (or the window went to the tray): the microphone test stops.
 pub fn stop_mic_test(app: &App) {
-    use std::sync::atomic::Ordering;
-    let was_paused = app.mic_test_paused.swap(false, Ordering::SeqCst);
     let _ = set_mic_test(app, false);
-    if was_paused && std::env::var_os("STREAMER_DEBUG_WHINE_RESUMES_TEST").is_some() {
-        app.mic_test_paused.store(true, Ordering::SeqCst);
-    }
 }
 
 pub fn mic_test_on(app: &App) -> bool {
@@ -1669,7 +1640,7 @@ mod voice_room_tests {
         let in_bg = |room: &str| app.background.lock().unwrap().iter().any(|(_, s)| s.room == room);
         assert!(in_bg("vroom-a"), "A was not kept in the background for its voice");
         let mut st = app.voice_settings.lock().unwrap().clone();
-        st.dsp.high_cut = !st.dsp.high_cut;
+        st.dsp.deepfilter_strength = (st.dsp.deepfilter_strength + 1) % 3;
         super::set_voice_settings(&app, st);
         let voice_in = |room: &str| -> bool {
             let open = app.session.lock().unwrap().clone().filter(|s| s.room == room);
@@ -1683,22 +1654,4 @@ mod voice_room_tests {
         super::leave_everything(&app, Duration::from_millis(300));
     }
 
-    /// The microphone test paused by a whine search does not come back once the settings
-    /// closed meanwhile. Needs STREAMER_APP_TEST_VOICE (a tone). Spoiled:
-    /// STREAMER_DEBUG_WHINE_RESUMES_TEST.
-    #[test]
-    fn mic_test_stays_off_after_the_settings_close() {
-        if std::env::var("STREAMER_APP_TEST_VOICE").is_err() {
-            return;
-        }
-        media::init();
-        let app = std::sync::Arc::new(super::App::default());
-        super::set_mic_test(&app, true).expect("mic test");
-        let a = app.clone();
-        let search = std::thread::spawn(move || super::find_whine(&a));
-        std::thread::sleep(Duration::from_millis(1000));
-        super::stop_mic_test(&app);
-        let _ = search.join().unwrap();
-        assert!(!super::mic_test_on(&app), "the microphone test came back after the settings closed");
-    }
 }
