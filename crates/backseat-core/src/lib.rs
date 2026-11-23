@@ -526,15 +526,49 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
             };
             std::thread::spawn(move || {
                 // Done (whichever way): the room no longer counts as busy for it.
+                // A room kept in the background only for this rejoin and left without a voice
+                // closes keeping its place, as leave_voice does: it stayed online for good.
+                // STREAMER_DEBUG_REJOIN_NO_CLOSE: it stays (the spoiled variant).
                 struct Done(Arc<App>, Arc<Session>);
                 impl Drop for Done {
                     fn drop(&mut self) {
-                        let mut r = self.0.voice_rejoining.lock().unwrap();
-                        if r.as_ref().is_some_and(|x| Arc::ptr_eq(x, &self.1)) {
-                            *r = None;
+                        {
+                            let mut r = self.0.voice_rejoining.lock().unwrap();
+                            if r.as_ref().is_some_and(|x| Arc::ptr_eq(x, &self.1)) {
+                                *r = None;
+                            }
+                        }
+                        if std::env::var_os("STREAMER_DEBUG_REJOIN_NO_CLOSE").is_some() {
+                            return;
+                        }
+                        let idle = {
+                            let mut bg = self.0.background.lock().unwrap();
+                            bg.iter().position(|(_, b)| Arc::ptr_eq(b, &self.1) && !b.busy()).map(|i| bg.remove(i))
+                        };
+                        if let Some((_, b)) = idle {
+                            eprintln!("rooms: {} closed after its voice did not come back, place kept", b.room);
+                            b.close_keeping_place();
                         }
                     }
                 }
+                // After a join that should not have happened: the voice is left when this
+                // rejoin still owns it, or when its room is gone (nothing else can reach that
+                // microphone). STREAMER_DEBUG_REJOIN_KEEP_ORPHAN: only when owned (spoiled).
+                let settle = |a: &Arc<App>, s: &Arc<Session>, joined: bool| -> bool {
+                    let (ok, mine) = still(a, s);
+                    if ok {
+                        return false;
+                    }
+                    let orphan = !room_alive(a, s) && std::env::var_os("STREAMER_DEBUG_REJOIN_KEEP_ORPHAN").is_none();
+                    if joined && (mine || orphan) {
+                        eprintln!("voice: rejoined after leaving or into a closed room, left again");
+                        s.leave_voice();
+                        if mine {
+                            *a.voice_built.lock().unwrap() = None;
+                        }
+                    }
+                    true
+                };
                 let _done = Done(a.clone(), s.clone());
                 if !still(&a, &s).0 {
                     eprintln!("voice: rejoin dropped (left, taken over or room closed)");
@@ -543,17 +577,17 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
                 // Tests only: STREAMER_DEBUG_REJOIN_SLOW=<ms>, a microphone slow to open.
                 if let Some(ms) = std::env::var("STREAMER_DEBUG_REJOIN_SLOW").ok().and_then(|v| v.parse().ok()) {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
+                    // Checked again right before joining. STREAMER_DEBUG_REJOIN_NO_LAST_CHECK:
+                    // not (the spoiled variant).
+                    if std::env::var_os("STREAMER_DEBUG_REJOIN_NO_LAST_CHECK").is_none() && !still(&a, &s).0 {
+                        eprintln!("voice: rejoin dropped (left, taken over or room closed)");
+                        return;
+                    }
                 }
                 let mut r = if open_room { join_voice(&a) } else { join_voice_in(&a, s.clone()) };
                 // Joined after the voice was left or the room closed: the microphone it opened
                 // would stay open, out of reach. A newer rejoin owns the voice: leave it be.
-                let (ok, mine) = still(&a, &s);
-                if !ok {
-                    if mine && r.is_ok() {
-                        eprintln!("voice: rejoined after leaving, left again");
-                        s.leave_voice();
-                        *a.voice_built.lock().unwrap() = None;
-                    }
+                if settle(&a, &s, r.is_ok()) {
                     return;
                 }
                 // A change made while this joined found no voice to rejoin and was lost: the
@@ -574,12 +608,7 @@ pub fn set_voice_settings(app: &Arc<App>, new: VoiceSettings) {
                     eprintln!("voice: settings changed while rejoining, again");
                     s.leave_voice();
                     r = join_voice_in(&a, s.clone());
-                    let (ok, mine) = still(&a, &s);
-                    if !ok {
-                        if mine && r.is_ok() {
-                            s.leave_voice();
-                            *a.voice_built.lock().unwrap() = None;
-                        }
+                    if settle(&a, &s, r.is_ok()) {
                         return;
                     }
                 }
@@ -1764,6 +1793,7 @@ mod voice_room_tests {
         super::set_voice_settings(&app, st);
         std::thread::sleep(Duration::from_millis(1500));
         let after = super::voice_session(&app).and_then(|s| s.voice());
+        std::env::remove_var("STREAMER_DEBUG_VOICE_DENOISE_TONE");
         assert!(after.is_some_and(|v| std::sync::Arc::ptr_eq(&v, &before)), "the voice was rebuilt for a strength change");
         super::leave_everything(&app, Duration::from_millis(300));
     }
@@ -1836,6 +1866,65 @@ mod voice_room_tests {
         std::thread::sleep(Duration::from_millis(500));
         assert!(a.voice().is_some(), "the voice of A went away");
         super::leave_everything(&app, Duration::from_millis(300));
+    }
+
+    /// STREAMER_TEST_SERVER and STREAMER_APP_TEST_VOICE: a settings change rejoins slowly in
+    /// room A, the user switches to B, joins voice there (A closes) and leaves it again (with
+    /// voice in B, A's microphone could not open at all): A's rejoin, no longer the owner,
+    /// does not open a microphone in the closed room. Spoiled: STREAMER_DEBUG_REJOIN_NO_LAST_CHECK
+    /// with STREAMER_DEBUG_REJOIN_KEEP_ORPHAN.
+    #[test]
+    fn a_rejoin_into_a_closed_room_does_not_open_the_microphone() {
+        let (Ok(url), Ok(_)) = (std::env::var("STREAMER_TEST_SERVER"), std::env::var("STREAMER_APP_TEST_VOICE")) else { return };
+        let _one = one_voice();
+        media::init();
+        let app = std::sync::Arc::new(super::App::default());
+        super::connect(&app, &url, "vroom-o1", "Tester", None).expect("join A");
+        super::join_voice(&app).expect("voice");
+        let a = super::voice_session(&app).expect("session");
+        let mut st = app.voice_settings.lock().unwrap().clone();
+        st.dsp.auto_gain = !st.dsp.auto_gain;
+        std::env::set_var("STREAMER_DEBUG_REJOIN_SLOW", "800");
+        super::set_voice_settings(&app, st);
+        super::connect(&app, &url, "vroom-o2", "Tester", None).expect("join B");
+        super::join_voice(&app).expect("voice in B");
+        super::leave_voice(&app);
+        std::thread::sleep(Duration::from_millis(1800));
+        std::env::remove_var("STREAMER_DEBUG_REJOIN_SLOW");
+        let orphan = a.voice().is_some();
+        super::leave_everything(&app, Duration::from_millis(300));
+        if orphan {
+            a.leave_voice();
+        }
+        assert!(!orphan, "a microphone was opened in the closed room A");
+    }
+
+    /// STREAMER_TEST_SERVER and STREAMER_APP_TEST_VOICE: a settings change rejoins slowly in
+    /// room A, the user switches to B (A stays in the background for the rejoin) and leaves
+    /// voice: A, idle, is closed then instead of staying online. Spoiled:
+    /// STREAMER_DEBUG_REJOIN_NO_CLOSE.
+    #[test]
+    fn a_room_kept_for_a_dropped_rejoin_closes() {
+        let (Ok(url), Ok(_)) = (std::env::var("STREAMER_TEST_SERVER"), std::env::var("STREAMER_APP_TEST_VOICE")) else { return };
+        let _one = one_voice();
+        media::init();
+        let app = std::sync::Arc::new(super::App::default());
+        super::connect(&app, &url, "vroom-c1", "Tester", None).expect("join A");
+        super::join_voice(&app).expect("voice");
+        let a = super::voice_session(&app).expect("session");
+        let mut st = app.voice_settings.lock().unwrap().clone();
+        st.dsp.auto_gain = !st.dsp.auto_gain;
+        std::env::set_var("STREAMER_DEBUG_REJOIN_SLOW", "800");
+        super::set_voice_settings(&app, st);
+        super::connect(&app, &url, "vroom-c2", "Tester", None).expect("join B");
+        let kept = app.background.lock().unwrap().iter().any(|(_, b)| std::sync::Arc::ptr_eq(b, &a));
+        super::leave_voice(&app);
+        std::thread::sleep(Duration::from_millis(1800));
+        std::env::remove_var("STREAMER_DEBUG_REJOIN_SLOW");
+        let still_there = app.background.lock().unwrap().iter().any(|(_, b)| std::sync::Arc::ptr_eq(b, &a));
+        super::leave_everything(&app, Duration::from_millis(300));
+        assert!(kept, "A was not kept in the background while its voice rejoined");
+        assert!(!still_there, "A stayed online in the background with nothing to do");
     }
 
     /// STREAMER_TEST_SERVER and STREAMER_APP_TEST_VOICE: two settings changes in a row while
