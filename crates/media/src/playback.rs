@@ -19,7 +19,8 @@ pub const ECHO_PROBE: &str = "voice-echo";
 pub const RATE: i32 = 48_000;
 /// Room a mixer leaves for input that comes a little late (ms): with none, a mixer put
 /// silence in place of such pieces, and a stream's sound or a voice broke up on a busy
-/// machine (2026-11-24). Here and in the streamer's system sound mix.
+/// machine (2026-11-24). Only in the shared output: in the streamer's system sound mix it
+/// halved the sound sent (0.2.24).
 pub const MIX_ROOM_MS: u64 = 30;
 pub const CHANNELS: i32 = 2;
 

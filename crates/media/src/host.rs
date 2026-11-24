@@ -222,10 +222,11 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     // Silence keeps the mixer running when no program plays.
     let silence = gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "silence").property("is-live", true).property("samplesperbuffer", 480i32).build().map_err(|e| e.to_string())?;
     let scaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
-    // 30 ms of room for a program's sound that comes a little late (a busy machine): with
-    // none, the mixer replaced such pieces with silence and the stream's sound broke up
-    // (2026-11-24). STREAMER_DEBUG_SYSMIX_LATENCY_MS: another room (0: as before).
-    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(crate::playback::MIX_ROOM_MS) * 1_000_000).build().map_err(|e| e.to_string())?;
+    // No latency of its own: with 30 ms (0.2.24) only every other 10 ms piece reached the
+    // viewers (50 sound packets a second instead of 100: half the sound gone; rate-probe.ps1).
+    // The captures are stamped on arrival (below), so they are not late anyway.
+    // STREAMER_DEBUG_SYSMIX_LATENCY_MS: another (30: the spoiled variant).
+    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1_000_000).build().map_err(|e| e.to_string())?;
     if std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_SILENCE").is_some() {
         bin.add(&mixer).unwrap();
     } else {
