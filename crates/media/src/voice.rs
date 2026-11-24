@@ -693,6 +693,9 @@ impl Voice {
                 let _ = e.set_state(gst::State::Null);
                 let _ = self.pipeline.remove(e);
             }
+            if let Ok(out) = crate::playback::get() {
+                out.forget_level(&mix_pad);
+            }
             self.mixer.release_request_pad(&mix_pad);
         }
         eprintln!("voice: {id} gone");
@@ -884,6 +887,9 @@ fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: P
     pad.link(&chain[0].static_pad("sink").unwrap()).map_err(|e| format!("{e:?}"))?;
     for e in chain.iter().rev() {
         e.sync_state_with_parent().map_err(|e| e.to_string())?;
+    }
+    if let Ok(out) = crate::playback::get() {
+        out.watch_level(&mix_pad, format!("voice {id}"));
     }
     eprintln!("voice: hearing {id}");
     // STREAMER_DEBUG_VOICE_LATENCY: the latency each step of the receive chain reports.

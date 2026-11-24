@@ -304,6 +304,46 @@ fn sample(inner: &Mutex<Inner>) {
             win.set_badge_info(&text, ok);
         }
     }
+    // A video window that shows fewer frames than come (or none: a black window, 2026-11-24):
+    // in the log at most every 60 s per stream while it lasts, and once when it has shown
+    // them all again for 5 s in a row. Per stream: (last line, good seconds in a row, told).
+    {
+        static TOLD: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, u32, bool)>>> = std::sync::Mutex::new(None);
+        let mut told = TOLD.lock().unwrap();
+        let told = told.get_or_insert_with(HashMap::new);
+        told.retain(|k, _| watches.iter().any(|w| w.streamer.to_string() == *k));
+        for w in &watches {
+            let key = w.streamer.to_string();
+            let short = w.received_fps > 20.0 && w.shown_fps < w.received_fps * 0.8;
+            match (told.get_mut(&key), short) {
+                (None, true) => {
+                    told.insert(key, (std::time::Instant::now(), 0, true));
+                }
+                (Some(e), true) => {
+                    e.1 = 0;
+                    // Short again soon after a line: its recovery is still told.
+                    e.2 = true;
+                    if e.0.elapsed() < std::time::Duration::from_secs(60) {
+                        continue;
+                    }
+                    *e = (std::time::Instant::now(), 0, true);
+                }
+                (Some(e), false) => {
+                    e.1 += 1;
+                    if e.1 == 5 && e.2 {
+                        e.2 = false;
+                        eprintln!("video: the window of {} shows {:.0} of {:.0} fps again", w.streamer, w.shown_fps, w.received_fps);
+                    }
+                    continue;
+                }
+                (None, false) => continue,
+            }
+            eprintln!(
+                "video: the window of {} shows {:.0} of {:.0} fps received (fullscreen {}, topmost {}, frame gap max {:.0} ms)",
+                w.streamer, w.shown_fps, w.received_fps, w.fullscreen, w.topmost, w.gap_max_ms
+            );
+        }
+    }
     if std::env::var_os("STREAMER_APP_DEBUG_STATS").is_some() {
         for w in &watches {
             eprintln!(

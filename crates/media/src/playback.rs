@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// The name webrtcdsp finds the echo probe by.
 pub const ECHO_PROBE: &str = "voice-echo";
 pub const RATE: i32 = 48_000;
+/// Room a mixer leaves for input that comes a little late (ms): with none, a mixer put
+/// silence in place of such pieces, and a stream's sound or a voice broke up on a busy
+/// machine (2026-11-24). Here and in the streamer's system sound mix.
+pub const MIX_ROOM_MS: u64 = 30;
 pub const CHANNELS: i32 = 2;
 
 /// The mixer's format: every input converts to it.
@@ -32,6 +36,8 @@ pub fn caps() -> gst::Caps {
 pub struct Playback {
     pipeline: gst::Pipeline,
     mixer: gst::Element,
+    /// What each input brought this minute and what the mixer gave (`watch_level`).
+    levels: Arc<Mutex<Levels>>,
     /// The speakers chosen in the settings, None for the system's default.
     device: Mutex<Option<String>>,
     silent: bool,
@@ -321,10 +327,12 @@ impl Playback {
             .build()
             .map_err(|e| e.to_string())?;
         let mixer = gst::ElementFactory::make("audiomixer").name("pmix").build().map_err(|e| e.to_string())?;
-        // Every input is stamped as it comes in (streams' sound, voices, sounds), so the mixer
-        // needs no room for late ones: what it would add is a stream's sound coming later than
-        // with its own sink. (5 ms pieces instead of 10 stopped the echo canceller's output.)
-        mixer.set_property("latency", 0u64);
+        // Every input is stamped as it comes in (streams' sound, voices, sounds), so only a
+        // busy machine makes one late: `MIX_ROOM_MS` for that (none before 0.2.24, when a
+        // voice could break up). Everything here plays that much later. (5 ms pieces instead
+        // of 10 stopped the echo canceller's output.) STREAMER_DEBUG_PMIX_LATENCY_MS: another.
+        let room = std::env::var("STREAMER_DEBUG_PMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(MIX_ROOM_MS);
+        mixer.set_property("latency", room * 1_000_000);
         // The tee: what goes to the speakers, for `tap` (tests: a simulated room).
         let tee = gst::ElementFactory::make("tee").name("ptee").property("allow-not-linked", true).build().unwrap();
         // As in the voice mixer: a queue lets the silence be late, so inputs with more latency
@@ -343,7 +351,19 @@ impl Playback {
         crate::drain_bus(&pipeline, "playback");
         pipeline.set_state(gst::State::Playing).map_err(|e| format!("cannot start the speakers: {e}"))?;
         eprintln!("playback: started{}", if silent { " (silent)" } else { "" });
-        Ok(Arc::new(Self { pipeline, mixer, device: Mutex::new(device), silent }))
+        let levels: Arc<Mutex<Levels>> = Arc::default();
+        let l = levels.clone();
+        mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(m) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                let (sum, n) = sum_squares_s16(m.as_slice());
+                let mut l = l.lock().unwrap();
+                l.out.0 += sum;
+                l.out.1 += n;
+            }
+            gst::PadProbeReturn::Ok
+        });
+        log_levels(mixer.downgrade(), levels.clone());
+        Ok(Arc::new(Self { pipeline, mixer, levels, device: Mutex::new(device), silent }))
     }
 
     /// The pipeline, for the voice chat that lives in it.
@@ -370,6 +390,28 @@ impl Playback {
         &self.mixer
     }
 
+    /// Counts the level of what comes into the mixer through `pad` (one of its inputs), for
+    /// the log once a minute, under `label`. `forget_level` when the pad goes.
+    pub fn watch_level(&self, pad: &gst::Pad, label: String) {
+        let (l, key) = (self.levels.clone(), pad.name().to_string());
+        l.lock().unwrap().inputs.insert(key.clone(), (label, 0.0, 0));
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(m) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                let (sum, n) = sum_squares_s16(m.as_slice());
+                if let Some(e) = l.lock().unwrap().inputs.get_mut(&key) {
+                    e.1 += sum;
+                    e.2 += n;
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    /// The input on `pad` left: no longer in the log.
+    pub fn forget_level(&self, pad: &gst::Pad) {
+        self.levels.lock().unwrap().inputs.remove(pad.name().as_str());
+    }
+
     /// A new input, stamped on arrival. It goes away when the returned handle is dropped.
     pub fn input(self: &Arc<Self>, label: &str) -> Result<Input, String> {
         let src = gst::ElementFactory::make("appsrc").build().map_err(|e| e.to_string())?.downcast::<AppSrc>().unwrap();
@@ -389,6 +431,7 @@ impl Playback {
         let pad = self.mixer.request_pad_simple("sink_%u").ok_or("no mixer pad")?;
         src.static_pad("src").unwrap().link(&pad).map_err(|e| format!("{e:?}"))?;
         src.sync_state_with_parent().map_err(|e| e.to_string())?;
+        self.watch_level(&pad, label.to_string());
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         eprintln!("playback: input {n} ({label})");
@@ -529,6 +572,7 @@ impl Drop for Input {
             let _ = peer.unlink(&self.pad);
         }
         let _ = self.out.pipeline.remove(&self.src);
+        self.out.forget_level(&self.pad);
         self.out.mixer.release_request_pad(&self.pad);
     }
 }
@@ -549,4 +593,98 @@ pub fn tail(label: &str) -> Result<(Vec<gst::Element>, Arc<Input>), String> {
     sink.set_property("async", false);
     sink.set_callbacks(input.sink_callbacks());
     Ok((vec![mk("audioconvert")?, mk("audioresample")?, filter, sink.upcast()], input))
+}
+
+/// The shared output's levels over a minute: each input's (label, sum of squares, samples),
+/// keyed by its mixer pad, and the mixer's output.
+#[derive(Default)]
+struct Levels {
+    inputs: std::collections::HashMap<String, (String, f64, u64)>,
+    out: (f64, u64),
+}
+
+fn sum_squares_s16(bytes: &[u8]) -> (f64, u64) {
+    let (mut sum, mut n) = (0f64, 0u64);
+    for c in bytes.chunks_exact(2) {
+        let v = i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0;
+        sum += v * v;
+        n += 1;
+    }
+    (sum, n)
+}
+
+/// What the log says about a minute, or None when no input was heard (> -70 dB): each
+/// input's level and the output's, and a mark when the output is 10 dB quieter than its
+/// loudest input (the mixer dropped sound, as when a voice broke up 2026-11-24). Every level
+/// is over the output's time (same format): a voice silent most of the minute sends nothing
+/// then, and is not louder for it. The counts start over. STREAMER_DEBUG_PMIX_NO_MARK: never
+/// marked (the spoiled variant).
+fn levels_line(l: &mut Levels) -> Option<String> {
+    let db = |sum: f64, n: u64| if n > 0 && sum > 0.0 { 10.0 * (sum / n as f64).log10() } else { -150.0 };
+    let span = l.out.1;
+    let mut rows: Vec<(String, f64)> = l.inputs.values_mut().filter(|e| e.2 > 0).map(|e| (e.0.clone(), db(std::mem::take(&mut e.1), std::mem::take(&mut e.2).max(span)))).collect();
+    let out = db(l.out.0, l.out.1);
+    l.out = (0.0, 0);
+    let loudest = rows.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+    if loudest < -70.0 {
+        return None;
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let list = rows.iter().map(|(n, d)| format!("{n} {d:.0}")).collect::<Vec<_>>().join(", ");
+    let marked = out < loudest - 10.0 && std::env::var_os("STREAMER_DEBUG_PMIX_NO_MARK").is_none();
+    let cut = if marked { " (quieter than an input: the mixer dropped sound)" } else { "" };
+    Some(format!("playback: sound over the last minute, dB: out {out:.0}{cut}; {list}"))
+}
+
+/// Once a minute while the mixer lives: `levels_line`, when there is one.
+fn log_levels(mixer: gst::glib::WeakRef<gst::Element>, levels: Arc<Mutex<Levels>>) {
+    let _ = std::thread::Builder::new().name("playback-levels".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if mixer.upgrade().is_none() {
+            return;
+        }
+        let line = levels_line(&mut levels.lock().unwrap());
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    fn feed(l: &mut Levels, key: &str, label: &str, db: f64) {
+        let e = l.inputs.entry(key.into()).or_insert((label.into(), 0.0, 0));
+        e.1 += 10f64.powf(db / 10.0) * 1000.0;
+        e.2 += 1000;
+    }
+
+    /// The minute's line: nothing when no input was heard; the mark only when the output is
+    /// 10 dB quieter than its loudest input; the counts start over after each line.
+    /// Spoiled: STREAMER_DEBUG_PMIX_NO_MARK.
+    #[test]
+    fn the_level_line_marks_a_mixer_that_drops_sound() {
+        let mut l = Levels::default();
+        feed(&mut l, "sink_1", "voice 22", -90.0);
+        l.out = (10f64.powf(-9.0) * 1000.0, 1000);
+        assert_eq!(levels_line(&mut l), None, "nobody was heard");
+        feed(&mut l, "sink_1", "voice 22", -30.0);
+        feed(&mut l, "sink_2", "stream", -50.0);
+        l.out = (10f64.powf(-3.0) * 1000.0, 1000);
+        let line = levels_line(&mut l).unwrap();
+        assert!(line.contains("out -30;") && line.contains("stream -50, voice 22 -30") && !line.contains("dropped"), "{line}");
+        feed(&mut l, "sink_1", "voice 22", -30.0);
+        l.out = (10f64.powf(-4.5) * 1000.0, 1000);
+        let line = levels_line(&mut l).unwrap();
+        assert!(line.contains("dropped sound"), "cut by 15 dB: {line}");
+        assert_eq!(levels_line(&mut l), None, "the next minute starts from nothing");
+        // A voice heard a tenth of the minute at -30 dB in a -40 dB output: not a drop.
+        let e = l.inputs.entry("sink_1".into()).or_insert(("voice 22".into(), 0.0, 0));
+        e.1 += 10f64.powf(-3.0) * 100.0;
+        e.2 += 100;
+        l.out = (10f64.powf(-4.0) * 1000.0, 1000);
+        let line = levels_line(&mut l).unwrap();
+        assert!(!line.contains("dropped"), "a voice that spoke a little: {line}");
+    }
 }

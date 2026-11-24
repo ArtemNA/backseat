@@ -222,7 +222,10 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     // Silence keeps the mixer running when no program plays.
     let silence = gst::ElementFactory::make("audiotestsrc").property_from_str("wave", "silence").property("is-live", true).property("samplesperbuffer", 480i32).build().map_err(|e| e.to_string())?;
     let scaps = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
-    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1_000_000).build().map_err(|e| e.to_string())?;
+    // 30 ms of room for a program's sound that comes a little late (a busy machine): with
+    // none, the mixer replaced such pieces with silence and the stream's sound broke up
+    // (2026-11-24). STREAMER_DEBUG_SYSMIX_LATENCY_MS: another room (0: as before).
+    let mixer = gst::ElementFactory::make("audiomixer").name("sysmix").property("latency", std::env::var("STREAMER_DEBUG_SYSMIX_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(crate::playback::MIX_ROOM_MS) * 1_000_000).build().map_err(|e| e.to_string())?;
     if std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_SILENCE").is_some() {
         bin.add(&mixer).unwrap();
     } else {
@@ -311,6 +314,16 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     let late_by = gst::ClockTime::from_mseconds(std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_LATE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
     // STREAMER_DEBUG_SYSMIX_FAKE_LATE_JITTER_MS: plus 0..that much, different for each buffer.
     let late_jitter: u64 = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_LATE_JITTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // STREAMER_DEBUG_SYSMIX_FAKE_LATE_GROW_MS: plus that much more for every second since
+    // SECS (timestamps that drift away from the clock, as a real capture's did 2026-11-24).
+    let late_grow: f64 = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_LATE_GROW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    // Test only: STREAMER_DEBUG_SYSMIX_FAKE_CUT="PID SECS": from SECS s on, that fake program's
+    // first capture reaches the mixer with 19 of 20 pieces silenced (its capture's level stays):
+    // a mix much quieter than what it mixes, as the mixer made it 2026-11-24.
+    let cut = pid_secs("STREAMER_DEBUG_SYSMIX_FAKE_CUT");
+    let cut_used = Arc::new(AtomicBool::new(false));
+    let pause_used = Arc::new(AtomicBool::new(false));
+    let restamp = std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_RESTAMP").is_none();
     // Test only: STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED="PID": that fake program is a real capture
     // (of this process's own sound: none), which can give the pipeline its clock.
     let clocked: Option<u32> = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED").ok().and_then(|v| v.trim().parse().ok());
@@ -388,7 +401,10 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                     seed ^= seed << 5;
                     seed_cell.store(seed, Ordering::Relaxed);
                     let jitter = if late_jitter > 0 { gst::ClockTime::from_mseconds(seed as u64 % (late_jitter + 1)) } else { gst::ClockTime::ZERO };
-                    if t0.elapsed().as_secs_f64() >= secs {
+                    let since = t0.elapsed().as_secs_f64() - secs;
+                    let grow = gst::ClockTime::from_nseconds((late_grow * since.max(0.0) * 1e6) as u64);
+                    if since >= 0.0 {
+                        let jitter = jitter + grow;
                         if let Some(b) = info.buffer_mut() {
                             let b = b.make_mut();
                             if let Some(p) = b.pts() {
@@ -399,6 +415,53 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                     gst::PadProbeReturn::Ok
                 });
             }
+        }
+        // Test only: STREAMER_DEBUG_SYSMIX_FAKE_PAUSE="PID SECS": that fake program's first
+        // capture sends nothing for 500 ms from SECS s on (a capture that paused or stalled).
+        if let Some((pid, secs)) = pid_secs("STREAMER_DEBUG_SYSMIX_FAKE_PAUSE").filter(|(p, _)| is_fake && *p == app.pid) {
+            if !pause_used.swap(true, Ordering::SeqCst) {
+                let t0 = std::time::Instant::now();
+                eprintln!("host: test: the capture of fake{pid}.exe pauses in {secs} s");
+                cf.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    let t = t0.elapsed().as_secs_f64();
+                    if t >= secs && t < secs + 0.5 {
+                        gst::PadProbeReturn::Drop
+                    } else {
+                        gst::PadProbeReturn::Ok
+                    }
+                });
+            }
+        }
+        // Each piece of a program's sound is stamped with the stream's clock as it comes, as
+        // the voices are in the shared output: the capture's own timestamps drifted away from
+        // that clock over a stream, until the mixer took more and more of the sound for late
+        // and put silence in its place (2026-11-24: 85-99% of it, only a new capture helped).
+        // The mixer evens out the small unevenness of arrival (its pads' alignment threshold).
+        // STREAMER_DEBUG_SYSMIX_NO_RESTAMP: the capture's own timestamps (the spoiled variant).
+        // A pause in the capture needs no discontinuity flag: the mixer took the sound after
+        // a 500 ms pause in its place at once with or without one (STREAMER_DEBUG_SYSMIX_FAKE_PAUSE,
+        // 2026-11-24).
+        // The clock and base time are the whole pipeline's, and only while it plays (a viewer
+        // leaving pauses it, and the base time changes when the next one comes).
+        if restamp {
+            let cfw = cf.downgrade();
+            cf.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(el) = cfw.upgrade() else { return gst::PadProbeReturn::Ok };
+                let mut top: gst::Element = el;
+                while let Some(p) = top.parent().and_then(|p| p.downcast::<gst::Element>().ok()) {
+                    top = p;
+                }
+                if top.current_state() != gst::State::Playing {
+                    return gst::PadProbeReturn::Ok;
+                }
+                let (Some(clock), Some(base)) = (top.clock(), top.base_time()) else { return gst::PadProbeReturn::Ok };
+                if let (Some(now), Some(b)) = (clock.time().checked_sub(base), info.buffer_mut()) {
+                    let b = b.make_mut();
+                    b.set_pts(now);
+                    b.set_dts(gst::ClockTime::NONE);
+                }
+                gst::PadProbeReturn::Ok
+            });
         }
         // The capture's level (F32 after the caps filter), for the watch below; its entry is
         // made once the branch is in the mix.
@@ -444,6 +507,22 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             if let Err(e) = branch.static_pad("src").unwrap().link(&pad) {
                 mixer.release_request_pad(&pad);
                 return Err(e.to_string());
+            }
+            if let Some((pid, secs)) = cut.filter(|(p, _)| is_fake && *p == app.pid) {
+                if !cut_used.swap(true, Ordering::SeqCst) {
+                    let (t0, k) = (std::time::Instant::now(), std::sync::atomic::AtomicU64::new(0));
+                    eprintln!("host: test: the mixer gets fake{pid}.exe cut in {secs} s");
+                    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                        if t0.elapsed().as_secs_f64() >= secs && k.fetch_add(1, Ordering::Relaxed) % 20 != 0 {
+                            if let Some(b) = info.buffer_mut() {
+                                if let Ok(mut m) = b.make_mut().map_writable() {
+                                    m.as_mut_slice().fill(0);
+                                }
+                            }
+                        }
+                        gst::PadProbeReturn::Ok
+                    });
+                }
             }
             if std::env::var_os("STREAMER_DEBUG_SYSMIX_LEVEL").is_some() {
                 let (exe, n) = (app.exe.clone(), std::sync::atomic::AtomicU64::new(0));
@@ -515,6 +594,8 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             let parents = if is_fake { HashMap::new() } else { crate::audio_apps::parents() };
             // A program that plays while its capture gives silence: that capture starts anew.
             let mut again: Vec<&crate::audio_apps::AudioApp> = Vec::new();
+            // Each capture's level over the same time as the mix's (the samples the mixer gave,
+            // same format): a capture that sent sound only in bursts is not louder for it.
             let mut loudest = f64::NEG_INFINITY;
             for a in &now {
                 let peak = if is_fake { a.peak } else { crate::audio_apps::tree_peak(&all, &parents, a.pid) };
@@ -524,19 +605,19 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
                 if watch.born_while(a.pid, CaptureWatch::GRACE) {
                     continue;
                 }
-                loudest = loudest.max(db);
+                loudest = loudest.max(level_db(sum, n.max(mix.1)));
                 if live && watch.restart_due(a.pid, peak, db) {
                     eprintln!("host: system sound starts the capture of {} again: it plays (meter {:.0} dB) but the capture gave {db:.0} dB", a.exe, 20.0 * (peak as f64).max(1e-9).log10());
                     again.push(a);
                 }
             }
-            // Programs heard while the mix is silent: the mixer drops their sound (its timing
-            // went wrong); every capture starts anew, with fresh timestamps.
-            // No buffers out of the mixer at all counts as silent too.
+            // Programs heard while the mix is silent, or much quieter than they are: the mixer
+            // drops their sound, whole or in pieces (its timing went wrong); every capture
+            // starts anew, with fresh timestamps. No buffers out of the mixer counts as silent.
             let mix_db = level_db(mix.0, mix.1);
             watch.mix_add(mix.0, mix.1);
             if live && watch.mix_silent_due(loudest, mix_db) {
-                eprintln!("host: system sound: the mix gave {mix_db:.0} dB while a program's capture gave {loudest:.0} dB; every capture starts again");
+                eprintln!("host: system sound: the mix gave {mix_db:.0} dB while a program's capture gave {loudest:.0} dB (the mixer drops its sound); every capture starts again");
                 again = now.iter().filter(|a| !watch.is_abandoned(a.pid) && watch.may_add(a.pid)).collect();
             }
             for a in again {
@@ -667,6 +748,8 @@ struct CaptureWatch {
     /// mix was last heard, and the last one.
     mix_silent: u32,
     mix_restarts: (u32, Option<std::time::Instant>),
+    /// Looks in a row the mix was fine (the backoff starts over only after `GOOD_LOOKS`).
+    mix_good: u32,
     /// This minute's sums: each capture's (sum of squares, samples, loudest meter), the mix's.
     minute: HashMap<u32, (f64, u64, f32)>,
     mix_minute: (f64, u64),
@@ -685,8 +768,15 @@ impl CaptureWatch {
     const PLAYS: f32 = 0.003;
     /// Quieter than this, a capture or the mix is silent.
     const SILENT_DB: f64 = -80.0;
-    /// Louder than this, a capture is heard (for the mix check).
-    const HEARD_DB: f64 = -60.0;
+    /// Louder than this, a capture is heard (for the mix check). -70, not -60: a quiet
+    /// browser tab (-66 dB) had its sound cut to -83 dB in the mix (2026-11-24).
+    const HEARD_DB: f64 = -70.0;
+    /// The mix this much quieter than its loudest input: the mixer drops sound (a mix is
+    /// never quieter than one of its inputs, short of sounds that cancel out).
+    const CUT_DB: f64 = 10.0;
+    /// Looks in a row the mix must be fine before restarts count from the start again: 30 s
+    /// (a mix cut now and then would otherwise restart every capture every few seconds).
+    const GOOD_LOOKS: u32 = 15;
     /// Looks in a row before a restart: 4 s.
     const LOOKS: u32 = 2;
     /// A capture just started is left alone this long (its first sound may take a while).
@@ -755,6 +845,7 @@ impl CaptureWatch {
         self.restarts.clear();
         self.mix_silent = 0;
         self.mix_restarts = (0, None);
+        self.mix_good = 0;
         self.paused = true;
     }
 
@@ -784,16 +875,27 @@ impl CaptureWatch {
         true
     }
 
+    /// The mix silent, or `CUT_DB` quieter than its loudest input, while that input is heard:
+    /// two looks in a row (with the backoff after restarts that did not help).
+    /// STREAMER_DEBUG_SYSMIX_WATCH_SILENT_ONLY: only a silent mix counts (as in 0.2.23).
     fn mix_silent_due(&mut self, loudest_input_db: f64, mix_db: f64) -> bool {
-        if mix_db >= Self::SILENT_DB {
-            self.mix_silent = 0;
-            self.mix_restarts = (0, None);
-            return false;
-        }
+        let silent_only = std::env::var_os("STREAMER_DEBUG_SYSMIX_WATCH_SILENT_ONLY").is_some();
+        // Nothing heard: nothing to judge (a pause in a program's sound neither helps nor
+        // hurts the backoff).
         if loudest_input_db < Self::HEARD_DB {
             self.mix_silent = 0;
             return false;
         }
+        let cut = mix_db < Self::SILENT_DB || (!silent_only && mix_db < loudest_input_db - Self::CUT_DB);
+        if !cut {
+            self.mix_silent = 0;
+            self.mix_good += 1;
+            if self.mix_good >= Self::GOOD_LOOKS {
+                self.mix_restarts = (0, None);
+            }
+            return false;
+        }
+        self.mix_good = 0;
         self.mix_silent += 1;
         let (n, at) = self.mix_restarts;
         if self.mix_silent < Self::LOOKS || std::env::var_os("STREAMER_DEBUG_SYSMIX_NO_WATCH").is_some() || !Self::due(at.map(|t| (n, t))) {
@@ -2096,6 +2198,38 @@ mod source_tests {
 
     fn cfg(source: Source) -> HostConfig {
         HostConfig { mode: VideoMode::parse("1080p60").unwrap(), kbit: 8000, codec: Codec::H264, keyframe_secs: 2, audio: false, audio_pid: None, audio_exclude: vec![], source, ice: IceConfig::default() }
+    }
+
+    /// The watch restarts the captures when the mix is silent or much quieter than a capture
+    /// that is heard (two looks in a row), not when the mix is as loud, nor for a capture
+    /// that is barely heard. Spoiled: STREAMER_DEBUG_SYSMIX_WATCH_SILENT_ONLY.
+    #[cfg(windows)]
+    #[test]
+    fn a_mix_much_quieter_than_a_capture_restarts_them() {
+        let looks = |input: f64, mix: f64| {
+            let mut w = CaptureWatch::default();
+            (w.mix_silent_due(input, mix), w.mix_silent_due(input, mix))
+        };
+        assert_eq!(looks(-66.0, -83.0), (false, true), "a quiet tab cut by 17 dB (2026-11-24)");
+        assert_eq!(looks(-50.0, -70.0), (false, true), "cut by 20 dB, the mix not silent");
+        assert_eq!(looks(-44.0, -60.0), (false, true), "cut by 16 dB");
+        assert_eq!(looks(-40.0, -100.0), (false, true), "a silent mix");
+        assert_eq!(looks(-44.0, -44.0), (false, false), "a mix as loud as its input");
+        assert_eq!(looks(-44.0, -50.0), (false, false), "6 dB: the edges of a look");
+        assert_eq!(looks(-75.0, -100.0), (false, false), "an input barely heard");
+        // After a restart, a mix fine for a moment does not let the next restart come at once.
+        let mut w = CaptureWatch::default();
+        assert!(!w.mix_silent_due(-40.0, -60.0) && w.mix_silent_due(-40.0, -60.0));
+        assert!(!w.mix_silent_due(-40.0, -40.0));
+        assert!(!w.mix_silent_due(-40.0, -60.0) && !w.mix_silent_due(-40.0, -60.0), "the backoff held");
+        // A pause in the program's sound (nothing heard, mix silent) does not count against
+        // the good looks: 14 good, a pause, 1 good clear the backoff.
+        for _ in 0..14 {
+            assert!(!w.mix_silent_due(-40.0, -40.0));
+        }
+        assert!(!w.mix_silent_due(-150.0, -150.0));
+        assert!(!w.mix_silent_due(-40.0, -40.0));
+        assert!(!w.mix_silent_due(-40.0, -60.0) && w.mix_silent_due(-40.0, -60.0), "the backoff cleared");
     }
 
     /// A running stream changes its window or monitor by building the new capture as a bin
