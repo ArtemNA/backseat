@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.23
+
+- **Diagnostics for crackling sound.** Some users hear a stream's sound or a voice start to crackle after a pause, until they join again. This version changes nothing in the sound; it writes to the log where the sound's timing breaks (each program's capture, the mix and the encoder on the streamer's side; the received stream and voices, and the speakers, on the listener's side) and what the jitter buffers do. If you hear it, send your newest log from `%LOCALAPPDATA%\Backseat\logs` (and ask the streamer for theirs) soon: the app keeps only the last 5.
+
 ## 0.2.22
 
 - **New noise suppression: DeepFilterNet3**, a neural network that keeps the voice natural and removes noise, hums and whines much better than RNNoise did. It replaces RNNoise and is the default; a saved RNNoise choice switches to it, and a chosen WebRTC level (Low…Very high) stays until you pick *Neural*. Your voice reaches others 20 ms later than with RNNoise (streams are not affected); it takes about 4% of one CPU core on a recent processor.
