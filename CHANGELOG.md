@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.24
+
+- **A stream's sound no longer breaks up after a while.** With "all sound" shared, the sound of a program could drift in time until the streamer's mixer threw most of it away: viewers heard it chopped, quieter, or almost gone, and only joining again helped. Each program's sound now follows the stream's own clock, so it cannot drift. If the mix still comes out much quieter than what it mixes, Backseat starts the captures again by itself.
+- **Voices and other sounds have 30 ms of room** before the mixer gives up on a late piece, so a busy computer no longer makes a voice crackle. Voices play 30 ms later; you will not hear the difference.
+- The log now shows, once a minute, how loud each voice and the stream came in and what went out to the speakers, and when a video window shows fewer frames than arrive.
+
 ## 0.2.23
 
 - **Diagnostics for crackling sound.** Some users hear a stream's sound or a voice start to crackle after a pause, until they join again. This version changes nothing in the sound; it writes to the log where the sound's timing breaks (each program's capture, the mix and the encoder on the streamer's side; the received stream and voices, and the speakers, on the listener's side) and what the jitter buffers do. If you hear it, send your newest log from `%LOCALAPPDATA%\Backseat\logs` (and ask the streamer for theirs) soon: the app keeps only the last 5.
