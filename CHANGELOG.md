@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.25
+
+- **Fixed: in 0.2.24 viewers got only half of a stream's sound** (it sounded broken from the start) when the streamer shared all sound. The streamer's mixer is back to sending every piece; the fix of 0.2.24 (sound that no longer drifts and breaks up after a while) stays.
+
 ## 0.2.24
 
 - **A stream's sound no longer breaks up after a while.** With "all sound" shared, the sound of a program could drift in time until the streamer's mixer threw most of it away: viewers heard it chopped, quieter, or almost gone, and only joining again helped. Each program's sound now follows the stream's own clock, so it cannot drift. If the mix still comes out much quieter than what it mixes, Backseat starts the captures again by itself.
