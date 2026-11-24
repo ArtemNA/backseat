@@ -174,14 +174,26 @@ pub fn gst_warnings() {
 
 static HIDDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// At most 10 lines a minute of one warning (its category and first 40 characters); the
-/// rest are counted and the count is told with the first line of the next minute.
+/// At most 10 lines a minute of one warning (its category and first 40 characters with the
+/// numbers left out: a drift or skew value changes every time); the rest are counted and the
+/// count is told with the first line of the next minute. STREAMER_DEBUG_LIMIT_BY_TEXT: the
+/// whole text as it is, numbers too (the spoiled variant: nothing was limited).
 fn limited(category: &str, text: &str) -> bool {
     use std::collections::HashMap;
     static SEEN: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, u32, u64)>>> = std::sync::Mutex::new(None);
-    let key = format!("{category} {}", text.chars().take(40).collect::<String>());
+    let words: String = if std::env::var_os("STREAMER_DEBUG_LIMIT_BY_TEXT").is_some() {
+        text.to_string()
+    } else {
+        text.chars().filter(|c| !c.is_ascii_digit() && !"+-:.".contains(*c)).take(40).collect()
+    };
+    let key = format!("{category} {words}");
     let mut g = SEEN.lock().unwrap();
-    let e = g.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((std::time::Instant::now(), 0, 0));
+    let map = g.get_or_insert_with(HashMap::new);
+    // Many different warnings over a long run: those quiet for a minute go.
+    if map.len() > 256 {
+        map.retain(|_, v| v.0.elapsed() < std::time::Duration::from_secs(60));
+    }
+    let e = map.entry(key.clone()).or_insert((std::time::Instant::now(), 0, 0));
     if e.0.elapsed() >= std::time::Duration::from_secs(60) {
         if e.2 > 0 {
             eprintln!("gst: {} more of \"{key}\" in the last minute, not shown", e.2);
@@ -259,6 +271,11 @@ mod tests {
         }
         assert!(limited("testcat", "the same warning"));
         assert!(!limited("testcat", "another warning"));
+        // A changing number is the same warning. Spoiled: STREAMER_DEBUG_LIMIT_BY_TEXT.
+        for i in 0..10 {
+            assert!(!limited("skewcat", &format!("correct clock skew +0:00:00.0{i}0 > 0:00:00.020")));
+        }
+        assert!(limited("skewcat", "correct clock skew +0:00:00.093 > 0:00:00.020"), "a new number escaped the limit");
     }
 
     #[test]

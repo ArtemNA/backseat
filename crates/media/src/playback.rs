@@ -185,7 +185,7 @@ fn switch_sink(old: &gst::Element, id: &Option<String>) {
         }
     }
     new.set_property("device", id.clone());
-    crate::diag::watch_ts(&new.static_pad("sink").unwrap(), "stream sound to its speakers".into());
+    crate::diag::watch_ts(&new.static_pad("sink").unwrap(), "stream sound to its speakers (after a change of speakers)".into());
     if parent.add(&new).is_err() {
         return;
     }

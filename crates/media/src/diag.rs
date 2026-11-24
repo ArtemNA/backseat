@@ -42,7 +42,8 @@ impl TsStats {
             self.disconts += 1;
         }
         let pts = pts?;
-        let blind = std::env::var_os("STREAMER_DEBUG_DIAG_BLIND").is_some();
+        static BLIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let blind = *BLIND.get_or_init(|| std::env::var_os("STREAMER_DEBUG_DIAG_BLIND").is_some());
         let mut out = None;
         if let (Some(exp), false) = (self.expected, blind) {
             let d = pts as i64 - exp as i64;
