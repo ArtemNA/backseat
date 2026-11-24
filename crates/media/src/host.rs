@@ -239,6 +239,7 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
         mixer.link(&outcaps).map_err(|e| e.to_string())?;
         outcaps.clone()
     };
+    crate::diag::watch_ts(&mixer.static_pad("src").unwrap(), "system sound mix".into());
     bin.add_pad(&gst::GhostPad::with_target(&out.static_pad("src").unwrap()).unwrap()).unwrap();
     // Tests: STREAMER_DEBUG_SYSMIX_LEVEL logs the mix's level once a second (packets alone
     // flow with silence too: 0.2.13 passed that check and sent silence).
@@ -264,6 +265,19 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             }
             gst::PadProbeReturn::Ok
         });
+    }
+    // Tests: STREAMER_DEBUG_SYSMIX_DUMP=<file> writes the mix (F32 stereo 48 kHz, raw).
+    if let Some(path) = std::env::var_os("STREAMER_DEBUG_SYSMIX_DUMP") {
+        if let Ok(f) = std::fs::File::create(path) {
+            let f = Mutex::new(std::io::BufWriter::new(f));
+            mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(map) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                    use std::io::Write;
+                    let _ = f.lock().unwrap().write_all(map.as_slice());
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
     }
     let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
     // Test only: STREAMER_DEBUG_SYSMIX_FAKE="A_FROM A_TO;B_FROM B_TO" (seconds since start)
@@ -292,6 +306,11 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
     // stamps its sound 1 s in the past from SECS s on, so the mixer drops it as late (the mix
     // goes silent while the capture is heard).
     let late = pid_secs("STREAMER_DEBUG_SYSMIX_FAKE_LATE");
+    // STREAMER_DEBUG_SYSMIX_FAKE_LATE_MS: by that much instead of 1 s (a little late: the
+    // mixer cuts the start of every buffer instead of dropping it whole).
+    let late_by = gst::ClockTime::from_mseconds(std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_LATE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
+    // STREAMER_DEBUG_SYSMIX_FAKE_LATE_JITTER_MS: plus 0..that much, different for each buffer.
+    let late_jitter: u64 = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_LATE_JITTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     // Test only: STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED="PID": that fake program is a real capture
     // (of this process's own sound: none), which can give the pipeline its clock.
     let clocked: Option<u32> = std::env::var("STREAMER_DEBUG_SYSMIX_FAKE_CLOCKED").ok().and_then(|v| v.trim().parse().ok());
@@ -336,6 +355,7 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
         let conv = mk("audioconvert")?;
         let res = mk("audioresample")?;
         let cf = gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap();
+        crate::diag::watch_ts(&cf.static_pad("src").unwrap(), format!("capture of {}", app.exe));
         let branch = gst::Bin::with_name(&format!("app{}", app.pid));
         branch.add_many([&src, &conv, &res, &cf]).unwrap();
         gst::Element::link_many([&src, &conv, &res, &cf]).map_err(|e| e.to_string())?;
@@ -360,12 +380,19 @@ fn system_sound(exclude: &[String]) -> Result<gst::Element, String> {
             if !late_used.swap(true, Ordering::SeqCst) {
                 let t0 = std::time::Instant::now();
                 eprintln!("host: test: the capture of fake{pid}.exe is stamped late in {secs} s");
+                let seed_cell = std::sync::atomic::AtomicU32::new(0x9e37_79b9);
                 cf.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                    let mut seed = seed_cell.load(Ordering::Relaxed);
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed_cell.store(seed, Ordering::Relaxed);
+                    let jitter = if late_jitter > 0 { gst::ClockTime::from_mseconds(seed as u64 % (late_jitter + 1)) } else { gst::ClockTime::ZERO };
                     if t0.elapsed().as_secs_f64() >= secs {
                         if let Some(b) = info.buffer_mut() {
                             let b = b.make_mut();
                             if let Some(p) = b.pts() {
-                                b.set_pts(p.saturating_sub(gst::ClockTime::from_seconds(1)));
+                                b.set_pts(p.saturating_sub(late_by + jitter));
                             }
                         }
                     }
@@ -903,6 +930,8 @@ impl Host {
                 .property("allow-not-linked", true)
                 .build()
                 .unwrap();
+            crate::diag::watch_ts(&opus.static_pad("sink").unwrap(), "sound to the encoder".into());
+            crate::diag::watch_queue_drops(&queue, "sound before the encoder".into());
             let chain = [audio_source(&cfg)?, mk("audioconvert")?, mk("audioresample")?, filter, queue, opus, tee];
             pipeline.add_many(&chain).unwrap();
             gst::Element::link_many(&chain).map_err(|e| format!("audio link: {e}"))?;

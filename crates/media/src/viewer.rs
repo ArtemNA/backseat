@@ -178,6 +178,7 @@ impl Viewer {
             })
         };
         tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone(), (lag.clone(), ask));
+        crate::diag::watch_jitterbuffers(&webrtc, "stream".into());
 
         // The video in a process of its own (decoder and window): a fault in the GPU driver
         // ends only that process. STREAMER_VIDEO_IN_PROCESS: here, as before.
@@ -910,6 +911,8 @@ fn add_audio(
     // nothing, to check what the host captured without recording it.
     let debug_level = std::env::var_os("STREAMER_DEBUG_AUDIO_LEVEL").is_some();
     let sink = if debug_level { make("fakesink")? } else { sink };
+    crate::diag::watch_ts(&decoder.static_pad("src").unwrap(), "stream sound decoded".into());
+    crate::diag::watch_ts(&sink.static_pad("sink").unwrap(), "stream sound to its speakers".into());
     if debug_level {
         let acc = std::sync::Mutex::new((0f64, 0u64, Instant::now()));
         decoder.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {

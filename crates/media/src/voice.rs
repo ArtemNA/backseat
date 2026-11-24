@@ -563,6 +563,7 @@ impl Voice {
         // The jitter buffers kept rtpbin's own 200 ms whatever webrtcbin was told, and in the
         // shared output that latency is everyone's: a watched stream's sound came 170 ms later
         // while anyone was in voice (output latency 210 ms against 40). Set on each one.
+        crate::diag::watch_jitterbuffers(&webrtc, format!("voice {id}"));
         if let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) {
             let ms = self.cfg.latency_ms;
             rtpbin.connect("new-jitterbuffer", false, move |v| {
@@ -837,6 +838,7 @@ impl Drop for Voice {
 fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: PeerId, level: &Arc<Level>, volume: f64, deaf: bool) -> Result<(Vec<gst::Element>, gst::Pad), String> {
     let dec = make("opusdec")?;
     dec.set_property("plc", true);
+    crate::diag::watch_ts(&dec.static_pad("src").unwrap(), format!("voice {id} decoded"));
     // No in-band FEC: to use it the decoder waits for the next packet and reports 120 ms for
     // that (measured: 60 ms after the jitter buffer, 180 after the decoder), and in the shared
     // output every input waits for the slowest: a watched stream's sound came 170 ms later

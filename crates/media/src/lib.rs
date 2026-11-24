@@ -24,6 +24,7 @@ pub mod videolink;
 pub mod voice;
 pub mod mictest;
 pub mod denoise;
+pub mod diag;
 pub mod audio_apps;
 
 #[cfg(windows)]

@@ -185,6 +185,7 @@ fn switch_sink(old: &gst::Element, id: &Option<String>) {
         }
     }
     new.set_property("device", id.clone());
+    crate::diag::watch_ts(&new.static_pad("sink").unwrap(), "stream sound to its speakers".into());
     if parent.add(&new).is_err() {
         return;
     }
@@ -275,6 +276,12 @@ pub fn devices(input: bool) -> Vec<Device> {
 }
 
 fn sink_for(silent: bool, device: &Option<String>) -> Result<gst::Element, String> {
+    let s = sink_for_inner(silent, device)?;
+    crate::diag::watch_ts(&s.static_pad("sink").unwrap(), "shared output to the speakers".into());
+    Ok(s)
+}
+
+fn sink_for_inner(silent: bool, device: &Option<String>) -> Result<gst::Element, String> {
     if silent {
         return Ok(gst::ElementFactory::make("fakesink").name("pout").property("sync", true).build().unwrap());
     }

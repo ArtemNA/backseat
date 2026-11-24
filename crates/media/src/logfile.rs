@@ -165,11 +165,36 @@ pub fn gst_warnings() {
             }
             return;
         }
+        if limited(cat.name(), &text) {
+            return;
+        }
         eprintln!("gst {level:?} {} {what}: {text}", cat.name());
     });
 }
 
 static HIDDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At most 10 lines a minute of one warning (its category and first 40 characters); the
+/// rest are counted and the count is told with the first line of the next minute.
+fn limited(category: &str, text: &str) -> bool {
+    use std::collections::HashMap;
+    static SEEN: std::sync::Mutex<Option<HashMap<String, (std::time::Instant, u32, u64)>>> = std::sync::Mutex::new(None);
+    let key = format!("{category} {}", text.chars().take(40).collect::<String>());
+    let mut g = SEEN.lock().unwrap();
+    let e = g.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((std::time::Instant::now(), 0, 0));
+    if e.0.elapsed() >= std::time::Duration::from_secs(60) {
+        if e.2 > 0 {
+            eprintln!("gst: {} more of \"{key}\" in the last minute, not shown", e.2);
+        }
+        *e = (std::time::Instant::now(), 0, 0);
+    }
+    e.1 += 1;
+    if e.1 > 10 {
+        e.2 += 1;
+        return true;
+    }
+    false
+}
 
 /// GStreamer warnings that come with normal operation and say nothing about a fault: start-up
 /// probes, a WebRTC session before its first packet, live sources settling. Seen in every
@@ -189,11 +214,9 @@ fn known_harmless(category: &str, text: &str) -> bool {
         ("rtpsession", "Don't have a clock yet"),
         ("rtpsource", "running time not set"),
         ("GST_PADS", "could not send sticky events"),
-        // Live sources and sinks settling: the jitterbuffer's first clock fit, the audio
-        // device's first drift correction, a window that did not change for a while.
-        ("rtpjitterbuffer", "too big, reset skew"),
-        ("audiobasesink", "correct clock skew"),
-        ("audiobasesink", "Unexpected discontinuity in audio timestamps"),
+        // A window that did not change for a while. (The jitter buffer's skew resets and the
+        // audio device's drift corrections and discontinuities are shown since 0.2.23: they
+        // may be what makes sound crackle; repeats are limited by `limited`.)
         ("d3d11screencapturesrc", "Got expected error, try again"),
         ("d3d11screencapturesrc", "No frame available"),
         // Loopback capture has no per-session volume control (it is not a microphone).
@@ -219,9 +242,23 @@ mod tests {
 
     #[test]
     fn harmless_list_matches_category_and_text() {
-        assert!(known_harmless("rtpjitterbuffer", "delta - skew: 0:00:02.6 too big, reset skew"));
-        assert!(!known_harmless("rtpjitterbuffer", "something else"));
-        assert!(!known_harmless("rtpbasedepay2", "too big, reset skew"));
+        assert!(known_harmless("d3d11screencapturesrc", "Got expected error, try again"));
+        assert!(!known_harmless("d3d11screencapturesrc", "something else"));
+        assert!(!known_harmless("rtpbasedepay2", "Got expected error, try again"));
+        // Shown since 0.2.23: they may be what makes sound crackle.
+        assert!(!known_harmless("rtpjitterbuffer", "delta - skew: 0:00:02.6 too big, reset skew"));
+        assert!(!known_harmless("audiobasesink", "correct clock skew 0:00:00.020 > 0:00:00.020"));
+        assert!(!known_harmless("audiobasesink", "Unexpected discontinuity in audio timestamps of +0:00:00.040"));
+    }
+
+    /// The 11th line of one warning within a minute is held back, a different one is not.
+    #[test]
+    fn repeats_are_limited() {
+        for _ in 0..10 {
+            assert!(!limited("testcat", "the same warning"));
+        }
+        assert!(limited("testcat", "the same warning"));
+        assert!(!limited("testcat", "another warning"));
     }
 
     #[test]
