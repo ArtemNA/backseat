@@ -47,9 +47,9 @@ pub struct Room {
     pub placed: Rc<RefCell<HashMap<u64, Option<(i32, i32, i32, i32)>>>>,
     pub below: ScrollHandle,
     pub videos_hidden: bool,
-    /// How many streams were watched when `videos_hidden` was last applied: one started meanwhile
+    /// The watches (by identity) when `videos_hidden` was last applied: one started meanwhile
     /// (through the API, under an open dialog) must be hidden too.
-    pub hidden_watches: Vec<u64>,
+    pub hidden_watches: Vec<usize>,
     /// Tests: what was last written about the layout and our stream.
     pub reported: String,
     /// Our own stream's small picture, while the window is in front (`sync_preview`).
@@ -253,7 +253,8 @@ impl Shell {
         let menu_open = (self.voice_menu.is_some() || self.room_menu.is_some()) && std::env::var_os("STREAMER_DEBUG_LISTS_UNDER_VIDEO").is_none();
         let hide = self.join_shown() || self.dialog_open() || list_open || menu_open;
         let session = self.core.session.lock().unwrap().clone();
-        let mut watches: Vec<u64> = session.map(|s| s.watching().iter().map(|w| w.streamer).collect()).unwrap_or_default();
+        // By identity: a stopped watch and a new one of the same streamer differ.
+        let mut watches: Vec<usize> = session.map(|s| s.watching().iter().map(|w| std::sync::Arc::as_ptr(w) as usize).collect()).unwrap_or_default();
         watches.sort_unstable();
         if hide != self.room.videos_hidden || (hide && watches != self.room.hidden_watches) {
             self.room.videos_hidden = hide;

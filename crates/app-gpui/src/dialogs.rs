@@ -306,7 +306,10 @@ impl Shell {
                 _ => Audio::System,
             };
             g.live_audio_none = l.audio == "none";
-            (g.res_picked, g.codec_picked, g.audio_picked) = (true, true, true);
+            // The codec and sound are fixed while live; the resolution follows a new source unless
+            // the settings fix it, as when the stream was started.
+            g.res_picked = !pref("stream", "res").is_empty();
+            (g.codec_picked, g.audio_picked) = (true, true);
         }
         g.error = None;
         g.busy = false;
@@ -912,7 +915,10 @@ impl Shell {
     fn render_api_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let a = crate::api::load();
         let shown = self.dialogs.settings.as_ref().is_some_and(|s| s.token_shown);
-        let mut col = div().flex().flex_col().gap_3().child(small(t("set.api_hint"))).child(Checkbox::new("set-api").cursor_pointer().label(t("set.api")).checked(a.enabled).on_click(cx.listener(|_, v: &bool, _, cx| {
+        let mut col = div().flex().flex_col().gap_3().child(small(t("set.api_hint"))).child(Checkbox::new("set-api").cursor_pointer().label(t("set.api")).checked(a.enabled).on_click(cx.listener(|s, v: &bool, _, cx| {
+            if let Some(st) = s.dialogs.settings.as_mut() {
+                st.token_shown = false;
+            }
             let mut a = crate::api::load();
             a.enabled = *v;
             if a.enabled && a.token.is_empty() {
@@ -964,7 +970,10 @@ impl Shell {
                             .child(Button::new("set-api-copy").cursor_pointer().small().label(t("set.api_copy")).on_click(cx.listener(move |_, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(token.clone()));
                             })))
-                            .child(Button::new("set-api-new").cursor_pointer().small().label(t("set.api_new_token")).on_click(cx.listener(|_, _, _, cx| {
+                            .child(Button::new("set-api-new").cursor_pointer().small().label(t("set.api_new_token")).on_click(cx.listener(|s, _, _, cx| {
+                                if let Some(st) = s.dialogs.settings.as_mut() {
+                                    st.token_shown = false;
+                                }
                                 let mut a = crate::api::load();
                                 a.token = crate::api::new_token();
                                 crate::api::save(&a);
@@ -1003,6 +1012,8 @@ impl Shell {
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if let Some(st) = s.dialogs.settings.as_mut() {
                         st.tab = which;
+                        // Shown on purpose once, not for the next visit (maybe on a stream).
+                        st.token_shown = false;
                     }
                     cx.notify();
                 }))

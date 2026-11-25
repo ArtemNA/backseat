@@ -250,7 +250,9 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
             // As the app's button: deafened counts as muted, and turning the microphone on
             // turns the sound on too.
             let v = core::voice_view(core);
-            let on = field!(r.opt_bool("muted")).unwrap_or(!(v.mic_muted || v.deafened));
+            // STREAMER_DEBUG_API_MUTE_RAW: the raw switch only (the spoiled variant).
+            let shown = if std::env::var_os("STREAMER_DEBUG_API_MUTE_RAW").is_some() { v.mic_muted } else { v.mic_muted || v.deafened };
+            let on = field!(r.opt_bool("muted")).unwrap_or(!shown);
             if !spoiled() {
                 core::set_mic_muted(core, on);
             }
@@ -443,7 +445,10 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
         // Not looked up again: a window gone from the list (hidden) must not fail a new bitrate.
         _ if keep.is_some() => {
             let b = keep.unwrap();
-            (b.id, 0, b.audio_pid)
+            // A stream of a window with the system's sound has no program yet: found now, for
+            // a change to "app".
+            let pid = b.audio_pid.or_else(|| (b.kind == "window").then(|| src.windows.iter().find(|w| w.hwnd == b.id).map(|w| w.pid)).flatten());
+            (b.id, 0, pid)
         }
         "monitor" => {
             let m = match id {
@@ -527,6 +532,9 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     };
     if !["system", "app", "none"].contains(&audio.as_str()) || (audio == "app" && kind != "window") {
         return Reply::err(400, "\"audio\" is \"system\" or \"none\" (and \"app\" for a window)");
+    }
+    if audio == "app" && pid.is_none() {
+        return Reply::err(404, "the streamed window is gone from the list; give \"source\" again");
     }
     if let Some(b) = &base {
         if (b.audio == "none") != (audio == "none") {
@@ -663,7 +671,8 @@ fn status(core: &Arc<Core>) -> Value {
         "voice": {
             "joined": voice_room.is_some(),
             "room": voice_room,
-            "mic_muted": v.mic_muted,
+            // As heard: while deafened the microphone is off too (as `members[].mic_muted`).
+            "mic_muted": v.mic_muted || v.deafened,
             "deafened": v.deafened,
             "push_to_talk": v.ptt,
             "talking": v.talking,

@@ -61,7 +61,8 @@ the API with `fetch` and the `Authorization` header.
 - Reads are `GET`, actions are `POST`. A `POST` body is optional JSON; send
   `Content-Type: application/json` and a `Content-Length` (chunked bodies get `411`). No body
   is the same as `{}`; a field of the wrong type (`"muted": "true"`) gets `400`.
-- Every response has `"ok": true` or `"ok": false` with `"error": "text"`.
+- Every response (but the empty `204` to `OPTIONS`) has `"ok": true` or `"ok": false` with
+  `"error": "text"`.
 - Actions answer with the same object as `GET /status` (plus `"ok"`), taken after the
   action, so one call is enough to update a remote's screen.
 - Actions that take time (opening a room, joining voice, starting a stream, watching) answer
@@ -182,10 +183,10 @@ No token needed. Use it to check that the address is right.
 | `members[].streaming` | They are live; you can watch them. |
 | `members[].watching` | You are watching them. |
 | `members[].in_voice`, `speaking`, `mic_muted`, `deafened` | Voice chat state. `speaking` is true while their sound is above the speaking threshold. |
-| `members[].volume` | How loud they are for you, percent (100: as they speak); `null` for you and for those not in voice. |
+| `members[].volume` | How loud they are for you, percent (100: as they speak); `null` for you, for those not in voice, and for everyone while your voice is in another room. |
 | `background_rooms` | Codes of rooms kept connected in the background (you switched away while watching, streaming or in voice there). |
 | `voice.joined`, `voice.room` | You are in voice, and in which room's (it may be a background room). |
-| `voice.mic_muted`, `voice.deafened` | Your microphone and sound switches. They are kept between voice joins, so they are valid outside voice too. |
+| `voice.mic_muted`, `voice.deafened` | Your microphone and sound switches; `mic_muted` is true while deafened too (the microphone sends nothing then). They are kept between voice joins, so they are valid outside voice too. |
 | `voice.push_to_talk`, `voice.talking` | Push-to-talk is on; your microphone is sending right now. |
 | `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `viewers[].problems` are short codes such as `loss:4.7` or `queue:1748`. Right after the start the numbers are 0 and `viewers` empty for up to a second. |
 | `live.settings` | What it runs with, in the form `/live/start` takes. |
@@ -227,7 +228,8 @@ Same with a body: `POST /api/v1/room/open` with `{"room": "K7M2Q9XR4TBA"}`.
 ### POST /api/v1/room/leave
 
 Leaves the open room for good (the others see you leave). Voice, your stream and your
-watches there end.
+watches there end. While the app is joining the room again after a lost connection
+(`reconnecting`), this also stops that.
 
 ### POST /api/v1/voice/join, /voice/leave
 
@@ -319,6 +321,8 @@ Changes the running stream in place: viewers keep watching. The body is as for
 { "source": { "kind": "window", "id": 395274 } }
 ```
 
+- Switching to `"audio": "app"` without `source` uses the streamed window's program; if
+  that window is gone from `/sources`, `404`.
 - A new source keeps the sound choice. With `"app"` (a program's sound) a new window brings
   its own program's sound; a monitor takes the whole system's sound instead.
 - The codec, and sound on versus off, cannot change while live: `409`. Stop and start again.
@@ -409,7 +413,7 @@ async function call(path, body) {
   return j;
 }
 const s = await call('/status');
-await call('/voice/mute', { muted: !s.voice.mic_muted });
+await call('/voice/mute', {}); // toggles, as the app's button
 ```
 
 A page served over `https://` cannot call an `http://` address on the local network

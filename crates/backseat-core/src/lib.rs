@@ -34,6 +34,8 @@ pub struct App {
     /// The server lost our place (its connection broke for longer than it keeps one): we
     /// join the same room again (`rejoin`).
     rejoining: std::sync::atomic::AtomicBool,
+    /// Left on purpose meanwhile: the rejoin stops (it joined again within 2 s, after Leave).
+    rejoin_cancelled: std::sync::atomic::AtomicBool,
     /// The direct connection (beta) and our name in it, while there is one.
     direct: Mutex<Option<(Arc<media::direct::Control>, String)>>,
     /// Microphone off, sound off: kept across voice joins and rooms, as in other voice apps.
@@ -95,6 +97,10 @@ fn save_place(key: &str, place: Option<protocol::Resume>) {
 /// Leaves the open room for good: the server is told before we go on, and the saved
 /// place is forgotten. `wait`: how long to wait for the server to be told (exiting).
 pub fn leave_for_good(app: &App, wait: std::time::Duration) {
+    // STREAMER_DEBUG_LEAVE_KEEPS_REJOIN: a rejoin goes on after Leave (the spoiled variant).
+    if std::env::var_os("STREAMER_DEBUG_LEAVE_KEEPS_REJOIN").is_none() {
+        app.rejoin_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let s = app.session.lock().unwrap().take();
     if let Some(s) = s {
         s.leave_and_wait(wait);
@@ -1108,6 +1114,7 @@ fn rejoin(app: &Arc<App>, key: String) {
     let (Some(server), Some(room), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
     let (server, room, name) = (server.to_string(), room.to_string(), name.to_string());
     let a = app.clone();
+    a.rejoin_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
     a.rejoining.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         let mut ok = false;
@@ -1115,6 +1122,11 @@ fn rejoin(app: &Arc<App>, key: String) {
             std::thread::sleep(std::time::Duration::from_secs(2));
             if a.session.lock().unwrap().is_some() || a.joined.lock().unwrap().is_some() {
                 eprintln!("rooms: another room was opened; not rejoining {room}");
+                a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            if a.rejoin_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("rooms: left; not rejoining {room}");
                 a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
