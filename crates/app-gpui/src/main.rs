@@ -12,6 +12,7 @@ mod testing;
 mod voice_ui;
 mod tray;
 mod autostart;
+mod api;
 
 use backseat_core::{self as core, App as Core, Snapshot};
 use gpui_kit::component::button::ButtonVariants as _;
@@ -233,6 +234,7 @@ impl Shell {
             }
         })
         .detach();
+        api::start(&shell.core, window, cx);
         test_actions(cx);
         testing::test_voice(window, cx);
         join::test_direct(window, cx);
@@ -318,7 +320,21 @@ impl Shell {
 
     /// Joins a room in the background (joining blocks; video windows wait for this thread).
     fn open_room(&mut self, r: Room, cx: &mut Context<Self>) {
-        if self.joining || (self.snap.connected && self.current.as_ref().is_some_and(|c| c.same(&r))) {
+        self.open_room_then(r, cx, None);
+    }
+
+    /// `open_room`, telling `done` how the join went (the local API waits for it).
+    pub(crate) fn open_room_then(&mut self, r: Room, cx: &mut Context<Self>, done: Option<api::Done>) {
+        if self.joining {
+            if let Some(d) = done {
+                d(Err("busy: another room is being joined".into()));
+            }
+            return;
+        }
+        if self.snap.connected && self.current.as_ref().is_some_and(|c| c.same(&r)) {
+            if let Some(d) = done {
+                d(Ok(()));
+            }
             return;
         }
         // A join that fails leaves the open room as it was (the core keeps it until the new
@@ -334,14 +350,17 @@ impl Shell {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 s.joining = false;
-                if let Err(e) = result {
-                    s.error = Some(s.join_error(&r_room, &e));
+                if let Err(e) = &result {
+                    s.error = Some(s.join_error(&r_room, e));
                     if prev.is_some() && s.current.as_ref().is_some_and(|c| c.room == r_room) {
                         s.current = prev;
                     }
                 }
                 s.tick(cx);
             });
+            if let Some(d) = done {
+                d(result);
+            }
         })
         .detach();
         cx.notify();
@@ -856,18 +875,25 @@ impl Shell {
 
     /// Joins the room's voice. Opening the microphone may take a moment: off the UI thread.
     pub(crate) fn join_voice(&mut self, cx: &mut Context<Self>) {
+        self.join_voice_then(cx, None);
+    }
+
+    pub(crate) fn join_voice_then(&mut self, cx: &mut Context<Self>, done: Option<api::Done>) {
         let core = self.core.clone();
         let task = cx.background_executor().spawn(async move { core::join_voice(&core) });
         cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
-                if let Err(e) = result {
-                    s.error = Some(tf("voice.failed", &[("e", &e)]).to_string());
+                if let Err(e) = &result {
+                    s.error = Some(tf("voice.failed", &[("e", e)]).to_string());
                     s.error_since = Some(std::time::Instant::now());
                 }
                 s.snap.voice = core::voice_view(&s.core);
                 cx.notify();
             });
+            if let Some(d) = done {
+                d(result);
+            }
         })
         .detach();
     }

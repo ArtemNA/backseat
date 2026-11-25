@@ -873,6 +873,59 @@ impl Shell {
         cx.notify();
     }
 
+    /// The local API (API.md): on/off, the local network, the address and the token.
+    fn render_api_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let a = crate::api::load();
+        let mut col = div().flex().flex_col().gap_2().child(Checkbox::new("set-api").cursor_pointer().label(t("set.api")).checked(a.enabled).on_click(cx.listener(|_, v: &bool, _, cx| {
+            let mut a = crate::api::load();
+            a.enabled = *v;
+            if a.enabled && a.token.is_empty() {
+                a.token = crate::api::new_token();
+            }
+            crate::api::save(&a);
+            crate::api::apply();
+            cx.notify();
+        })));
+        if !a.enabled {
+            return col.child(small(t("set.api_hint"))).into_any_element();
+        }
+        col = col.child(Checkbox::new("set-api-lan").cursor_pointer().label(t("set.api_lan")).checked(a.lan).on_click(cx.listener(|_, v: &bool, _, cx| {
+            let mut a = crate::api::load();
+            a.lan = *v;
+            crate::api::save(&a);
+            crate::api::apply();
+            cx.notify();
+        })));
+        if let Some(e) = crate::api::last_error() {
+            return col.child(banner(tf("set.api_failed", &[("e", &e)]), false)).into_any_element();
+        }
+        let address = crate::api::shown_address().unwrap_or_default();
+        let token = a.token.clone();
+        let mono = |text: String| div().px_2().py_1().rounded_md().bg(rgb(color::RAIL)).text_color(rgb(color::BRIGHT)).font_family("Consolas").text_sm().child(text);
+        col.child(div().flex().items_center().gap_2().child(small(t("set.api_address"))).child(mono(address)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(small(t("set.api_token")))
+                    .child(mono(token.clone()))
+                    .child(Button::new("set-api-copy").cursor_pointer().small().label(t("set.api_copy")).on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(token.clone()));
+                    })))
+                    .child(Button::new("set-api-new").cursor_pointer().small().label(t("set.api_new_token")).on_click(cx.listener(|_, _, _, cx| {
+                        let mut a = crate::api::load();
+                        a.token = crate::api::new_token();
+                        crate::api::save(&a);
+                        crate::api::apply();
+                        cx.notify();
+                    }))),
+            )
+            .child(small(t("set.api_warning")))
+            .into_any_element()
+    }
+
     fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(st) = self.dialogs.settings.as_ref() else { return div().into_any_element() };
         let tab = st.tab;
@@ -923,6 +976,7 @@ impl Shell {
                     crate::autostart::sync();
                     cx.notify();
                 })))
+                .child(self.render_api_settings(cx))
                 .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").cursor_pointer().label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
                     if let Err(e) = core::open_logs() {
                         s.error = Some(e);

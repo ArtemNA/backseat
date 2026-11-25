@@ -122,21 +122,38 @@ fn card() -> Div {
 impl Shell {
     /// Watch a streamer (a Watch button). Joining the video blocks: off the UI thread.
     pub fn watch_stream(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.watch_stream_then(id, None, cx, None);
+    }
+
+    /// `watch_stream`; `quality` ("720p30 4000") instead of the settings' and of the tile's
+    /// pickers; `done` hears how it went (the local API).
+    pub fn watch_stream_then(&mut self, id: u64, quality: Option<String>, cx: &mut Context<Self>, done: Option<crate::api::Done>) {
         let core = self.core.clone();
-        let quality = watch_request();
+        let asked = quality.clone();
+        let quality = quality.or_else(watch_request);
         let task = cx.background_executor().spawn(async move { core::watch(&core, id, quality) });
         cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
             let result = task.await;
+            // A second click while the first is being set up: nothing went wrong.
+            let result = result.map(|_| ()).or_else(|e| if e.starts_with("already watching") { Ok(()) } else { Err(e) });
             let _ = this.update(cx, |s, cx| {
-                // A second click while the first is being set up: nothing went wrong.
-                let result = result.map(|_| ()).or_else(|e| if e.starts_with("already watching") { Ok(()) } else { Err(e) });
-                if let Err(e) = result {
-                    s.error = Some(tf("notice.error", &[("msg", &e)]).to_string());
+                if let Err(e) = &result {
+                    s.error = Some(tf("notice.error", &[("msg", e)]).to_string());
                 }
                 s.tick(cx);
             });
+            if let Some(d) = done {
+                d(result);
+            }
         })
         .detach();
+        if let Some(q) = asked {
+            if let Err(e) = core::set_quality(&self.core, id, &q) {
+                eprintln!("quality: {e}");
+            }
+            cx.notify();
+            return;
+        }
         cx.notify();
     }
 

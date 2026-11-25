@@ -55,6 +55,8 @@ good connection) and the picture as sharp as your upload allows.
   inside; it needs nothing else installed.
 - **Stays out of the way:** it starts with Windows into the tray (you can turn that off),
   and closing the window keeps it there. It updates itself.
+- **Remote control:** an optional local API lets a phone, a Stream Deck or a script join
+  rooms and voice, mute, start a stream and watch ([API.md](API.md)). Off by default.
 - **Direct connection (beta):** two people can connect with no server at all (see below).
 - In **English, Ukrainian and Russian**.
 

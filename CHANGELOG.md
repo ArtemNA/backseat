@@ -2,6 +2,10 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.26
+
+- **Remote control through a local API.** Turn it on in *Settings → General*: phones, a Stream Deck, scripts or AI agents on your computer or your home network can see your rooms, who is in them, voice and streams, and open a room, join or leave voice, mute or deafen, start or stop your stream, and watch someone. Every call needs a token shown in the settings; a new token cuts off the old one. Off by default. The calls are described in [API.md](API.md).
+
 ## 0.2.25
 
 - **Fixed: in 0.2.24 viewers got only half of a stream's sound** (it sounded broken from the start) when the streamer shared all sound. The streamer's mixer is back to sending every piece; the fix of 0.2.24 (sound that no longer drifts and breaks up after a while) stays.

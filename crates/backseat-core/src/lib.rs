@@ -3,6 +3,7 @@
 //! calls these and shows `snapshot` once a second; a sampler thread keeps the numbers.
 //! Video goes to each viewer's own native window, never through the UI (decision D4).
 
+pub mod api;
 pub mod sampler;
 pub mod update;
 
@@ -720,9 +721,17 @@ pub fn watches(app: &App) -> Vec<sampler::WatchStats> {
 }
 
 pub fn snapshot(app: &App) -> Snapshot {
+    snapshot_with(app, true)
+}
+
+/// The snapshot without taking the notice and the link (they stay for the UI): the local API.
+pub fn status(app: &App) -> Snapshot {
+    snapshot_with(app, false)
+}
+
+fn snapshot_with(app: &App, take: bool) -> Snapshot {
     let s = app.session.lock().unwrap().clone();
-    let notice = app.notice.lock().unwrap().take();
-    let link = app.link.lock().unwrap().take();
+    let (notice, link) = if take { (app.notice.lock().unwrap().take(), app.link.lock().unwrap().take()) } else { (None, None) };
     let Some(s) = s else {
         return Snapshot { connected: false, room: String::new(), title: None, me: 0, peers: vec![], watches: vec![], live: None, notice, link, direct: None, voice: voice_view(app), reconnecting: app.rejoining.load(std::sync::atomic::Ordering::SeqCst), background: background_rooms(app) };
     };
