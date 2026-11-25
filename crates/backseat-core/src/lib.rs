@@ -1499,6 +1499,40 @@ pub fn update_live(app: &App, req: GoLive) -> Result<(), String> {
 /// start from them.
 pub fn live_now(app: &App) -> Option<GoLive> {
     let s = app.session.lock().unwrap().clone()?;
+    golive_of(&s)
+}
+
+/// The room we stream in: the open one, or one kept in the background (switched away from
+/// while live). One at a time (`quiet_background`).
+pub fn live_session(app: &App) -> Option<Arc<Session>> {
+    let open = app.session.lock().unwrap().clone().filter(|s| s.host().is_some());
+    open.or_else(|| app.background.lock().unwrap().iter().find(|(_, s)| s.host().is_some()).map(|(_, s)| s.clone()))
+}
+
+/// Our stream wherever it runs (`live_session`): its room code and settings.
+pub fn live_anywhere(app: &App) -> Option<(String, GoLive)> {
+    let s = live_session(app)?;
+    Some((s.room.clone(), golive_of(&s)?))
+}
+
+/// Stops our stream wherever it runs. A room in the background kept only for it has nothing
+/// left to do there: it closes keeping its place, as one switched away from idle does.
+pub fn end_live_anywhere(app: &App) {
+    let Some(s) = live_session(app) else { return };
+    s.stop_streaming();
+    if !s.busy() {
+        let idle = {
+            let mut bg = app.background.lock().unwrap();
+            bg.iter().position(|(_, b)| Arc::ptr_eq(b, &s)).map(|i| bg.remove(i))
+        };
+        if let Some((_, b)) = idle {
+            eprintln!("rooms: {} closed after its stream stopped, place kept", b.room);
+            b.close_keeping_place();
+        }
+    }
+}
+
+fn golive_of(s: &Session) -> Option<GoLive> {
     let c = s.host()?.cfg();
     let (kind, id) = match c.source {
         Source::Window { hwnd } => ("window", hwnd),

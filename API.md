@@ -190,6 +190,7 @@ No token needed. Use it to check that the address is right.
 | `voice.push_to_talk`, `voice.talking` | Push-to-talk is on; your microphone is sending right now. |
 | `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `viewers[].problems` are short codes such as `loss:4.7` or `queue:1748`. Right after the start the numbers are 0 and `viewers` empty for up to a second. |
 | `live.settings` | What it runs with, in the form `/live/start` takes. |
+| `live.room` | The room it runs in. It can be a room kept in the background (you opened another room while live); then the numbers are 0 and `viewers` empty. |
 | `watching[]` | Streams you watch: `streamer` (member id), `name`, `quality` you asked for (`null`: as streamed), `codec`, `fps` received, `latency_ms`, `mbit`, `loss_pct`, `muted`, `volume` (percent), `fullscreen`, `popped_out` (in its own window), `window_closed`. |
 
 Member lists come from the open room only; for a background room you only get its code.
@@ -303,7 +304,8 @@ app's "Go live" dialog chooses them (the settings' Stream tab first).
 | `audio` | `"system"` (the whole PC's sound), `"app"` (only the window's program), `"none"` | the settings', else `system` for a monitor and `app` for a window |
 
 The whole system's sound leaves out the programs listed in the settings (Discord by
-default). Already live: `409`; use `/live/update`.
+default). Already live: `409`; use `/live/update` (or, for a stream in a background room,
+stop it first).
 
 The simplest call streams the primary monitor with the usual settings:
 
@@ -328,11 +330,11 @@ Changes the running stream in place: viewers keep watching. The body is as for
   its own program's sound; a monitor takes the whole system's sound instead.
 - The codec, and sound on versus off, cannot change while live: `409`. Stop and start again.
 - Viewers who asked for less keep that, unless the new quality is lower still.
-- Not live: `409`.
+- Not live: `409`. Live in a room kept in the background: `409`; open that room first.
 
 ### POST /api/v1/live/stop
 
-Stops your stream; viewers see it end.
+Stops your stream, also one running in a room kept in the background; viewers see it end.
 
 ### POST /api/v1/watch/{id}
 

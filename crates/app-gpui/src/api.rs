@@ -304,7 +304,12 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
         (_, true, ["live", "start"]) => live(core, r, false),
         (_, true, ["live", "update"]) => live(core, r, true),
         (_, true, ["live", "stop"]) => {
-            core::end_live(core);
+            // STREAMER_DEBUG_API_STOP_OPEN_ONLY: only the open room's (the spoiled variant).
+            if std::env::var_os("STREAMER_DEBUG_API_STOP_OPEN_ONLY").is_some() {
+                core::end_live(core);
+            } else {
+                core::end_live_anywhere(core);
+            }
             Reply::ok(status(core))
         }
         (_, true, ["watch", id, rest @ ..]) => {
@@ -441,6 +446,11 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
         return conflict("not in a room".into());
     }
     let base = core::live_now(core);
+    // Live in a room kept in the background: starting here would end it unseen, and changing
+    // it needs that room open.
+    if let (None, Some((room, _))) = (&base, core::live_anywhere(core)) {
+        return conflict(if update { format!("your stream runs in room {room}; open it to change the stream") } else { format!("already live in room {room}; stop first") });
+    }
     match (&base, update) {
         (Some(_), false) => return conflict("already live; use /live/update to change it, or stop first".into()),
         (None, true) => return conflict("not live".into()),
@@ -619,6 +629,8 @@ fn status(core: &Arc<Core>) -> Value {
     let session = core.session.lock().unwrap().clone();
     let watched: Vec<u64> = session.as_ref().map(|x| x.watching().iter().map(|w| w.streamer).collect()).unwrap_or_default();
     let live_now = session.as_ref().is_some_and(|x| x.host().is_some());
+    // Our stream may run in a room kept in the background (switched away from while live).
+    let live_away = if live_now { None } else { core::live_anywhere(core) };
     let room = s.connected.then(|| {
         let cur = m.current.as_ref().filter(|c| c.room == s.room);
         json!({
@@ -668,8 +680,12 @@ fn status(core: &Arc<Core>) -> Value {
             })
         })
         .collect();
-    let settings_now = core::live_now(core);
-    let live = live_now.then(|| match &s.live {
+    let settings_now = core::live_anywhere(core);
+    let live = if let Some((room, _)) = &live_away {
+        // No numbers for a room in the background (the sampler follows the open one).
+        Some(json!({ "room": room, "since_secs": 0, "quality": "", "encoder": "", "upload_mbit": 0.0, "viewers": [] }))
+    } else {
+        live_now.then(|| match &s.live {
         Some(l) => json!({
             "since_secs": l.since_secs,
             "quality": l.ceiling,
@@ -679,7 +695,12 @@ fn status(core: &Arc<Core>) -> Value {
         }),
         // Just started: no numbers yet.
         None => json!({ "since_secs": 0, "quality": "", "encoder": "", "upload_mbit": 0.0, "viewers": [] }),
-    });
+    })
+    .map(|mut l| {
+        l["room"] = json!(s.room);
+        l
+    })
+    };
     json!({
         "version": core::app_version(),
         "joining": m.joining,
@@ -696,7 +717,7 @@ fn status(core: &Arc<Core>) -> Value {
             "talking": v.talking,
         },
         "live": live.map(|mut l| {
-            if let Some(g) = &settings_now {
+            if let Some((_, g)) = &settings_now {
                 l["settings"] = json!({ "source": { "kind": g.kind, "id": g.id }, "mode": g.mode, "kbit": g.kbit, "codec": g.codec, "audio": g.audio });
             }
             l
