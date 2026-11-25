@@ -172,7 +172,7 @@ No token needed. Use it to check that the address is right.
 | Field | Meaning |
 |---|---|
 | `joining` | A room is being opened right now. |
-| `reconnecting` | The connection to the server broke and is being made again (your place is kept). |
+| `reconnecting` | The connection to the server broke and is being made again. With `room` set (`room.reconnecting`), your place is kept. With `room: null`, the place was lost and the app joins the room again as a new member: every member id changes. |
 | `room` | The open room, `null` when none is open. |
 | `room.code` | The room's code: what `/rooms/{code}/open` takes. |
 | `room.title` | Its display name, `null` when it has none (show `code` then). |
@@ -343,7 +343,8 @@ click on Watch does.
 { "quality": "720p30 4000" }
 ```
 
-`quality` is optional: "`mode`" or "`mode` `kbit`". It can only lower what the streamer
+`quality` is optional: "`mode`" or "`mode` `kbit`". Already watching: only the quality
+changes, if given. It can only lower what the streamer
 sends (never above their own), and snaps to the presets. Missing: the settings' Watch tab,
 else as streamed.
 

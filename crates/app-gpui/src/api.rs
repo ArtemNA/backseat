@@ -267,7 +267,7 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
         }
         (_, true, ["voice", "members", id, "volume"]) => {
             let Ok(id) = id.parse::<u64>() else { return Reply::err(400, "the member id is a number") };
-            let Some(v) = field!(r.opt_f64("volume")).filter(|v| (0.0..=200.0).contains(v)) else {
+            let Some(v) = field!(r.opt_f64("volume")).map(f64::round).filter(|v| (0.0..=200.0).contains(v)) else {
                 return Reply::err(400, "\"volume\" is a percent, 0 to 200 (100: as they speak)");
             };
             let snap = core::status(core);
@@ -350,6 +350,15 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
                     return Reply::err(400, e);
                 }
             }
+            // Already watched: only the quality, if one is asked for.
+            if watching.is_some() {
+                if let Some(q) = &q {
+                    if let Err(e) = core::set_quality(core, id, q) {
+                        return conflict(e);
+                    }
+                }
+                return ok(core);
+            }
             match ui(Cmd::Watch(id, q), Duration::from_secs(20)) {
                 Ok(()) => ok(core),
                 Err(e) => conflict(e),
@@ -376,7 +385,7 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
             }
         }
         ["volume"] => {
-            let Some(v) = field!(r.opt_f64("volume")).filter(|v| (0.0..=100.0).contains(v)) else {
+            let Some(v) = field!(r.opt_f64("volume")).map(f64::round).filter(|v| (0.0..=100.0).contains(v)) else {
                 return Reply::err(400, "\"volume\" is a percent, 0 to 100");
             };
             if watching.is_none() {
@@ -435,7 +444,7 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     if r.body.get("source").is_some_and(|v| !(v.is_null() || v.is_object())) {
         return Reply::err(400, "\"source\" must be an object: {\"kind\": \"window\", \"id\": ...}");
     }
-    let given_kind = field!(r.opt_str("/source/kind"));
+    let given_kind = field!(r.opt_str("/source/kind")).map(|k| k.to_ascii_lowercase());
     let given_id = field!(r.opt_u64("/source/id"));
     // The source: given, else the running one, else the primary monitor.
     let kind = given_kind.clone().or_else(|| base.as_ref().map(|b| b.kind.clone())).unwrap_or_else(|| "monitor".into());

@@ -80,6 +80,8 @@ pub struct GoLiveState {
     pub editing: bool,
     /// The running stream has no sound (it stays so while live).
     live_audio_none: bool,
+    /// The running stream's source, while changing it.
+    live_pick: Option<u64>,
     pub error: Option<String>,
     pub busy: bool,
     limit: Entity<InputState>,
@@ -230,10 +232,16 @@ fn set_audio_exclude(list: &[String]) {
 /// A source clicked in the go-live dialog. While changing a stream, another source lets the
 /// resolution follow it (unless the settings fix one), as at the start.
 fn pick_source(g: &mut GoLiveState, id: u64) {
-    if g.editing && g.pick != Some(id) && pref("stream", "res").is_empty() {
+    g.pick = Some(id);
+    follow_new_source(g);
+}
+
+/// While changing a stream: a source other than the running one (clicked, or picked by the
+/// dialog after a tab switch) lets the resolution follow it, unless the settings fix one.
+fn follow_new_source(g: &mut GoLiveState) {
+    if g.editing && g.pick.is_some() && g.pick != g.live_pick && pref("stream", "res").is_empty() {
         g.res_picked = false;
     }
-    g.pick = Some(id);
 }
 
 fn small(t: impl Into<SharedString>) -> Div {
@@ -275,6 +283,7 @@ impl Shell {
             audio_picked: false,
             editing: false,
             live_audio_none: false,
+            live_pick: None,
             error: None,
             busy: false,
             limit: cx.new(|cx| InputState::new(window, cx).placeholder(t("unit.mbit"))),
@@ -297,6 +306,7 @@ impl Shell {
         if let Some(l) = core::live_now(&self.core).filter(|_| editing && std::env::var_os("STREAMER_DEBUG_CHANGE_FROM_DIALOG").is_none()) {
             g.screen = l.kind != "window";
             g.pick = Some(l.id);
+            g.live_pick = Some(l.id);
             if let Some((r, f)) = l.mode.split_once('p') {
                 if let Some(r) = ["720", "1080", "1440"].into_iter().find(|x| *x == r) {
                     g.res = r;
@@ -394,6 +404,7 @@ impl Shell {
         let Some(g) = self.dialogs.golive.as_mut() else { return };
         if !list.iter().any(|x| Some(x.id) == g.pick) {
             g.pick = if g.screen { list.iter().find(|x| x.primary).or(list.first()).map(|x| x.id) } else { None };
+            follow_new_source(g);
         }
         if let Some(p) = list.iter().find(|x| Some(x.id) == g.pick) {
             if !g.res_picked && p.height > 0 {

@@ -1011,6 +1011,12 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
     // both connections alive: the same person twice in the room.
     static JOINING: Mutex<()> = Mutex::new(());
     let _one = JOINING.lock().unwrap_or_else(|e| e.into_inner());
+    // A rejoin that waited here while another room was opened (or after a Leave) has nothing
+    // to do: it would push that room aside.
+    let given_up = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
+    if cancel.is_some() && (given_up() || app.session.lock().unwrap().is_some() || app.joined.lock().unwrap().is_some()) {
+        return Err("left meanwhile".into());
+    }
     let key = resume_key(server, room, name);
     if app.joined.lock().unwrap().as_deref() == Some(key.as_str()) && app.session.lock().unwrap().is_some() {
         return Ok(());
@@ -1035,16 +1041,33 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
         step_away(app);
     }
     let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
-    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+    // Tests only: STREAMER_DEBUG_REJOIN_SLOW_JOIN=ms makes a rejoin's join take that much
+    // longer, so a Leave can land while it runs.
+    if let (Some(_), Some(ms)) = (cancel, std::env::var("STREAMER_DEBUG_REJOIN_SLOW_JOIN").ok().and_then(|v| v.parse().ok())) {
+        eprintln!("rooms: (test) the rejoin's join takes {ms} ms more");
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    if given_up() {
         s.leave();
         return Err("left meanwhile".into());
     }
     // Joined: only now the open room steps away (into the background, or closed).
     step_away(app);
     save_place(&key, s.resume());
-    *app.joined.lock().unwrap() = Some(key);
-    // Whatever got in meanwhile leaves.
-    let other = app.session.lock().unwrap().replace(s.clone());
+    // Checked again under the open room's lock: a Leave sets the flag before it takes that
+    // lock, so it either is seen here or finds this room installed and leaves it.
+    let other = {
+        let mut open = app.session.lock().unwrap();
+        if given_up() {
+            drop(open);
+            s.leave();
+            save_place(&key, None);
+            return Err("left meanwhile".into());
+        }
+        *app.joined.lock().unwrap() = Some(key);
+        // Whatever got in meanwhile leaves.
+        open.replace(s.clone())
+    };
     if let Some(other) = other {
         other.leave();
     }
@@ -1147,9 +1170,11 @@ fn rejoin(app: &Arc<App>, key: String) {
                     ok = true;
                     break;
                 }
+                // Left on purpose, or another room opened: no "lost" news.
                 Err(e) if e == "left meanwhile" => {
                     eprintln!("rooms: left while rejoining {room}");
-                    break;
+                    a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
                 }
                 Err(e) => eprintln!("rooms: rejoining {room}: {e}"),
             }
