@@ -434,6 +434,17 @@ impl Viewer {
         return false;
     }
 
+    /// This stream's sound level, 0..1 (1: as received), as the video window's slider sets it.
+    pub fn set_volume(&self, v: f32) {
+        self.audio.volume.store((v.clamp(0.0, 1.0) * 100.0).round() as u32, Ordering::SeqCst);
+        self.audio.apply(&self.pipeline);
+        sound_changed(self.muted(), self.audio.volume.load(Ordering::SeqCst));
+        #[cfg(windows)]
+        if let Some(w) = &self.window {
+            w.sync_audio(self.muted(), self.volume());
+        }
+    }
+
     pub fn muted(&self) -> bool {
         self.audio.muted.load(Ordering::SeqCst)
     }

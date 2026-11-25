@@ -23,6 +23,8 @@ enum Cmd {
     Watch(u64, Option<String>),
     Unwatch(u64),
     JoinVoice,
+    /// Anything else that must run on the UI thread (it writes the settings, as the UI does).
+    Run(Box<dyn FnOnce(&mut Shell) -> Result<(), String> + Send>),
 }
 
 static QUEUE: Mutex<Vec<(Cmd, Done)>> = Mutex::new(Vec::new());
@@ -148,6 +150,10 @@ fn pump(s: &mut Shell, cx: &mut Context<Shell>) {
                 done(Ok(()));
             }
             Cmd::JoinVoice => s.join_voice_then(cx, Some(done)),
+            Cmd::Run(f) => {
+                done(f(s));
+                cx.notify();
+            }
         }
     }
 }
@@ -210,7 +216,27 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
             core::set_deafened(core, on);
             Reply::ok(status(core))
         }
-        (_, true, ["live", "start"]) => live_start(core, r),
+        (_, true, ["voice", "members", id, "volume"]) => {
+            let Ok(id) = id.parse::<u64>() else { return Reply::err(400, "the member id is a number") };
+            let Some(v) = r.body.get("volume").and_then(|v| v.as_f64()).filter(|v| (0.0..=200.0).contains(v)) else {
+                return Reply::err(400, "\"volume\" is a percent, 0 to 200 (100: as they speak)");
+            };
+            let snap = core::status(core);
+            let Some(p) = snap.peers.iter().find(|p| p.id == id && !p.me).cloned() else { return Reply::err(404, "no such member (not you) in the open room") };
+            let c = core.clone();
+            let run = Cmd::Run(Box::new(move |_| {
+                core::set_peer_volume(&c, id, v / 100.0);
+                // Kept by name, as the voice menu keeps it: it comes back next time.
+                crate::voice_ui::save_volume(&p.name, v as f32);
+                Ok(())
+            }));
+            match ui(run, Duration::from_secs(5)) {
+                Ok(()) => Reply::ok(status(core)),
+                Err(e) => conflict(e),
+            }
+        }
+        (_, true, ["live", "start"]) => live(core, r, false),
+        (_, true, ["live", "update"]) => live(core, r, true),
         (_, true, ["live", "stop"]) => {
             core::end_live(core);
             Reply::ok(status(core))
@@ -279,6 +305,18 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
                 Err(e) => conflict(e),
             }
         }
+        ["volume"] => {
+            let Some(v) = r.body.get("volume").and_then(|v| v.as_f64()).filter(|v| (0.0..=100.0).contains(v)) else {
+                return Reply::err(400, "\"volume\" is a percent, 0 to 100");
+            };
+            if watching.is_none() {
+                return Reply::err(404, "not watching this stream");
+            }
+            match core::set_stream_volume(core, id, v as f32 / 100.0) {
+                Ok(()) => ok(core),
+                Err(e) => conflict(e),
+            }
+        }
         ["quality"] => {
             let Some(q) = r.str("quality") else { return Reply::err(400, "\"quality\" is missing, e.g. \"720p30 4000\"") };
             if watching.is_none() {
@@ -304,18 +342,25 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
     }
 }
 
-/// The go-live dialog's choices, filled the way it fills them when not given.
-fn live_start(core: &Arc<Core>, r: &Request) -> Reply {
+/// Starts a stream (`update` false: missing fields as the go-live dialog fills them) or
+/// changes the running one (`update` true: missing fields stay as they are; viewers stay).
+fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     let snap = core::status(core);
     if !snap.connected {
         return conflict("not in a room".into());
     }
-    if snap.live.is_some() {
-        return conflict("already live; stop first".into());
+    let base = core::live_now(core);
+    match (&base, update) {
+        (Some(_), false) => return conflict("already live; use /live/update to change it, or stop first".into()),
+        (None, true) => return conflict("not live".into()),
+        _ => {}
     }
     let src = core::sources();
-    let kind = r.body.pointer("/source/kind").and_then(|v| v.as_str()).unwrap_or("monitor").to_string();
-    let id = r.body.pointer("/source/id").and_then(|v| v.as_u64());
+    let given_kind = r.body.pointer("/source/kind").and_then(|v| v.as_str()).map(String::from);
+    let given_id = r.body.pointer("/source/id").and_then(|v| v.as_u64());
+    // The source: given, else the running one, else the primary monitor.
+    let kind = given_kind.clone().or_else(|| base.as_ref().map(|b| b.kind.clone())).unwrap_or_else(|| "monitor".into());
+    let id = given_id.or_else(|| if given_kind.is_none() { base.as_ref().map(|b| b.id) } else { None });
     let (id, height, pid) = match kind.as_str() {
         "monitor" => {
             let m = match id {
@@ -334,49 +379,72 @@ fn live_start(core: &Arc<Core>, r: &Request) -> Reply {
     };
     let stream = settings().get("stream").cloned().unwrap_or_default();
     let pref = |k: &str| stream.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let codecs = core::codecs();
-    let order: Vec<String> = ["av1", "h265", "h264"].iter().filter(|c| codecs.iter().any(|h| h == *c)).map(|c| c.to_string()).collect();
-    let codec = match r.str("codec").or_else(|| Some(pref("codec")).filter(|c| !c.is_empty())) {
-        Some(c) if order.contains(&c) => c,
-        Some(c) if r.str("codec").is_some() => return Reply::err(400, format!("this computer cannot encode {c}; it can: {}", order.join(", "))),
-        _ => match order.first() {
-            Some(c) => c.clone(),
-            None => return conflict("no hardware video encoder found".into()),
-        },
+    let codec = match (&base, r.str("codec")) {
+        (Some(b), Some(c)) if Some(&c) != b.codec.as_ref() => return conflict("the codec cannot change while live; stop and start again".into()),
+        (Some(b), _) => b.codec.clone().unwrap_or_default(),
+        (None, given) => {
+            let codecs = core::codecs();
+            let order: Vec<String> = ["av1", "h265", "h264"].iter().filter(|c| codecs.iter().any(|h| h == *c)).map(|c| c.to_string()).collect();
+            match given.clone().or_else(|| Some(pref("codec")).filter(|c| !c.is_empty())) {
+                Some(c) if order.contains(&c) => c,
+                Some(c) if given.is_some() => return Reply::err(400, format!("this computer cannot encode {c}; it can: {}", order.join(", "))),
+                _ => match order.first() {
+                    Some(c) => c.clone(),
+                    None => return conflict("no hardware video encoder found".into()),
+                },
+            }
+        }
     };
-    let mode = match r.str("mode") {
-        Some(m) => m,
-        None => {
+    let mode = match (r.str("mode"), &base) {
+        (Some(m), _) => m,
+        (None, Some(b)) => b.mode.clone(),
+        (None, None) => {
             let res = Some(pref("res")).filter(|x| ["720", "1080", "1440"].contains(&x.as_str())).unwrap_or_else(|| if height >= 1440 { "1440" } else if height >= 1080 { "1080" } else { "720" }.into());
             let fps = Some(pref("fps")).filter(|x| ["30", "60"].contains(&x.as_str())).unwrap_or_else(|| "60".into());
             format!("{res}p{fps}")
         }
     };
-    if !["720p30", "720p60", "1080p30", "1080p60", "1440p30", "1440p60"].contains(&mode.as_str()) {
-        return Reply::err(400, "\"mode\" is one of 720p30, 720p60, 1080p30, 1080p60, 1440p30, 1440p60");
+    if !MODES.contains(&mode.as_str()) {
+        return Reply::err(400, format!("\"mode\" is one of {}", MODES.join(", ")));
     }
-    let kbit = match r.body.get("kbit").and_then(|v| v.as_u64()) {
-        Some(k) => k as u32,
-        None => pref("kbit").parse().ok().filter(|k| crate::room::PRESETS.contains(k)).unwrap_or(if codec == "av1" { 15000 } else { 20000 }),
+    let kbit = match (r.body.get("kbit").and_then(|v| v.as_u64()), &base) {
+        (Some(k), _) => k as u32,
+        (None, Some(b)) => b.kbit,
+        (None, None) => pref("kbit").parse().ok().filter(|k| crate::room::PRESETS.contains(k)).unwrap_or(if codec == "av1" { 15000 } else { 20000 }),
     };
     if !crate::room::PRESETS.contains(&kbit) {
         return Reply::err(400, format!("\"kbit\" is one of {:?}", crate::room::PRESETS));
     }
-    let audio = r.str("audio").unwrap_or_else(|| match pref("audio").as_str() {
-        "none" => "none".into(),
-        "system" => "system".into(),
-        _ if kind == "window" => "app".into(),
-        _ => "system".into(),
-    });
+    let audio = match (r.str("audio"), &base) {
+        (Some(a), _) => a,
+        // A running stream keeps its sound: a program's own sound follows a new window; a
+        // monitor has no program of its own, so it takes the whole system's.
+        (None, Some(b)) if b.audio == "app" && kind != "window" => "system".into(),
+        (None, Some(b)) => b.audio.clone(),
+        (None, None) => match pref("audio").as_str() {
+            "none" => "none".into(),
+            "system" => "system".into(),
+            _ if kind == "window" => "app".into(),
+            _ => "system".into(),
+        },
+    };
     if !["system", "app", "none"].contains(&audio.as_str()) || (audio == "app" && kind != "window") {
         return Reply::err(400, "\"audio\" is \"system\" or \"none\" (and \"app\" for a window)");
     }
+    if let Some(b) = &base {
+        if (b.audio == "none") != (audio == "none") {
+            return conflict("sound on or off cannot change while live; stop and start again".into());
+        }
+    }
     let req = GoLive { kind, id, audio, audio_pid: pid, audio_exclude: crate::dialogs::audio_exclude(), mode, kbit, codec: Some(codec) };
-    match core::go_live(core, req) {
+    let done = if update { core::update_live(core, req) } else { core::go_live(core, req) };
+    match done {
         Ok(()) => Reply::ok(status(core)),
         Err(e) => conflict(e),
     }
 }
+
+const MODES: [&str; 6] = ["720p30", "720p60", "1080p30", "1080p60", "1440p30", "1440p60"];
 
 fn sources() -> Value {
     let s = core::sources();
@@ -386,7 +454,7 @@ fn sources() -> Value {
         "monitors": s.monitors.iter().map(|m| json!({ "id": m.handle, "name": m.name.trim_start_matches(r"\\.\"), "width": m.width, "height": m.height, "primary": m.primary })).collect::<Vec<_>>(),
         "windows": s.windows.iter().map(|w| json!({ "id": w.hwnd, "title": w.title, "exe": w.exe, "pid": w.pid, "minimized": w.minimized, "width": w.width, "height": w.height })).collect::<Vec<_>>(),
         "codecs": codecs,
-        "modes": ["720p30", "720p60", "1080p30", "1080p60", "1440p30", "1440p60"],
+        "modes": MODES,
         "kbit_presets": crate::room::PRESETS,
     })
 }
@@ -443,6 +511,7 @@ fn status(core: &Arc<Core>) -> Value {
                     "speaking": v.speaking.contains(&p.id),
                     "mic_muted": in_voice && if p.me { v.mic_muted || v.deafened } else { v.muted.contains(&p.id) },
                     "deafened": in_voice && if p.me { v.deafened } else { v.deaf.contains(&p.id) },
+                    "volume": (!p.me && in_voice).then(|| (core::peer_volume(core, p.id) * 100.0).round()),
                 })
             }).collect::<Vec<_>>(),
         })
@@ -452,6 +521,7 @@ fn status(core: &Arc<Core>) -> Value {
         .iter()
         .map(|id| {
             let w = s.watches.iter().find(|w| w.streamer == *id);
+            let viewer = session.as_ref().and_then(|x| x.watching().into_iter().find(|x| x.streamer == *id));
             json!({
                 "streamer": id,
                 "name": name_of(*id),
@@ -461,13 +531,15 @@ fn status(core: &Arc<Core>) -> Value {
                 "latency_ms": w.map_or(0.0, |w| w.latency_ms),
                 "mbit": w.map_or(0.0, |w| w.mbit),
                 "loss_pct": w.map_or(0.0, |w| w.loss_pct),
-                "muted": session.as_ref().and_then(|x| x.watching().into_iter().find(|x| x.streamer == *id)).is_some_and(|x| x.viewer.muted()),
+                "muted": viewer.as_ref().is_some_and(|x| x.viewer.muted()),
+                "volume": viewer.as_ref().map_or(100.0, |x| (x.viewer.volume() * 100.0).round() as f64),
                 "fullscreen": w.is_some_and(|w| w.fullscreen),
                 "popped_out": w.is_some_and(|w| w.popped),
                 "window_closed": w.is_some_and(|w| w.window_closed),
             })
         })
         .collect();
+    let settings_now = core::live_now(core);
     let live = live_now.then(|| match &s.live {
         Some(l) => json!({
             "since_secs": l.since_secs,
@@ -493,7 +565,12 @@ fn status(core: &Arc<Core>) -> Value {
             "push_to_talk": v.ptt,
             "talking": v.talking,
         },
-        "live": live,
+        "live": live.map(|mut l| {
+            if let Some(g) = &settings_now {
+                l["settings"] = json!({ "source": { "kind": g.kind, "id": g.id }, "mode": g.mode, "kbit": g.kbit, "codec": g.codec, "audio": g.audio });
+            }
+            l
+        }),
         "watching": watching,
     })
 }

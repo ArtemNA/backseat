@@ -1427,6 +1427,37 @@ pub fn update_live(app: &App, req: GoLive) -> Result<(), String> {
     h.reconfigure(cfg).inspect_err(|e| eprintln!("update_live failed: {e}"))
 }
 
+/// The running stream's settings as a go-live request (None: not live), so a change can
+/// start from them.
+pub fn live_now(app: &App) -> Option<GoLive> {
+    let s = app.session.lock().unwrap().clone()?;
+    let c = s.host()?.cfg();
+    let (kind, id) = match c.source {
+        Source::Window { hwnd } => ("window", hwnd),
+        Source::Monitor { handle } => ("monitor", handle),
+        _ => ("monitor", 0),
+    };
+    let audio = if !c.audio { "none" } else if c.audio_pid.is_some() { "app" } else { "system" };
+    Some(GoLive {
+        kind: kind.into(),
+        id,
+        audio: audio.into(),
+        audio_pid: c.audio_pid,
+        audio_exclude: c.audio_exclude.clone(),
+        mode: format!("{}p{}", c.mode.height, c.mode.fps),
+        kbit: c.kbit,
+        codec: Some(c.codec.short().to_string()),
+    })
+}
+
+/// Sound level of one watched stream, 0..1.
+pub fn set_stream_volume(app: &App, streamer: u64, v: f32) -> Result<(), String> {
+    let s = app.session.lock().unwrap().clone().ok_or("not in a room")?;
+    let w = s.watching().into_iter().find(|w| w.streamer == streamer).ok_or("not watching this stream")?;
+    w.viewer.set_volume(v);
+    Ok(())
+}
+
 /// A watch we ended ourselves (Stop, closing its window, leaving the room) needs no notice;
 /// "the stream ended: stopped" showed after the viewer's own Stop.
 /// STREAMER_DEBUG_NOTIFY_OWN_STOP: the old way, the spoiled variant.

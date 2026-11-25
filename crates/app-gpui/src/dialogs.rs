@@ -101,6 +101,9 @@ pub enum SetTab {
     Watch,
     Voice,
     Updates,
+    /// Remote control (the local API): apart from the rest, so its token is not on screen
+    /// whenever the settings are open (on a stream, say).
+    Remote,
 }
 
 pub struct SettingsState {
@@ -115,6 +118,8 @@ pub struct SettingsState {
     pub threshold: Entity<gpui_kit::component::slider::SliderState>,
     /// Programs playing sound when the settings opened (to exclude from streams).
     sounding: Vec<String>,
+    /// The API token is shown (hidden behind dots until asked).
+    pub token_shown: bool,
 }
 
 #[derive(Default)]
@@ -797,7 +802,7 @@ impl Shell {
         let update = self.update.clone().or_else(|| self.dialogs.settings.as_ref().and_then(|s| s.update.clone()));
         let (threshold, sub) = self.threshold_slider(window, cx);
         subs.push(sub);
-        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold, sounding: core::sounding_programs() });
+        self.dialogs.settings = Some(SettingsState { tab, server, prefs, status: String::new(), update, scroll: ScrollHandle::new(), _subs: subs, threshold, sounding: core::sounding_programs(), token_shown: false });
         self.dialogs.open = Some(Open::Settings);
         eprintln!("settings: opened in {} ms", started.elapsed().as_millis());
         cx.notify();
@@ -873,10 +878,12 @@ impl Shell {
         cx.notify();
     }
 
-    /// The local API (API.md): on/off, the local network, the address and the token.
+    /// The local API (API.md): on/off, who may connect, the address and the token. The token
+    /// shows as dots until "Show" (the settings may be on a stream); Copy works either way.
     fn render_api_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let a = crate::api::load();
-        let mut col = div().flex().flex_col().gap_2().child(Checkbox::new("set-api").cursor_pointer().label(t("set.api")).checked(a.enabled).on_click(cx.listener(|_, v: &bool, _, cx| {
+        let shown = self.dialogs.settings.as_ref().is_some_and(|s| s.token_shown);
+        let mut col = div().flex().flex_col().gap_3().child(small(t("set.api_hint"))).child(Checkbox::new("set-api").cursor_pointer().label(t("set.api")).checked(a.enabled).on_click(cx.listener(|_, v: &bool, _, cx| {
             let mut a = crate::api::load();
             a.enabled = *v;
             if a.enabled && a.token.is_empty() {
@@ -887,40 +894,55 @@ impl Shell {
             cx.notify();
         })));
         if !a.enabled {
-            return col.child(small(t("set.api_hint"))).into_any_element();
+            return col.into_any_element();
         }
-        col = col.child(Checkbox::new("set-api-lan").cursor_pointer().label(t("set.api_lan")).checked(a.lan).on_click(cx.listener(|_, v: &bool, _, cx| {
-            let mut a = crate::api::load();
-            a.lan = *v;
-            crate::api::save(&a);
-            crate::api::apply();
-            cx.notify();
-        })));
+        col = col.child(
+            div().flex().flex_col().gap_1().child(Checkbox::new("set-api-lan").cursor_pointer().label(t("set.api_lan")).checked(a.lan).on_click(cx.listener(|_, v: &bool, _, cx| {
+                let mut a = crate::api::load();
+                a.lan = *v;
+                crate::api::save(&a);
+                crate::api::apply();
+                cx.notify();
+            }))).child(small(t(if a.lan { "set.api_lan_on" } else { "set.api_lan_off" }))),
+        );
         if let Some(e) = crate::api::last_error() {
             return col.child(banner(tf("set.api_failed", &[("e", &e)]), false)).into_any_element();
         }
         let address = crate::api::shown_address().unwrap_or_default();
         let token = a.token.clone();
         let mono = |text: String| div().px_2().py_1().rounded_md().bg(rgb(color::RAIL)).text_color(rgb(color::BRIGHT)).font_family("Consolas").text_sm().child(text);
-        col.child(div().flex().items_center().gap_2().child(small(t("set.api_address"))).child(mono(address)))
+        let field = |label: SharedString| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::MUTED)).child(label);
+        col.child(div().flex().flex_col().gap_1p5().child(field(tu("set.api_address"))).child(div().flex().child(mono(address))))
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(small(t("set.api_token")))
-                    .child(mono(token.clone()))
-                    .child(Button::new("set-api-copy").cursor_pointer().small().label(t("set.api_copy")).on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(token.clone()));
-                    })))
-                    .child(Button::new("set-api-new").cursor_pointer().small().label(t("set.api_new_token")).on_click(cx.listener(|_, _, _, cx| {
-                        let mut a = crate::api::load();
-                        a.token = crate::api::new_token();
-                        crate::api::save(&a);
-                        crate::api::apply();
-                        cx.notify();
-                    }))),
+                    .flex_col()
+                    .gap_1p5()
+                    .child(field(tu("set.api_token")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(mono(if shown { token.clone() } else { "•".repeat(32) }))
+                            .child(Button::new("set-api-show").cursor_pointer().small().label(t(if shown { "set.api_hide" } else { "set.api_show" })).on_click(cx.listener(|s, _, _, cx| {
+                                if let Some(st) = s.dialogs.settings.as_mut() {
+                                    st.token_shown = !st.token_shown;
+                                }
+                                cx.notify();
+                            })))
+                            .child(Button::new("set-api-copy").cursor_pointer().small().label(t("set.api_copy")).on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(token.clone()));
+                            })))
+                            .child(Button::new("set-api-new").cursor_pointer().small().label(t("set.api_new_token")).on_click(cx.listener(|_, _, _, cx| {
+                                let mut a = crate::api::load();
+                                a.token = crate::api::new_token();
+                                crate::api::save(&a);
+                                crate::api::apply();
+                                cx.notify();
+                            }))),
+                    ),
             )
             .child(small(t("set.api_warning")))
             .into_any_element()
@@ -976,7 +998,6 @@ impl Shell {
                     crate::autostart::sync();
                     cx.notify();
                 })))
-                .child(self.render_api_settings(cx))
                 .child(div().flex().flex_col().items_start().gap_1p5().child(Button::new("set-logs").cursor_pointer().label(t("set.open_logs")).on_click(cx.listener(|s, _, _, cx| {
                     if let Err(e) = core::open_logs() {
                         s.error = Some(e);
@@ -1137,6 +1158,7 @@ impl Shell {
                     .child(two(sounds_col.into_any_element(), echo_col.into_any_element()))
                     .into_any_element()
             }
+            SetTab::Remote => self.render_api_settings(cx),
             SetTab::Updates => div()
                 .flex()
                 .flex_col()
@@ -1176,7 +1198,7 @@ impl Shell {
                     .gap_4()
                     .px_6()
                     .pb_4()
-                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Voice, "tab-voice", t("set.voice"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)))
+                    .child(div().w(px(150.)).flex_none().flex().flex_col().gap_1().child(tab_button(SetTab::General, "tab-general", t("set.general"), cx)).child(tab_button(SetTab::Stream, "tab-stream", t("set.stream"), cx)).child(tab_button(SetTab::Watch, "tab-watch", t("set.watch"), cx)).child(tab_button(SetTab::Voice, "tab-voice", t("set.voice"), cx)).child(tab_button(SetTab::Updates, "tab-updates", t("set.updates"), cx)).child(tab_button(SetTab::Remote, "tab-remote", t("set.remote"), cx)))
                     .child(div().id("set-page").flex_1().min_w_0().overflow_y_scroll().track_scroll(&st.scroll).child(div().pb_2().pr_3().child(page)).vertical_scrollbar(&st.scroll)),
             )
             .child(div().px_6().py_4().flex().justify_end().bg(rgb(color::SIDE)).child(Button::new("set-close").cursor_pointer().primary().label(t("set.close")).on_click(cx.listener(|s, _, _, cx| s.close_dialog(cx)))))
@@ -1252,6 +1274,7 @@ pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
                 "watch" => SetTab::Watch,
                 "voice" | "voicetest" => SetTab::Voice,
                 "updates" => SetTab::Updates,
+                "remote" => SetTab::Remote,
                 _ => SetTab::General,
             };
             let test = tab_name == "voicetest";

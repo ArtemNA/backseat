@@ -2,7 +2,8 @@
 
 Backseat can be controlled by other programs over HTTP: a phone remote, a Stream Deck
 button, a script, an AI agent. They see your rooms, who is in them, voice and streams, and
-can open a room, join or leave voice, mute, start or stop a stream, and watch someone.
+can open a room, join or leave voice, mute, set someone's volume, start, change or stop a
+stream, and watch someone.
 
 The API is served by the Backseat app itself, on your computer. There is no cloud part.
 
@@ -12,14 +13,15 @@ The API is served by the Backseat app itself, on your computer. There is no clou
 
 ## Turning it on
 
-Settings → General → **Remote control (local API)**.
+Settings → **Remote control** (a tab of its own, so the token is not on screen whenever
+the settings are open, on a stream for example).
 
 | Option | Meaning |
 |---|---|
-| Remote control (local API) | Starts the API server. |
-| Other devices on my local network can connect | On: listens on all networks of this PC (`0.0.0.0`), so a phone on the same Wi-Fi can reach it. Off: this PC only (`127.0.0.1`). On by default. |
+| Turn on remote control (local API) | Starts the API server. |
+| Also from other devices on my network | Who can reach it. On (the default): this PC and other devices on your Wi-Fi or home network, a phone for example (listens on `0.0.0.0`). Off: only programs on this PC, such as scripts or the Stream Deck app (`127.0.0.1`); a phone cannot. |
 | Address | What to type into the other device, e.g. `http://192.168.1.20:47820`. |
-| Token | The secret every call needs. **Copy** puts it on the clipboard, **New token** makes a new one and the old one stops working at once. |
+| Token | The secret every call needs, shown as dots until **Show**. **Copy** puts it on the clipboard either way, **New token** makes a new one and the old one stops working at once. |
 
 The first time the API listens on the local network, Windows Firewall may ask whether
 Backseat may accept connections on private networks. Allow it for private networks, or the
@@ -100,13 +102,16 @@ e.g. 4–5 times a second, while the screen that shows it is open.
 | POST | `/api/v1/voice/join` | Join the open room's voice chat. |
 | POST | `/api/v1/voice/leave` | Leave voice. |
 | POST | `/api/v1/voice/mute` | Microphone off/on. |
+| POST | `/api/v1/voice/members/{id}/volume` | How loud member `id` is for you. |
 | POST | `/api/v1/voice/deafen` | Sound off/on. While deafened the microphone sends nothing, as in Discord. |
 | GET | `/api/v1/sources` | Monitors and windows to stream, codecs, modes, bitrates. |
 | POST | `/api/v1/live/start` | Start streaming in the open room. |
+| POST | `/api/v1/live/update` | Change the running stream: source, resolution, frame rate, bitrate. Viewers stay. |
 | POST | `/api/v1/live/stop` | Stop streaming. |
 | POST | `/api/v1/watch/{id}` | Watch the stream of member `id`. |
 | POST | `/api/v1/watch/{id}/stop` | Stop watching. |
 | POST | `/api/v1/watch/{id}/mute` | That stream's sound off/on. |
+| POST | `/api/v1/watch/{id}/volume` | That stream's volume. |
 | POST | `/api/v1/watch/{id}/quality` | Ask for a lower quality. |
 | POST | `/api/v1/watch/{id}/window` | Fullscreen, pop out, stats overlay of the video window. |
 
@@ -135,9 +140,11 @@ No token needed. Use it to check that the address is right.
     "me": 12,
     "members": [
       { "id": 12, "name": "Alex", "me": true, "streaming": true, "watching": false,
-        "in_voice": true, "speaking": false, "mic_muted": false, "deafened": false },
+        "in_voice": true, "speaking": false, "mic_muted": false, "deafened": false,
+        "volume": null },
       { "id": 15, "name": "Maria", "me": false, "streaming": false, "watching": false,
-        "in_voice": true, "speaking": true, "mic_muted": false, "deafened": false }
+        "in_voice": true, "speaking": true, "mic_muted": false, "deafened": false,
+        "volume": 100 }
     ]
   },
   "background_rooms": [],
@@ -146,6 +153,8 @@ No token needed. Use it to check that the address is right.
   "live": {
     "since_secs": 754, "quality": "1080p60 20000", "encoder": "AV1 · NVENC",
     "upload_mbit": 21.4,
+    "settings": { "source": { "kind": "monitor", "id": 65537 }, "mode": "1080p60",
+                  "kbit": 20000, "codec": "av1", "audio": "system" },
     "viewers": [ { "id": 15, "name": "Maria", "quality": "1080p60 20000",
                    "rtt_ms": 18.0, "loss_pct": 0.0, "problems": [] } ]
   },
@@ -167,12 +176,14 @@ No token needed. Use it to check that the address is right.
 | `members[].streaming` | They are live; you can watch them. |
 | `members[].watching` | You are watching them. |
 | `members[].in_voice`, `speaking`, `mic_muted`, `deafened` | Voice chat state. `speaking` is true while their sound is above the speaking threshold. |
+| `members[].volume` | How loud they are for you, percent (100: as they speak); `null` for you and for those not in voice. |
 | `background_rooms` | Codes of rooms kept connected in the background (you switched away while watching, streaming or in voice there). |
 | `voice.joined`, `voice.room` | You are in voice, and in which room's (it may be a background room). |
 | `voice.mic_muted`, `voice.deafened` | Your microphone and sound switches. They are kept between voice joins, so they are valid outside voice too. |
 | `voice.push_to_talk`, `voice.talking` | Push-to-talk is on; your microphone is sending right now. |
-| `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `problems` are short codes such as `loss:4.7` or `queue:1748`. |
-| `watching[]` | Streams you watch: `streamer` (member id), `name`, `quality` you asked for (`null`: as streamed), `codec`, `fps` received, `latency_ms`, `mbit`, `loss_pct`, `muted`, `fullscreen`, `popped_out` (in its own window), `window_closed`. |
+| `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `problems` are short codes such as `loss:4.7` or `queue:1748`. Right after the start the numbers are 0 and `viewers` empty for up to a second. |
+| `live.settings` | What it runs with, in the form `/live/start` takes. |
+| `watching[]` | Streams you watch: `streamer` (member id), `name`, `quality` you asked for (`null`: as streamed), `codec`, `fps` received, `latency_ms`, `mbit`, `loss_pct`, `muted`, `volume` (percent), `fullscreen`, `popped_out` (in its own window), `window_closed`. |
 
 Member lists come from the open room only; for a background room you only get its code.
 
@@ -228,6 +239,16 @@ ends them in background rooms. Leaving voice works wherever you are in voice.
 Without a body each call toggles. Both work outside voice too: they are what the next join
 starts with.
 
+### POST /api/v1/voice/members/{id}/volume
+
+```json
+{ "volume": 150 }
+```
+
+Percent, 0 to 200 (100: as they speak). Only for you; it is kept by their name, so it
+comes back next time, as the volume set from the app's voice list. The member must be in
+the open room and not you.
+
 ### GET /api/v1/sources
 
 What can be streamed and how.
@@ -272,13 +293,29 @@ app's "Go live" dialog chooses them (the settings' Stream tab first).
 | `audio` | `"system"` (the whole PC's sound), `"app"` (only the window's program), `"none"` | the settings', else `system` for a monitor and `app` for a window |
 
 The whole system's sound leaves out the programs listed in the settings (Discord by
-default). Already live: `409`; stop first. Changing a running stream in place is not in v1.
+default). Already live: `409`; use `/live/update`.
 
 The simplest call streams the primary monitor with the usual settings:
 
 ```
 POST /api/v1/live/start
 ```
+
+### POST /api/v1/live/update
+
+Changes the running stream in place: viewers keep watching. The body is as for
+`/live/start`; what is missing stays as it is (see `live.settings` in `/status`).
+
+```json
+{ "mode": "1440p60", "kbit": 35000 }
+{ "source": { "kind": "window", "id": 395274 } }
+```
+
+- A new source keeps the sound choice. With `"app"` (a program's sound) a new window brings
+  its own program's sound; a monitor takes the whole system's sound instead.
+- The codec, and sound on versus off, cannot change while live: `409`. Stop and start again.
+- Viewers who asked for less keep that, unless the new quality is lower still.
+- Not live: `409`.
 
 ### POST /api/v1/live/stop
 
@@ -302,6 +339,10 @@ else as streamed.
 ### POST /api/v1/watch/{id}/mute
 
 `{"muted": true}`, or no body to toggle. Only this stream's sound.
+
+### POST /api/v1/watch/{id}/volume
+
+`{"volume": 60}`: percent, 0 to 100, as the video's own volume slider.
 
 ### POST /api/v1/watch/{id}/quality
 
@@ -379,10 +420,11 @@ A Discord-like voice panel (current room, members, mute / deafen / leave, list o
    `mic_muted`, `deafened` draw their state.
 6. Go-live button → `POST /live/start` (or pick from `/sources` first); stop → `/live/stop`.
 7. A member with `streaming: true` → Watch → `POST /watch/{id}`.
+8. A volume slider per voice member → `POST /voice/members/{id}/volume`; per stream →
+   `POST /watch/{id}/volume`.
 
 ## Not in v1
 
 - Push events (WebSocket / SSE): poll `/status`.
-- Adding new rooms, invites, the direct connection (beta), changing a running stream,
-  settings, per-person voice volume.
+- Adding new rooms, invites, the direct connection (beta), the app's settings.
 - HTTPS.

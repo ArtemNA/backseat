@@ -4,7 +4,7 @@ Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`
 
 ## 0.2.26
 
-- **Remote control through a local API.** Turn it on in *Settings → General*: phones, a Stream Deck, scripts or AI agents on your computer or your home network can see your rooms, who is in them, voice and streams, and open a room, join or leave voice, mute or deafen, start or stop your stream, and watch someone. Every call needs a token shown in the settings; a new token cuts off the old one. Off by default. The calls are described in [API.md](API.md).
+- **Remote control through a local API.** Turn it on in *Settings → Remote control*: phones, a Stream Deck, scripts or AI agents on your computer or your home network can see your rooms, who is in them, voice and streams, and open a room, join or leave voice, mute or deafen, set a person's or a stream's volume, start, change or stop your stream, and watch someone. Every call needs a token; it shows as dots until you ask, so it does not leak on a stream, and a new token cuts off the old one. Off by default. The calls are described in [API.md](API.md).
 
 ## 0.2.25
 

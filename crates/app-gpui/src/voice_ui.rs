@@ -142,14 +142,14 @@ pub fn apply_settings(c: &std::sync::Arc<core::App>) {
 }
 
 /// Saved volumes, percent by member name.
-fn volumes() -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn volumes() -> serde_json::Map<String, serde_json::Value> {
     match settings().get("voiceVolumes") {
         Some(serde_json::Value::Object(m)) => m.clone(),
         _ => Default::default(),
     }
 }
 
-fn save_volume(name: &str, percent: f32) {
+pub(crate) fn save_volume(name: &str, percent: f32) {
     let mut m = volumes();
     if (percent - 100.0).abs() < 0.5 {
         m.remove(name);
