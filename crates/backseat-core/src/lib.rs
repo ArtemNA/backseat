@@ -1000,6 +1000,12 @@ pub fn connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Opti
 
 /// `title` names the room if it is new (a room made here, with its invite code as `room`).
 fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Option<&str>) -> Result<(), String> {
+    do_connect_unless(app, server, room, name, title, None)
+}
+
+/// `do_connect`; `cancel` set while joining (a rejoin, left meanwhile): the new place is left
+/// at once instead of becoming the open room.
+fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title: Option<&str>, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
     // One join at a time. Connect runs off the main thread, so an invite link arriving twice
     // (the page opens the app, and the user also presses its button) joined twice and left
     // both connections alive: the same person twice in the room.
@@ -1029,6 +1035,10 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
         step_away(app);
     }
     let (s, events) = Session::join_resuming(server, room, name, title, saved_places().remove(&key))?;
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+        s.leave();
+        return Err("left meanwhile".into());
+    }
     // Joined: only now the open room steps away (into the background, or closed).
     step_away(app);
     save_place(&key, s.resume());
@@ -1091,6 +1101,8 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
                             s.leave();
                         }
                     }
+                    // Cleared before `joined` is taken: a Leave from then on stops the rejoin.
+                    a.rejoin_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(k) = a.joined.lock().unwrap().take() {
                         save_place(&k, None);
                         if again {
@@ -1114,7 +1126,6 @@ fn rejoin(app: &Arc<App>, key: String) {
     let (Some(server), Some(room), Some(name)) = (parts.next(), parts.next(), parts.next()) else { return };
     let (server, room, name) = (server.to_string(), room.to_string(), name.to_string());
     let a = app.clone();
-    a.rejoin_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
     a.rejoining.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         let mut ok = false;
@@ -1130,10 +1141,14 @@ fn rejoin(app: &Arc<App>, key: String) {
                 a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
-            match do_connect(&a, &server, &room, &name, None) {
+            match do_connect_unless(&a, &server, &room, &name, None, Some(&a.rejoin_cancelled)) {
                 Ok(()) => {
                     eprintln!("rooms: rejoined {room} as a new member (attempt {attempt})");
                     ok = true;
+                    break;
+                }
+                Err(e) if e == "left meanwhile" => {
+                    eprintln!("rooms: left while rejoining {room}");
                     break;
                 }
                 Err(e) => eprintln!("rooms: rejoining {room}: {e}"),

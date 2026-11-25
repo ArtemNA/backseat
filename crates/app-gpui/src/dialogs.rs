@@ -227,6 +227,15 @@ fn set_audio_exclude(list: &[String]) {
     set_setting("audioExclude", serde_json::Value::Array(list.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
 }
 
+/// A source clicked in the go-live dialog. While changing a stream, another source lets the
+/// resolution follow it (unless the settings fix one), as at the start.
+fn pick_source(g: &mut GoLiveState, id: u64) {
+    if g.editing && g.pick != Some(id) && pref("stream", "res").is_empty() {
+        g.res_picked = false;
+    }
+    g.pick = Some(id);
+}
+
 fn small(t: impl Into<SharedString>) -> Div {
     div().text_xs().text_color(rgb(color::MUTED)).child(t.into())
 }
@@ -306,9 +315,10 @@ impl Shell {
                 _ => Audio::System,
             };
             g.live_audio_none = l.audio == "none";
-            // The codec and sound are fixed while live; the resolution follows a new source unless
-            // the settings fix it, as when the stream was started.
-            g.res_picked = !pref("stream", "res").is_empty();
+            // The running resolution stays as it is; picking another source lets it follow that
+            // source (unless the settings fix it), as at the start. The codec and sound are fixed
+            // while live. STREAMER_DEBUG_CHANGE_RES_FOLLOWS: it follows at once (the spoiled variant).
+            g.res_picked = std::env::var_os("STREAMER_DEBUG_CHANGE_RES_FOLLOWS").is_none() || !pref("stream", "res").is_empty();
             (g.codec_picked, g.audio_picked) = (true, true);
         }
         g.error = None;
@@ -339,12 +349,13 @@ impl Shell {
         let limit = upload_limit();
         g.limit.update(cx, |i, cx| i.set_value(if limit > 0.0 { format!("{limit}") } else { String::new() }, window, cx));
         g.sources = Some(core::sources());
-        if editing && std::env::var_os("STREAMER_APP_TEST_PEEK_CHANGE").is_some() {
-            eprintln!("test: change dialog shows {} {:?} {}p{} {} {} {}", if g.screen { "monitor" } else { "window" }, g.pick, g.res, g.fps, g.kbit, g.codec, g.audio.key());
-        }
         self.dialogs.golive = Some(g);
         self.dialogs.open = Some(Open::GoLive);
         self.golive_fixups();
+        // After the fix-ups: what the dialog shows.
+        if let Some(g) = self.dialogs.golive.as_ref().filter(|_| editing && std::env::var_os("STREAMER_APP_TEST_PEEK_CHANGE").is_some()) {
+            eprintln!("test: change dialog shows {} {:?} {}p{} {} {} {}", if g.screen { "monitor" } else { "window" }, g.pick, g.res, g.fps, g.kbit, g.codec, g.audio.key());
+        }
         if self.dialogs.golive.as_ref().is_some_and(|g| g.codecs.is_none()) {
             let task = cx.background_executor().spawn(async move { core::codecs() });
             cx.spawn(async move |this: WeakEntity<Shell>, cx: &mut AsyncApp| {
@@ -537,7 +548,7 @@ impl Shell {
                 .child(small(x.sub.clone()))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if let Some(g) = s.dialogs.golive.as_mut() {
-                        g.pick = Some(id);
+                        pick_source(g, id);
                     }
                     cx.notify();
                 }))
@@ -592,7 +603,7 @@ impl Shell {
                         )
                         .on_click(cx.listener(move |s, _, _, cx| {
                             if let Some(g) = s.dialogs.golive.as_mut() {
-                                g.pick = Some(id);
+                                pick_source(g, id);
                             }
                             cx.notify();
                         }))

@@ -439,8 +439,9 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     let given_id = field!(r.opt_u64("/source/id"));
     // The source: given, else the running one, else the primary monitor.
     let kind = given_kind.clone().or_else(|| base.as_ref().map(|b| b.kind.clone())).unwrap_or_else(|| "monitor".into());
-    let id = given_id.or_else(|| if given_kind.is_none() { base.as_ref().map(|b| b.id) } else { None });
-    let keep = base.as_ref().filter(|_| given_kind.is_none() && given_id.is_none());
+    // No id: the running one if the kind is the running one (an update), else the default.
+    let id = given_id.or_else(|| base.as_ref().filter(|b| given_kind.as_ref().is_none_or(|k| *k == b.kind)).map(|b| b.id));
+    let keep = base.as_ref().filter(|b| given_id.is_none() && given_kind.as_ref().is_none_or(|k| *k == b.kind));
     let (id, height, pid) = match kind.as_str() {
         // Not looked up again: a window gone from the list (hidden) must not fail a new bitrate.
         _ if keep.is_some() => {
@@ -481,7 +482,9 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
                 Some(c) if given.is_some() => return Reply::err(400, format!("this computer cannot encode {c}; it can: {}", order.join(", "))),
                 _ => match order.first() {
                     Some(c) => {
-                        codec_auto = true;
+                        // As the dialog: only when no codec is saved (a saved one it cannot use
+                        // is replaced, but counts as picked).
+                        codec_auto = pref("codec").is_empty();
                         c.clone()
                     }
                     None => return conflict("no hardware video encoder found".into()),

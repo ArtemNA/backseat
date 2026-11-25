@@ -298,7 +298,7 @@ app's "Go live" dialog chooses them (the settings' Stream tab first).
 | `source.kind` | `"monitor"`, `"window"` | `"monitor"` |
 | `source.id` | an id from `/sources` | the primary monitor (a window needs an id) |
 | `mode` | one of `modes` | the settings', else by the source's height (1440 / 1080 / 720), 60 fps |
-| `kbit` | one of `kbit_presets` | the settings', else 20000 (15000 when AV1 was picked because no codec was set) |
+| `kbit` | one of `kbit_presets` | the settings', else 20000; when no codec is given or saved and AV1 is picked, 20000 becomes 15000 |
 | `codec` | one of `codecs` | the settings', else the first of `codecs` |
 | `audio` | `"system"` (the whole PC's sound), `"app"` (only the window's program), `"none"` | the settings', else `system` for a monitor and `app` for a window |
 
@@ -323,6 +323,7 @@ Changes the running stream in place: viewers keep watching. The body is as for
 
 - Switching to `"audio": "app"` without `source` uses the streamed window's program; if
   that window is gone from `/sources`, `404`.
+- `source` with only `kind`, the running kind: the running source stays.
 - A new source keeps the sound choice. With `"app"` (a program's sound) a new window brings
   its own program's sound; a monitor takes the whole system's sound instead.
 - The codec, and sound on versus off, cannot change while live: `409`. Stop and start again.
