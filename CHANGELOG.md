@@ -5,6 +5,9 @@ Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`
 ## 0.2.26
 
 - **Remote control through a local API.** Turn it on in *Settings → Remote control*: phones, a Stream Deck, scripts or AI agents on your computer or your home network can see your rooms, who is in them, voice and streams, and open a room, join or leave voice, mute or deafen, set a person's or a stream's volume, start, change or stop your stream, and watch someone. Every call needs a token; it shows as dots until you ask, so it does not leak on a stream, and a new token cuts off the old one. Off by default. The calls are described in [API.md](API.md).
+- **Stop, then Watch the same stream at once** no longer ends the new watch a moment later.
+- **The Change dialog of a running stream** starts from what actually runs, and keeps its resolution until you pick another source.
+- **Leave while Backseat is joining a room again** after a lost connection now really leaves (it came back, or said "Lost the connection"), and that rejoin no longer pushes aside a room or a direct connection you opened meanwhile.
 
 ## 0.2.25
 
