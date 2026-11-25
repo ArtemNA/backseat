@@ -246,7 +246,8 @@ fn read_request(stream: &mut TcpStream) -> Result<Raw, Reply> {
         }
         buf.extend_from_slice(&chunk[..n]);
     };
-    let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| Reply::err(400, "bad request"))?;
+    // Lossy: one header with a Latin-1 byte (some clients' User-Agent) must not fail the call.
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let mut lines = head.split("\r\n");
     let mut first = lines.next().unwrap_or_default().split(' ');
     let (Some(method), Some(target)) = (first.next(), first.next()) else { return Err(Reply::err(400, "bad request line")) };
@@ -362,7 +363,9 @@ fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler, log: &Mutex
     let r = handler(&req);
     // Actions and errors only: a remote reads the state every second, which would fill the
     // log (it has a size cap) and push out everything else.
-    if req.method != "GET" || r.status != 200 {
+    // Volume sliders send many calls in a row: their successes are not logged either.
+    let quiet = req.path.last().is_some_and(|p| p == "volume");
+    if (req.method != "GET" && !quiet) || r.status != 200 {
         eprintln!("api: {} /{} -> {}", loggable(&req.method), loggable(&req.path.join("/")), r.status);
     }
     r
@@ -450,6 +453,8 @@ mod tests {
         assert_eq!(st, 200, "a lower-case scheme refused");
         let (st, _) = call(addr, &format!("POST /api/v1/rooms/x/open HTTP/1.1\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
         assert_eq!(st, 411, "a chunked body taken as none");
+        let (st, _) = call(addr, "OPTIONS /api/v1/status HTTP/1.1\r\nOrigin: http://example.test\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: authorization\r\n\r\n");
+        assert_eq!(st, 204, "a browser's preflight refused");
         let (st, _) = call(addr, "GET /other HTTP/1.1\r\n\r\n");
         assert_eq!(st, 404);
         run(None, h).unwrap();

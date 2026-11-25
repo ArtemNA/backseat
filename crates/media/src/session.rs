@@ -400,10 +400,7 @@ impl Session {
                 let end = |reason: &str| {
                     if let Some(s) = weak.upgrade() {
                         // Only this watch, never a newer one of the same streamer.
-                        let mine = s.state.lock().unwrap().watches.get(&w2.streamer).is_some_and(|x| Arc::ptr_eq(x, &w2));
-                        if mine || spoiled {
-                            s.end_watch(w2.streamer, reason, true);
-                        }
+                        s.end_watch_of(&w2, reason, spoiled);
                     }
                 };
                 // The video process crashed again and again: the watch ends, and says so.
@@ -436,8 +433,27 @@ impl Session {
         self.state.lock().unwrap().watches.values().cloned().collect()
     }
 
+    /// Ends `w` if it is still the watch of its streamer (checked and taken under one lock, so
+    /// a newer watch of the same streamer is never ended). `any`: whichever it is (the spoiled
+    /// variant of the gate).
+    fn end_watch_of(&self, w: &Arc<Watch>, reason: &str, any: bool) {
+        let taken = {
+            let mut st = self.state.lock().unwrap();
+            let mine = st.watches.get(&w.streamer).is_some_and(|x| Arc::ptr_eq(x, w));
+            if mine || any { st.watches.remove(&w.streamer) } else { None }
+        };
+        if let Some(w) = taken {
+            self.finish_watch(w, reason, true);
+        }
+    }
+
     fn end_watch(&self, streamer: PeerId, reason: &str, unsubscribe: bool) {
         let Some(w) = self.state.lock().unwrap().watches.remove(&streamer) else { return };
+        self.finish_watch(w, reason, unsubscribe);
+    }
+
+    fn finish_watch(&self, w: Arc<Watch>, reason: &str, unsubscribe: bool) {
+        let streamer = w.streamer;
         w.stop.store(true, Ordering::SeqCst);
         if unsubscribe {
             self.client.send(ClientMsg::Unsubscribe { streamer });

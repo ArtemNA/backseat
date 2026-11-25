@@ -1028,7 +1028,8 @@ fn do_connect(app: &Arc<App>, server: &str, room: &str, name: &str, title: Optio
     save_place(&key, s.resume());
     *app.joined.lock().unwrap() = Some(key);
     // Whatever got in meanwhile leaves.
-    if let Some(other) = app.session.lock().unwrap().replace(s.clone()) {
+    let other = app.session.lock().unwrap().replace(s.clone());
+    if let Some(other) = other {
         other.leave();
     }
     app.sampler.attach(s.clone());

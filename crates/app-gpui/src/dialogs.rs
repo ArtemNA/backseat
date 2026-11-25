@@ -935,7 +935,7 @@ impl Shell {
             }))).child(small(t(if a.lan { "set.api_lan_on" } else { "set.api_lan_off" }))),
         );
         if let Some(e) = crate::api::last_error() {
-            return col.child(banner(tf("set.api_failed", &[("e", &e)]), false)).into_any_element();
+            col = col.child(banner(tf("set.api_failed", &[("e", &e)]), false));
         }
         let address = crate::api::shown_address().unwrap_or_default();
         let token = a.token.clone();

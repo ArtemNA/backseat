@@ -83,11 +83,17 @@ pub fn save(s: &Settings) {
 }
 
 /// 128 random bits as 32 hex digits.
+/// Empty if the system's random source fails: then the API does not start (`apply`), rather
+/// than run with a known token.
 pub fn new_token() -> String {
     let mut b = [0u8; 16];
-    unsafe {
+    let ok = unsafe {
         use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
-        let _ = BCryptGenRandom(None, &mut b, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        BCryptGenRandom(None, &mut b, BCRYPT_USE_SYSTEM_PREFERRED_RNG).is_ok()
+    };
+    if !ok {
+        eprintln!("api: no random numbers for a token");
+        return String::new();
     }
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -196,7 +202,7 @@ fn ui(cmd: Cmd, wait: Duration) -> Result<(), String> {
         // Not started yet: it never will. Started: it finishes, but nobody waits.
         gave_up.store(true, Ordering::SeqCst);
     }
-    r.map_err(|_| "still running; check /status".to_string())?
+    r.map_err(|_| "the app did not finish in time (it may still do it, or it was busy); check /status".to_string())?
 }
 
 /// A core error as a reply: the call could not be done in this state.
@@ -205,6 +211,11 @@ fn conflict(e: String) -> Reply {
 }
 
 fn handle(core: &Arc<Core>, r: &Request) -> Reply {
+    // `[true]` or `5` is not "no body": every field would read as missing (a toggle, or the
+    // primary monitor streamed instead of the window asked for).
+    if !(r.body.is_null() || r.body.is_object()) {
+        return Reply::err(400, "the body must be a JSON object");
+    }
     let get = r.method == "GET";
     let post = r.method == "POST";
     let p: Vec<&str> = r.path.iter().map(String::as_str).collect();
@@ -236,7 +247,10 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
             Reply::ok(status(core))
         }
         (_, true, ["voice", "mute"]) => {
-            let on = field!(r.opt_bool("muted")).unwrap_or(!core::voice_view(core).mic_muted);
+            // As the app's button: deafened counts as muted, and turning the microphone on
+            // turns the sound on too.
+            let v = core::voice_view(core);
+            let on = field!(r.opt_bool("muted")).unwrap_or(!(v.mic_muted || v.deafened));
             if !spoiled() {
                 core::set_mic_muted(core, on);
             }
@@ -255,6 +269,10 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
                 return Reply::err(400, "\"volume\" is a percent, 0 to 200 (100: as they speak)");
             };
             let snap = core::status(core);
+            // Volumes act on the voice we are in; in another room's, these ids are not theirs.
+            if !snap.voice.joined {
+                return conflict(if snap.voice.elsewhere.is_some() { "your voice is in another room; open it first".into() } else { "not in voice".into() });
+            }
             let Some(p) = snap.peers.iter().find(|p| p.id == id && !p.me).cloned() else { return Reply::err(404, "no such member (not you) in the open room") };
             let c = core.clone();
             let run = Cmd::Run(Box::new(move |s| {
@@ -412,12 +430,21 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
         _ => {}
     }
     let src = core::sources();
+    if r.body.get("source").is_some_and(|v| !(v.is_null() || v.is_object())) {
+        return Reply::err(400, "\"source\" must be an object: {\"kind\": \"window\", \"id\": ...}");
+    }
     let given_kind = field!(r.opt_str("/source/kind"));
     let given_id = field!(r.opt_u64("/source/id"));
     // The source: given, else the running one, else the primary monitor.
     let kind = given_kind.clone().or_else(|| base.as_ref().map(|b| b.kind.clone())).unwrap_or_else(|| "monitor".into());
     let id = given_id.or_else(|| if given_kind.is_none() { base.as_ref().map(|b| b.id) } else { None });
+    let keep = base.as_ref().filter(|_| given_kind.is_none() && given_id.is_none());
     let (id, height, pid) = match kind.as_str() {
+        // Not looked up again: a window gone from the list (hidden) must not fail a new bitrate.
+        _ if keep.is_some() => {
+            let b = keep.unwrap();
+            (b.id, 0, b.audio_pid)
+        }
         "monitor" => {
             let m = match id {
                 Some(id) => src.monitors.iter().find(|m| m.handle == id),
@@ -587,7 +614,7 @@ fn status(core: &Arc<Core>) -> Value {
                     "speaking": v.speaking.contains(&p.id),
                     "mic_muted": in_voice && if p.me { v.mic_muted || v.deafened } else { v.muted.contains(&p.id) },
                     "deafened": in_voice && if p.me { v.deafened } else { v.deaf.contains(&p.id) },
-                    "volume": (!p.me && in_voice).then(|| (core::peer_volume(core, p.id) * 100.0).round()),
+                    "volume": (!p.me && in_voice && v.joined).then(|| (core::peer_volume(core, p.id) * 100.0).round()),
                 })
             }).collect::<Vec<_>>(),
         })

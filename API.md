@@ -47,7 +47,7 @@ GET /api/v1/status?token=3f6c0e...
 
 Prefer the header: a token in the address ends up in browser history and logs.
 
-A wrong or missing token gets `401` (after a short pause). Anyone who has the token can do
+A wrong or missing token gets `401`. Anyone who has the token can do
 everything below, including streaming your screen, so treat it like a password. The API
 has no TLS: on the local network the token travels in the clear, so use it on networks you
 trust (home Wi-Fi), not on public ones.
@@ -67,9 +67,12 @@ the API with `fetch` and the `Authorization` header.
 - Actions that take time (opening a room, joining voice, starting a stream, watching) answer
   when done: up to ~30 s for a room, usually under 2 s.
 - Path parts are URL-encoded: room codes may contain spaces (`Evening%20games`).
+- The body is a JSON object; `[...]`, a number or a string gets `400`, as does a field of
+  the wrong type.
 - People are identified by `id` (a number, from `room.members`). Ids belong to the
   connection: they change when someone (or you) joins the room again.
-- The app's own window stays in step: what the API does shows there as if clicked.
+- The app's own window stays in step: what the API does shows there as if clicked. (A
+  stream's quality picker that the user has already touched keeps the user's pick on screen.)
 
 Status codes:
 
@@ -78,9 +81,9 @@ Status codes:
 | 200 | Done. |
 | 400 | Bad input (unknown mode, bad JSON, missing field, a field of the wrong type). |
 | 401 | Wrong or missing token. |
-| 404 | Unknown path, room, streamer, monitor or window. |
+| 404 | Unknown path, room, member, streamer, monitor or window. |
 | 405 | Method other than GET, POST, OPTIONS. |
-| 409 | Not possible now (not in a room, already live, a join is running, the join failed, "still running; check /status" after a timeout). |
+| 409 | Not possible now (not in a room, your voice is in another room, no video window, already live, a join is running, the join failed, "still running; check /status" after a timeout). |
 | 408 | The request did not arrive whole within 5 s. |
 | 411 | A chunked body: send `Content-Length`. |
 | 413, 431 | Body over 64 KB, headers over 16 KB. |
@@ -184,7 +187,7 @@ No token needed. Use it to check that the address is right.
 | `voice.joined`, `voice.room` | You are in voice, and in which room's (it may be a background room). |
 | `voice.mic_muted`, `voice.deafened` | Your microphone and sound switches. They are kept between voice joins, so they are valid outside voice too. |
 | `voice.push_to_talk`, `voice.talking` | Push-to-talk is on; your microphone is sending right now. |
-| `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `problems` are short codes such as `loss:4.7` or `queue:1748`. Right after the start the numbers are 0 and `viewers` empty for up to a second. |
+| `live` | Your own stream, `null` when not live. `quality` is "`mode` `kbit`". `viewers[].problems` are short codes such as `loss:4.7` or `queue:1748`. Right after the start the numbers are 0 and `viewers` empty for up to a second. |
 | `live.settings` | What it runs with, in the form `/live/start` takes. |
 | `watching[]` | Streams you watch: `streamer` (member id), `name`, `quality` you asked for (`null`: as streamed), `codec`, `fps` received, `latency_ms`, `mbit`, `loss_pct`, `muted`, `volume` (percent), `fullscreen`, `popped_out` (in its own window), `window_closed`. |
 
@@ -239,7 +242,8 @@ ends them in background rooms. Leaving voice works wherever you are in voice.
 { "deafened": false }
 ```
 
-Without a body each call toggles. Both work outside voice too: they are what the next join
+Without a body each call toggles, as the app's buttons do: while deafened the microphone
+counts as off, and turning it on turns the sound on too. Both work outside voice too: they are what the next join
 starts with.
 
 ### POST /api/v1/voice/members/{id}/volume
@@ -249,8 +253,9 @@ starts with.
 ```
 
 Percent, 0 to 200 (100: as they speak). Only for you; it is kept by their name, so it
-comes back next time, as the volume set from the app's voice list. The member must be in
-the open room and not you.
+comes back next time, as the volume set from the app's voice list. You must be in voice in
+the open room (else `409`), and the member in that room and not you. Each call is saved:
+send it when a slider is let go, not on every move.
 
 ### GET /api/v1/sources
 
@@ -345,7 +350,8 @@ else as streamed.
 
 ### POST /api/v1/watch/{id}/volume
 
-`{"volume": 60}`: percent, 0 to 100, as the video's own volume slider.
+`{"volume": 60}`: percent, 0 to 100, as the video's own volume slider. As above, send it
+when a slider is let go.
 
 ### POST /api/v1/watch/{id}/quality
 
