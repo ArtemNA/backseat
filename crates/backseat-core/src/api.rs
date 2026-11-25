@@ -360,13 +360,29 @@ fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler, log: &Mutex
         }
     };
     let req = Request { method: raw.method, path: parts, query, body };
-    let r = handler(&req);
+    // A bug in a call must not take the connection's thread down with a poisoned lock half
+    // way; it answers 500.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&req))).unwrap_or_else(|_| Reply::err(500, "internal error"));
     // Actions and errors only: a remote reads the state every second, which would fill the
     // log (it has a size cap) and push out everything else.
     // Volume sliders send many calls in a row: their successes are not logged either.
     let quiet = req.path.last().is_some_and(|p| p == "volume");
     if (req.method != "GET" && !quiet) || r.status != 200 {
-        eprintln!("api: {} /{} -> {}", loggable(&req.method), loggable(&req.path.join("/")), r.status);
+        let line = format!("api: {} /{} -> {}", loggable(&req.method), loggable(&req.path.join("/")), r.status);
+        // The same failure over and over (a remote polling a gone stream): once per 30 s.
+        static LAST: Mutex<Option<(String, std::time::Instant, u64)>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match last.as_mut() {
+            Some((l, at, n)) if r.status != 200 && *l == line && at.elapsed() < REFUSED_LOG_EVERY => *n += 1,
+            _ => {
+                let again = last.as_ref().map_or(0, |x| x.2);
+                if again > 0 {
+                    eprintln!("api: (the line before came {again} more times)");
+                }
+                eprintln!("{line}");
+                *last = Some((line, std::time::Instant::now(), 0));
+            }
+        }
     }
     r
 }
@@ -384,6 +400,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Error",

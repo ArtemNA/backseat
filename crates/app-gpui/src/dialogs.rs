@@ -80,8 +80,10 @@ pub struct GoLiveState {
     pub editing: bool,
     /// The running stream has no sound (it stays so while live).
     live_audio_none: bool,
-    /// The running stream's source, while changing it.
-    live_pick: Option<u64>,
+    /// The running stream's source (screen tab, id), while changing it.
+    live_pick: Option<(bool, u64)>,
+    /// A resolution clicked in this dialog: a new source does not change it.
+    res_hand: bool,
     pub error: Option<String>,
     pub busy: bool,
     limit: Entity<InputState>,
@@ -239,7 +241,12 @@ fn pick_source(g: &mut GoLiveState, id: u64) {
 /// While changing a stream: a source other than the running one (clicked, or picked by the
 /// dialog after a tab switch) lets the resolution follow it, unless the settings fix one.
 fn follow_new_source(g: &mut GoLiveState) {
-    if g.editing && g.pick.is_some() && g.pick != g.live_pick && pref("stream", "res").is_empty() {
+    // STREAMER_DEBUG_CHANGE_NO_FOLLOW: never (the spoiled variant).
+    if std::env::var_os("STREAMER_DEBUG_CHANGE_NO_FOLLOW").is_some() {
+        return;
+    }
+    let other = g.pick.is_some_and(|p| Some((g.screen, p)) != g.live_pick);
+    if g.editing && other && !g.res_hand && pref("stream", "res").is_empty() {
         g.res_picked = false;
     }
 }
@@ -284,6 +291,7 @@ impl Shell {
             editing: false,
             live_audio_none: false,
             live_pick: None,
+            res_hand: false,
             error: None,
             busy: false,
             limit: cx.new(|cx| InputState::new(window, cx).placeholder(t("unit.mbit"))),
@@ -300,13 +308,14 @@ impl Shell {
             self.subs.push(sub);
         }
         g.editing = editing;
+        g.res_hand = false;
         // Changing: start from what runs now. It may have been started or changed through the
         // API, and the dialog's last state would undo that (or offer another codec).
         // STREAMER_DEBUG_CHANGE_FROM_DIALOG: the dialog's last state, the spoiled variant.
         if let Some(l) = core::live_now(&self.core).filter(|_| editing && std::env::var_os("STREAMER_DEBUG_CHANGE_FROM_DIALOG").is_none()) {
             g.screen = l.kind != "window";
             g.pick = Some(l.id);
-            g.live_pick = Some(l.id);
+            g.live_pick = Some((g.screen, l.id));
             if let Some((r, f)) = l.mode.split_once('p') {
                 if let Some(r) = ["720", "1080", "1440"].into_iter().find(|x| *x == r) {
                     g.res = r;
@@ -650,6 +659,7 @@ impl Shell {
                 if let Some(g) = s.dialogs.golive.as_mut() {
                     g.res = r;
                     g.res_picked = true;
+                    g.res_hand = true;
                 }
                 cx.notify();
             }))
@@ -1313,6 +1323,17 @@ pub fn test_peek_change(window: &mut Window, cx: &mut Context<Shell>) {
                     last = now.clone();
                     if !now.is_empty() {
                         s.open_golive(true, window, cx);
+                        // Then a window of another height, picked as a click does.
+                        if let Some(g) = s.dialogs.golive.as_mut() {
+                            g.screen = false;
+                            if let Some(w) = g.sources.as_ref().and_then(|x| x.windows.first()).map(|w| w.hwnd) {
+                                pick_source(g, w);
+                            }
+                        }
+                        s.golive_fixups();
+                        if let Some(g) = s.dialogs.golive.as_ref() {
+                            eprintln!("test: change dialog, another window: {}p{}", g.res, g.fps);
+                        }
                         s.close_dialog(cx);
                     }
                 }

@@ -1014,11 +1014,20 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
     // A rejoin that waited here while another room was opened (or after a Leave) has nothing
     // to do: it would push that room aside.
     let given_up = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
-    if cancel.is_some() && (given_up() || app.session.lock().unwrap().is_some() || app.joined.lock().unwrap().is_some()) {
+    // Each lock alone (a `||` or `&&` keeps the first operand's guard while it takes the
+    // second: two places taking them in the other order could wait on each other for ever).
+    let busy = || {
+        let open = app.session.lock().unwrap().is_some();
+        let joined = app.joined.lock().unwrap().is_some();
+        let direct = app.direct.lock().unwrap().is_some();
+        open || joined || direct
+    };
+    if cancel.is_some() && (given_up() || busy()) {
         return Err("left meanwhile".into());
     }
     let key = resume_key(server, room, name);
-    if app.joined.lock().unwrap().as_deref() == Some(key.as_str()) && app.session.lock().unwrap().is_some() {
+    let same = app.joined.lock().unwrap().as_deref() == Some(key.as_str());
+    if same && app.session.lock().unwrap().is_some() {
         return Ok(());
     }
     // A room kept in the background opens again as it is: no new join.
@@ -1047,7 +1056,9 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
         eprintln!("rooms: (test) the rejoin's join takes {ms} ms more");
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
-    if given_up() {
+    // A rejoin has nothing to step away from: anything open now (another room, a direct
+    // connection) came meanwhile and stays.
+    if given_up() || (cancel.is_some() && busy()) {
         s.leave();
         return Err("left meanwhile".into());
     }
@@ -1058,7 +1069,7 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
     // lock, so it either is seen here or finds this room installed and leaves it.
     let other = {
         let mut open = app.session.lock().unwrap();
-        if given_up() {
+        if given_up() || (cancel.is_some() && open.is_some()) {
             drop(open);
             s.leave();
             save_place(&key, None);
@@ -1118,17 +1129,19 @@ fn do_connect_unless(app: &Arc<App>, server: &str, room: &str, name: &str, title
                     // pipelines played crashed the app (0xC0000005) when the hosting's TLS
                     // connection broke during a stream. STREAMER_DEBUG_DROP_ON_LOST keeps
                     // the old drop, the spoiled variant for the gate.
+                    // Cleared before anything is taken: a Leave from then on stops the rejoin.
+                    a.rejoin_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
                     let s = a.session.lock().unwrap().take();
+                    // Not there: a Leave took it just now; no rejoin then.
+                    let ours = s.is_some();
                     if let Some(s) = s {
                         if std::env::var_os("STREAMER_DEBUG_DROP_ON_LOST").is_none() {
                             s.leave();
                         }
                     }
-                    // Cleared before `joined` is taken: a Leave from then on stops the rejoin.
-                    a.rejoin_cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(k) = a.joined.lock().unwrap().take() {
                         save_place(&k, None);
-                        if again {
+                        if again && ours {
                             rejoin(&a, k);
                         }
                     }
@@ -1154,7 +1167,9 @@ fn rejoin(app: &Arc<App>, key: String) {
         let mut ok = false;
         for attempt in 1..=30 {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            if a.session.lock().unwrap().is_some() || a.joined.lock().unwrap().is_some() {
+            let open = a.session.lock().unwrap().is_some();
+            let joined = a.joined.lock().unwrap().is_some();
+            if open || joined {
                 eprintln!("rooms: another room was opened; not rejoining {room}");
                 a.rejoining.store(false, std::sync::atomic::Ordering::SeqCst);
                 return;

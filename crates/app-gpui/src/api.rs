@@ -190,13 +190,19 @@ fn pump(s: &mut Shell, cx: &mut Context<Shell>) {
 fn ui(cmd: Cmd, wait: Duration) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let gave_up = Arc::new(AtomicBool::new(false));
-    QUEUE.lock().unwrap().push((
+    let mut q = QUEUE.lock().unwrap();
+    q.retain(|(_, _, g)| !g.load(Ordering::SeqCst));
+    if q.len() >= 64 {
+        return Err("the app is busy; try again".into());
+    }
+    q.push((
         cmd,
         Box::new(move |r| {
             let _ = tx.send(r);
         }),
         gave_up.clone(),
     ));
+    drop(q);
     let r = rx.recv_timeout(wait);
     if r.is_err() {
         // Not started yet: it never will. Started: it finishes, but nobody waits.
@@ -352,9 +358,9 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
             }
             // Already watched: only the quality, if one is asked for.
             if watching.is_some() {
-                if let Some(q) = &q {
+                if let Some(q) = q.as_ref().filter(|_| !spoiled()) {
                     if let Err(e) = core::set_quality(core, id, q) {
-                        return conflict(e);
+                        return Reply::err(400, e);
                     }
                 }
                 return ok(core);
@@ -501,7 +507,7 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
             }
         }
     };
-    let mode = match (field!(r.opt_str("mode")), &base) {
+    let mode = match (field!(r.opt_str("mode")).map(|m| m.to_ascii_lowercase()), &base) {
         (Some(m), _) => m,
         (None, Some(b)) => b.mode.clone(),
         (None, None) => {
@@ -529,7 +535,7 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     if !crate::room::PRESETS.contains(&kbit) {
         return Reply::err(400, format!("\"kbit\" is one of {:?}", crate::room::PRESETS));
     }
-    let audio = match (field!(r.opt_str("audio")), &base) {
+    let audio = match (field!(r.opt_str("audio")).map(|a| a.to_ascii_lowercase()), &base) {
         (Some(a), _) => a,
         // A running stream keeps its sound: a program's own sound follows a new window; a
         // monitor has no program of its own, so it takes the whole system's.
