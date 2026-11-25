@@ -45,12 +45,25 @@ impl Request {
     pub fn path_is(&self, p: &[&str]) -> bool {
         self.path.len() == p.len() && self.path.iter().zip(p).all(|(a, b)| b.is_empty() || a == b)
     }
-    /// A bool from the body (`{"muted": true}`), None when missing.
-    pub fn bool(&self, key: &str) -> Option<bool> {
-        self.body.get(key).and_then(|v| v.as_bool())
+    /// A field of the body by name (`"muted"`) or JSON pointer (`"/source/id"`); missing and
+    /// null are None.
+    fn field(&self, key: &str) -> Option<&Value> {
+        let v = if key.starts_with('/') { self.body.pointer(key) } else { self.body.get(key) };
+        v.filter(|v| !v.is_null())
     }
-    pub fn str(&self, key: &str) -> Option<String> {
-        self.body.get(key).and_then(|v| v.as_str()).map(String::from)
+    /// A field that must be a bool when given: `{"muted": "true"}` is an error, not a toggle.
+    pub fn opt_bool(&self, key: &str) -> Result<Option<bool>, String> {
+        self.field(key).map(|v| v.as_bool().ok_or(format!("\"{}\" must be true or false", key.trim_start_matches('/')))).transpose()
+    }
+    pub fn opt_str(&self, key: &str) -> Result<Option<String>, String> {
+        self.field(key).map(|v| v.as_str().map(String::from).ok_or(format!("\"{}\" must be a string", key.trim_start_matches('/')))).transpose()
+    }
+    /// A whole number, 0 or more.
+    pub fn opt_u64(&self, key: &str) -> Result<Option<u64>, String> {
+        self.field(key).map(|v| v.as_u64().ok_or(format!("\"{}\" must be a whole number, 0 or more", key.trim_start_matches('/')))).transpose()
+    }
+    pub fn opt_f64(&self, key: &str) -> Result<Option<f64>, String> {
+        self.field(key).map(|v| v.as_f64().ok_or(format!("\"{}\" must be a number", key.trim_start_matches('/')))).transpose()
     }
 }
 
@@ -135,6 +148,7 @@ pub fn lan_address() -> Option<IpAddr> {
 fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, token: String, handler: Arc<Handler>) {
     let active = Arc::new(AtomicUsize::new(0));
     let token = Arc::new(token);
+    let log = Arc::new(Mutex::new(Refused::default()));
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -142,12 +156,13 @@ fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, token: String, hand
                     let _ = write_reply(&stream, &Reply::err(503, "too many connections"));
                     continue;
                 }
-                active.fetch_add(1, Ordering::SeqCst);
-                let (active, token, handler) = (active.clone(), token.clone(), handler.clone());
+                let slot = Slot::take(&active);
+                let (token, handler, log) = (token.clone(), handler.clone(), log.clone());
                 let spawned = std::thread::Builder::new().name("api-conn".into()).spawn(move || {
-                    serve(stream, peer, &token, &*handler);
-                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _slot = slot;
+                    serve(stream, peer, &token, &*handler, &log);
                 });
+                // A thread that never started dropped its closure, and the slot with it.
                 if spawned.is_err() {
                     eprintln!("api: cannot start a connection thread");
                 }
@@ -161,6 +176,38 @@ fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, token: String, hand
     }
 }
 
+/// One of the `MAX_CONNECTIONS` places, given back when dropped (also when its thread panics).
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(active: &Arc<AtomicUsize>) -> Slot {
+        active.fetch_add(1, Ordering::SeqCst);
+        Slot(active.clone())
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Calls refused for the token, logged at most once in `REFUSED_LOG_EVERY` with a count, so
+/// a device knocking with a wrong token does not fill the log (it has a size cap).
+#[derive(Default)]
+struct Refused {
+    last: Option<std::time::Instant>,
+    since: u64,
+}
+
+const REFUSED_LOG_EVERY: Duration = Duration::from_secs(30);
+
+/// Text from a request made safe for one log line: no line breaks or other control
+/// characters, at most 120 characters.
+fn loggable(s: &str) -> String {
+    s.chars().take(120).map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
 /// A parsed request line and headers, plus the body.
 struct Raw {
     method: String,
@@ -169,7 +216,21 @@ struct Raw {
     body: Vec<u8>,
 }
 
+/// Reads up to `chunk.len()` bytes before `deadline`: one slow client must not keep a
+/// place for longer than that by sending a byte now and then.
+fn read_some(stream: &mut TcpStream, chunk: &mut [u8], deadline: std::time::Instant) -> Result<usize, Reply> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Err(Reply::err(408, "timeout"));
+    }
+    let _ = stream.set_read_timeout(Some(left));
+    stream.read(chunk).map_err(|_| Reply::err(408, "timeout"))
+}
+
+const READ_DEADLINE: Duration = Duration::from_secs(5);
+
 fn read_request(stream: &mut TcpStream) -> Result<Raw, Reply> {
+    let deadline = std::time::Instant::now() + READ_DEADLINE;
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -179,7 +240,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Raw, Reply> {
         if buf.len() > MAX_HEAD {
             return Err(Reply::err(431, "headers too large"));
         }
-        let n = stream.read(&mut chunk).map_err(|_| Reply::err(408, "timeout"))?;
+        let n = read_some(stream, &mut chunk, deadline)?;
         if n == 0 {
             return Err(Reply::err(400, "incomplete request"));
         }
@@ -195,6 +256,10 @@ fn read_request(stream: &mut TcpStream) -> Result<Raw, Reply> {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
+    // A chunked body would be read as none: `{"muted": true}` would toggle instead of set.
+    if headers.contains_key("transfer-encoding") {
+        return Err(Reply::err(411, "send the body with Content-Length (chunked bodies are not supported)"));
+    }
     let len: usize = match headers.get("content-length") {
         Some(v) => v.parse().map_err(|_| Reply::err(400, "bad content-length"))?,
         None => 0,
@@ -203,8 +268,12 @@ fn read_request(stream: &mut TcpStream) -> Result<Raw, Reply> {
         return Err(Reply::err(413, "body too large"));
     }
     let mut body = buf[head_end + 4..].to_vec();
+    // curl and others wait for this before sending a larger body.
+    if body.len() < len && headers.get("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
     while body.len() < len {
-        let n = stream.read(&mut chunk).map_err(|_| Reply::err(408, "timeout"))?;
+        let n = read_some(stream, &mut chunk, deadline)?;
         if n == 0 {
             return Err(Reply::err(400, "incomplete body"));
         }
@@ -243,18 +312,17 @@ fn same_secret(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn serve(mut stream: TcpStream, peer: SocketAddr, token: &str, handler: &Handler) {
+fn serve(mut stream: TcpStream, peer: SocketAddr, token: &str, handler: &Handler, log: &Mutex<Refused>) {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let reply = match read_request(&mut stream) {
-        Ok(raw) => route(raw, peer, token, handler),
+        Ok(raw) => route(raw, peer, token, handler, log),
         Err(r) => r,
     };
     let _ = write_reply(&stream, &reply);
 }
 
-fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler) -> Reply {
+fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler, log: &Mutex<Refused>) -> Reply {
     if raw.method == "OPTIONS" {
         return Reply { status: 204, body: Value::Null };
     }
@@ -268,11 +336,17 @@ fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler) -> Reply {
     // The one call without the token: what this is and which API it speaks.
     let public = raw.method == "GET" && (parts.is_empty() || parts == ["info"]);
     if !public {
-        let given = raw.headers.get("authorization").and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))).map(str::trim).map(String::from).or_else(|| query.get("token").cloned());
+        // The scheme's name is case-insensitive (RFC 9110).
+        let bearer = |v: &String| v.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, t)| t.trim().to_string());
+        let given = raw.headers.get("authorization").and_then(bearer).or_else(|| query.get("token").cloned());
         if !given.is_some_and(|g| same_secret(&g, token)) {
-            eprintln!("api: {} {} from {}: wrong or missing token", raw.method, path, peer.ip());
-            // Slows down guessing (the token is 128 bits anyway).
-            std::thread::sleep(Duration::from_millis(300));
+            // No pause: it would only keep a connection place busy, and 128 bits are not guessed.
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            l.since += 1;
+            if l.last.is_none_or(|t| t.elapsed() >= REFUSED_LOG_EVERY) {
+                eprintln!("api: {} {} from {}: wrong or missing token ({} refused since the last such line)", loggable(&raw.method), loggable(path), peer.ip(), l.since);
+                *l = Refused { last: Some(std::time::Instant::now()), since: 0 };
+            }
             return Reply::err(401, "wrong or missing token");
         }
     }
@@ -286,7 +360,11 @@ fn route(raw: Raw, peer: SocketAddr, token: &str, handler: &Handler) -> Reply {
     };
     let req = Request { method: raw.method, path: parts, query, body };
     let r = handler(&req);
-    eprintln!("api: {} /{} -> {}", req.method, req.path.join("/"), r.status);
+    // Actions and errors only: a remote reads the state every second, which would fill the
+    // log (it has a size cap) and push out everything else.
+    if req.method != "GET" || r.status != 200 {
+        eprintln!("api: {} /{} -> {}", loggable(&req.method), loggable(&req.path.join("/")), r.status);
+    }
     r
 }
 
@@ -299,6 +377,7 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        411 => "Length Required",
         409 => "Conflict",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -346,7 +425,7 @@ mod tests {
                 return Reply::ok(json!({ "app": "test" }));
             }
             if r.method == "POST" && r.path_is(&["rooms", "", "open"]) {
-                return Reply::ok(json!({ "room": r.path[1], "muted": r.bool("muted") }));
+                return Reply::ok(json!({ "room": r.path[1], "muted": r.opt_bool("muted").unwrap() }));
             }
             Reply::err(404, "unknown")
         });
@@ -367,10 +446,37 @@ mod tests {
         assert_eq!(st, 404);
         let (st, _) = call(addr, &format!("POST /api/v1/rooms/x/open?token={token} HTTP/1.1\r\nContent-Length: 2\r\n\r\n{{x"));
         assert_eq!(st, 400, "bad JSON accepted");
+        let (st, _) = call(addr, &format!("POST /api/v1/rooms/x/open HTTP/1.1\r\nauthorization: bearer {token}\r\n\r\n"));
+        assert_eq!(st, 200, "a lower-case scheme refused");
+        let (st, _) = call(addr, &format!("POST /api/v1/rooms/x/open HTTP/1.1\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+        assert_eq!(st, 411, "a chunked body taken as none");
         let (st, _) = call(addr, "GET /other HTTP/1.1\r\n\r\n");
         assert_eq!(st, 404);
         run(None, h).unwrap();
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err(), "still listening after stop");
+    }
+
+    /// A client sending a byte now and then is cut off at the deadline, not kept for minutes.
+    #[test]
+    fn a_slow_request_ends_at_the_deadline() {
+        let h: Arc<Handler> = Arc::new(|_: &Request| Reply::ok(Value::Null));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (s, peer) = l.accept().unwrap();
+            let t0 = std::time::Instant::now();
+            serve(s, peer, "0123456789abcdef0123456789abcdef", &*h, &Mutex::new(Refused::default()));
+            t0.elapsed()
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        for _ in 0..8 {
+            if c.write_all(b"G").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        let took = t.join().unwrap();
+        assert!(took < Duration::from_millis(6500), "a slow client kept the connection {took:?}");
     }
 
     #[test]
@@ -381,5 +487,6 @@ mod tests {
         assert_eq!(percent_decode("100%", false), "100%");
         assert_eq!(percent_decode("a+b", false), "a+b");
         assert_eq!(percent_decode("a+b", true), "a b");
+        assert_eq!(loggable("a\nb\rc"), "a?b?c");
     }
 }

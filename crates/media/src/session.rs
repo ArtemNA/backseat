@@ -390,17 +390,29 @@ impl Session {
             while !w2.stop.load(Ordering::SeqCst) {
                 w2.link.send("ping", &w2.clock.local_ns().to_string());
                 std::thread::sleep(Duration::from_millis(200));
+                // Ended meanwhile (Stop closes its window): not "window closed" now. A new watch
+                // of the same streamer, started within these 200 ms, was ended by this thread.
+                // STREAMER_DEBUG_OLD_WATCH_ENDS_NEW: the old way, the spoiled variant.
+                let spoiled = std::env::var_os("STREAMER_DEBUG_OLD_WATCH_ENDS_NEW").is_some();
+                if w2.stop.load(Ordering::SeqCst) && !spoiled {
+                    return;
+                }
+                let end = |reason: &str| {
+                    if let Some(s) = weak.upgrade() {
+                        // Only this watch, never a newer one of the same streamer.
+                        let mine = s.state.lock().unwrap().watches.get(&w2.streamer).is_some_and(|x| Arc::ptr_eq(x, &w2));
+                        if mine || spoiled {
+                            s.end_watch(w2.streamer, reason, true);
+                        }
+                    }
+                };
                 // The video process crashed again and again: the watch ends, and says so.
                 if w2.viewer.video_failed() {
-                    if let Some(s) = weak.upgrade() {
-                        s.end_watch(w2.streamer, "the video stopped working", true);
-                    }
+                    end("the video stopped working");
                     return;
                 }
                 if w2.viewer.window_closed() {
-                    if let Some(s) = weak.upgrade() {
-                        s.end_watch(w2.streamer, "window closed", true);
-                    }
+                    end("window closed");
                     return;
                 }
             }

@@ -242,6 +242,7 @@ impl Shell {
         room::test_click_watch(window, cx);
         room::test_quality(window, cx);
         dialogs::test_dialogs(window, cx);
+        dialogs::test_peek_change(window, cx);
         testing::test_form_more(window, cx);
         testing::test_rooms(window, cx);
         testing::test_ui_stress(window, cx);

@@ -160,7 +160,7 @@ pub(crate) fn save_volume(name: &str, percent: f32) {
 }
 
 pub struct VoiceMenu {
-    id: u64,
+    pub(crate) id: u64,
     name: String,
     at: Point<Pixels>,
     slider: Entity<SliderState>,

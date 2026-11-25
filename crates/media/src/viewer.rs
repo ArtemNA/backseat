@@ -439,6 +439,7 @@ impl Viewer {
         self.audio.volume.store((v.clamp(0.0, 1.0) * 100.0).round() as u32, Ordering::SeqCst);
         self.audio.apply(&self.pipeline);
         sound_changed(self.muted(), self.audio.volume.load(Ordering::SeqCst));
+        eprintln!("viewer: sound {} at {}%", if self.muted() { "muted" } else { "on" }, self.audio.volume.load(Ordering::SeqCst));
         #[cfg(windows)]
         if let Some(w) = &self.window {
             w.sync_audio(self.muted(), self.volume());

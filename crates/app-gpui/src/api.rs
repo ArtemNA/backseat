@@ -11,8 +11,19 @@ use backseat_core::api::{self, Reply, Request};
 use backseat_core::{self as core, App as Core, GoLive};
 use gpui_kit::*;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
+
+/// A body field read with `Request::opt_*`; a wrong type answers 400.
+macro_rules! field {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return Reply::err(400, e),
+        }
+    };
+}
 
 /// Told how a call the UI ran went.
 pub type Done = Box<dyn FnOnce(Result<(), String>) + Send>;
@@ -27,7 +38,9 @@ enum Cmd {
     Run(Box<dyn FnOnce(&mut Shell) -> Result<(), String> + Send>),
 }
 
-static QUEUE: Mutex<Vec<(Cmd, Done)>> = Mutex::new(Vec::new());
+/// Calls for the UI thread, each with whether its caller gave up waiting (then it is dropped:
+/// a retry of a timed-out call must not run it twice).
+static QUEUE: Mutex<Vec<(Cmd, Done, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 
 /// What the UI knows and the core does not, copied from the UI thread for the API's threads.
 #[derive(Clone, Default)]
@@ -132,14 +145,23 @@ pub fn start(core: &Arc<Core>, window: &mut Window, cx: &mut Context<Shell>) {
 }
 
 fn pump(s: &mut Shell, cx: &mut Context<Shell>) {
+    // Nothing to do while the API is off (the usual case).
+    if api::address().is_none() && QUEUE.lock().unwrap().is_empty() {
+        return;
+    }
     *MIRROR.lock().unwrap() = Some(Mirror { rooms: s.rooms.clone(), current: s.current.clone(), joining: s.joining });
-    let todo: Vec<(Cmd, Done)> = std::mem::take(&mut *QUEUE.lock().unwrap());
-    for (cmd, done) in todo {
+    let todo: Vec<(Cmd, Done, Arc<AtomicBool>)> = std::mem::take(&mut *QUEUE.lock().unwrap());
+    for (cmd, done, gave_up) in todo {
+        if gave_up.load(Ordering::SeqCst) {
+            continue;
+        }
         match cmd {
             Cmd::Open(code) => match s.rooms.iter().find(|r| r.room == code).cloned() {
                 Some(r) => s.open_room_then(r, cx, Some(done)),
                 None => done(Err("not a saved room".into())),
             },
+            // A join still running would open the room again after this leave.
+            Cmd::Leave if s.joining => done(Err("busy: a room is being joined".into())),
             Cmd::Leave => {
                 s.leave(cx);
                 done(Ok(()));
@@ -161,13 +183,20 @@ fn pump(s: &mut Shell, cx: &mut Context<Shell>) {
 /// Runs a call on the UI thread and waits for it.
 fn ui(cmd: Cmd, wait: Duration) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
+    let gave_up = Arc::new(AtomicBool::new(false));
     QUEUE.lock().unwrap().push((
         cmd,
         Box::new(move |r| {
             let _ = tx.send(r);
         }),
+        gave_up.clone(),
     ));
-    rx.recv_timeout(wait).map_err(|_| "still running; check /status".to_string())?
+    let r = rx.recv_timeout(wait);
+    if r.is_err() {
+        // Not started yet: it never will. Started: it finishes, but nobody waits.
+        gave_up.store(true, Ordering::SeqCst);
+    }
+    r.map_err(|_| "still running; check /status".to_string())?
 }
 
 /// A core error as a reply: the call could not be done in this state.
@@ -185,7 +214,7 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
         (true, _, ["rooms"]) => Reply::ok(json!({ "rooms": rooms(core) })),
         (true, _, ["sources"]) => Reply::ok(sources()),
         (_, true, ["rooms", code, "open"]) => open(core, code),
-        (_, true, ["room", "open"]) => match r.str("room") {
+        (_, true, ["room", "open"]) => match field!(r.opt_str("room")) {
             Some(code) => open(core, &code),
             None => Reply::err(400, "\"room\" is missing"),
         },
@@ -207,27 +236,38 @@ fn handle(core: &Arc<Core>, r: &Request) -> Reply {
             Reply::ok(status(core))
         }
         (_, true, ["voice", "mute"]) => {
-            let on = r.bool("muted").unwrap_or(!core::voice_view(core).mic_muted);
-            core::set_mic_muted(core, on);
+            let on = field!(r.opt_bool("muted")).unwrap_or(!core::voice_view(core).mic_muted);
+            if !spoiled() {
+                core::set_mic_muted(core, on);
+            }
             Reply::ok(status(core))
         }
         (_, true, ["voice", "deafen"]) => {
-            let on = r.bool("deafened").unwrap_or(!core::voice_view(core).deafened);
-            core::set_deafened(core, on);
+            let on = field!(r.opt_bool("deafened")).unwrap_or(!core::voice_view(core).deafened);
+            if !spoiled() {
+                core::set_deafened(core, on);
+            }
             Reply::ok(status(core))
         }
         (_, true, ["voice", "members", id, "volume"]) => {
             let Ok(id) = id.parse::<u64>() else { return Reply::err(400, "the member id is a number") };
-            let Some(v) = r.body.get("volume").and_then(|v| v.as_f64()).filter(|v| (0.0..=200.0).contains(v)) else {
+            let Some(v) = field!(r.opt_f64("volume")).filter(|v| (0.0..=200.0).contains(v)) else {
                 return Reply::err(400, "\"volume\" is a percent, 0 to 200 (100: as they speak)");
             };
             let snap = core::status(core);
             let Some(p) = snap.peers.iter().find(|p| p.id == id && !p.me).cloned() else { return Reply::err(404, "no such member (not you) in the open room") };
             let c = core.clone();
-            let run = Cmd::Run(Box::new(move |_| {
+            let run = Cmd::Run(Box::new(move |s| {
+                if spoiled() {
+                    return Ok(());
+                }
                 core::set_peer_volume(&c, id, v / 100.0);
                 // Kept by name, as the voice menu keeps it: it comes back next time.
                 crate::voice_ui::save_volume(&p.name, v as f32);
+                // Their volume menu, if open, shows the old value: closed (it opens again right).
+                if s.voice_menu.as_ref().is_some_and(|m| m.id == id) {
+                    s.voice_menu = None;
+                }
                 Ok(())
             }));
             match ui(run, Duration::from_secs(5)) {
@@ -260,6 +300,12 @@ fn open(core: &Arc<Core>, code: &str) -> Reply {
     }
 }
 
+/// Tests only: STREAMER_DEBUG_API_NO_EFFECT answers the changing calls without doing them
+/// (mute, deafen, volumes, quality, changing the stream), the spoiled run of the API gate.
+fn spoiled() -> bool {
+    std::env::var_os("STREAMER_DEBUG_API_NO_EFFECT").is_some()
+}
+
 fn check_quality(q: &str) -> Result<(), String> {
     use media::config::{Quality, VideoMode};
     let any = Quality::new(VideoMode::parse("1440p60")?, 50000);
@@ -278,7 +324,7 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
             if !streaming {
                 return Reply::err(404, "nobody with this id streams in the open room");
             }
-            let q = r.str("quality");
+            let q = field!(r.opt_str("quality"));
             if let Some(q) = &q {
                 if let Err(e) = check_quality(q) {
                     return Reply::err(400, e);
@@ -300,17 +346,24 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
         }
         ["mute"] => {
             let Some(w) = watching else { return Reply::err(404, "not watching this stream") };
-            match core::set_muted(core, id, r.bool("muted").unwrap_or(!w.viewer.muted())) {
+            let on = field!(r.opt_bool("muted")).unwrap_or(!w.viewer.muted());
+            if spoiled() {
+                return ok(core);
+            }
+            match core::set_muted(core, id, on) {
                 Ok(()) => ok(core),
                 Err(e) => conflict(e),
             }
         }
         ["volume"] => {
-            let Some(v) = r.body.get("volume").and_then(|v| v.as_f64()).filter(|v| (0.0..=100.0).contains(v)) else {
+            let Some(v) = field!(r.opt_f64("volume")).filter(|v| (0.0..=100.0).contains(v)) else {
                 return Reply::err(400, "\"volume\" is a percent, 0 to 100");
             };
             if watching.is_none() {
                 return Reply::err(404, "not watching this stream");
+            }
+            if spoiled() {
+                return ok(core);
             }
             match core::set_stream_volume(core, id, v as f32 / 100.0) {
                 Ok(()) => ok(core),
@@ -318,9 +371,12 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
             }
         }
         ["quality"] => {
-            let Some(q) = r.str("quality") else { return Reply::err(400, "\"quality\" is missing, e.g. \"720p30 4000\"") };
+            let Some(q) = field!(r.opt_str("quality")) else { return Reply::err(400, "\"quality\" is missing, e.g. \"720p30 4000\"") };
             if watching.is_none() {
                 return Reply::err(404, "not watching this stream");
+            }
+            if spoiled() {
+                return ok(core);
             }
             match core::set_quality(core, id, &q) {
                 Ok(()) => ok(core),
@@ -328,7 +384,7 @@ fn watch(core: &Arc<Core>, id: u64, rest: &[&str], r: &Request) -> Reply {
             }
         }
         ["window"] => {
-            let Some(a) = r.str("action") else { return Reply::err(400, "\"action\" is missing") };
+            let Some(a) = field!(r.opt_str("action")) else { return Reply::err(400, "\"action\" is missing") };
             const ACTIONS: [&str; 11] = ["show", "fullscreen", "windowed", "toggle_fullscreen", "topmost", "not_topmost", "pop_out", "pop_in", "overlay", "no_overlay", "badge"];
             if !ACTIONS.contains(&a.as_str()) && a != "no_badge" {
                 return Reply::err(400, format!("unknown action; one of {}, no_badge", ACTIONS.join(", ")));
@@ -356,8 +412,8 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
         _ => {}
     }
     let src = core::sources();
-    let given_kind = r.body.pointer("/source/kind").and_then(|v| v.as_str()).map(String::from);
-    let given_id = r.body.pointer("/source/id").and_then(|v| v.as_u64());
+    let given_kind = field!(r.opt_str("/source/kind"));
+    let given_id = field!(r.opt_u64("/source/id"));
     // The source: given, else the running one, else the primary monitor.
     let kind = given_kind.clone().or_else(|| base.as_ref().map(|b| b.kind.clone())).unwrap_or_else(|| "monitor".into());
     let id = given_id.or_else(|| if given_kind.is_none() { base.as_ref().map(|b| b.id) } else { None });
@@ -379,7 +435,10 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     };
     let stream = settings().get("stream").cloned().unwrap_or_default();
     let pref = |k: &str| stream.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let codec = match (&base, r.str("codec")) {
+    // "H265" means h265, as everywhere else.
+    let given_codec = field!(r.opt_str("codec")).map(|c| c.to_ascii_lowercase());
+    let mut codec_auto = false;
+    let codec = match (&base, given_codec) {
         (Some(b), Some(c)) if Some(&c) != b.codec.as_ref() => return conflict("the codec cannot change while live; stop and start again".into()),
         (Some(b), _) => b.codec.clone().unwrap_or_default(),
         (None, given) => {
@@ -389,13 +448,16 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
                 Some(c) if order.contains(&c) => c,
                 Some(c) if given.is_some() => return Reply::err(400, format!("this computer cannot encode {c}; it can: {}", order.join(", "))),
                 _ => match order.first() {
-                    Some(c) => c.clone(),
+                    Some(c) => {
+                        codec_auto = true;
+                        c.clone()
+                    }
                     None => return conflict("no hardware video encoder found".into()),
                 },
             }
         }
     };
-    let mode = match (r.str("mode"), &base) {
+    let mode = match (field!(r.opt_str("mode")), &base) {
         (Some(m), _) => m,
         (None, Some(b)) => b.mode.clone(),
         (None, None) => {
@@ -407,15 +469,23 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
     if !MODES.contains(&mode.as_str()) {
         return Reply::err(400, format!("\"mode\" is one of {}", MODES.join(", ")));
     }
-    let kbit = match (r.body.get("kbit").and_then(|v| v.as_u64()), &base) {
-        (Some(k), _) => k as u32,
+    let kbit = match (field!(r.opt_u64("kbit")), &base) {
+        (Some(k), _) => u32::try_from(k).unwrap_or(0),
         (None, Some(b)) => b.kbit,
-        (None, None) => pref("kbit").parse().ok().filter(|k| crate::room::PRESETS.contains(k)).unwrap_or(if codec == "av1" { 15000 } else { 20000 }),
+        // As the go-live dialog: the setting, else 20000; an AV1 it picked by itself gets 15000.
+        (None, None) => {
+            let k = pref("kbit").parse().ok().filter(|k| crate::room::PRESETS.contains(k)).unwrap_or(20000);
+            if codec_auto && codec == "av1" && k == 20000 {
+                15000
+            } else {
+                k
+            }
+        }
     };
     if !crate::room::PRESETS.contains(&kbit) {
         return Reply::err(400, format!("\"kbit\" is one of {:?}", crate::room::PRESETS));
     }
-    let audio = match (r.str("audio"), &base) {
+    let audio = match (field!(r.opt_str("audio")), &base) {
         (Some(a), _) => a,
         // A running stream keeps its sound: a program's own sound follows a new window; a
         // monitor has no program of its own, so it takes the whole system's.
@@ -437,7 +507,13 @@ fn live(core: &Arc<Core>, r: &Request, update: bool) -> Reply {
         }
     }
     let req = GoLive { kind, id, audio, audio_pid: pid, audio_exclude: crate::dialogs::audio_exclude(), mode, kbit, codec: Some(codec) };
-    let done = if update { core::update_live(core, req) } else { core::go_live(core, req) };
+    let done = if update && spoiled() {
+        Ok(())
+    } else if update {
+        core::update_live(core, req)
+    } else {
+        core::go_live(core, req)
+    };
     match done {
         Ok(()) => Reply::ok(status(core)),
         Err(e) => conflict(e),

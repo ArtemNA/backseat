@@ -59,7 +59,8 @@ the API with `fetch` and the `Authorization` header.
 ## Conventions
 
 - Reads are `GET`, actions are `POST`. A `POST` body is optional JSON; send
-  `Content-Type: application/json`. No body is the same as `{}`.
+  `Content-Type: application/json` and a `Content-Length` (chunked bodies get `411`). No body
+  is the same as `{}`; a field of the wrong type (`"muted": "true"`) gets `400`.
 - Every response has `"ok": true` or `"ok": false` with `"error": "text"`.
 - Actions answer with the same object as `GET /status` (plus `"ok"`), taken after the
   action, so one call is enough to update a remote's screen.
@@ -75,11 +76,13 @@ Status codes:
 | Code | When |
 |---|---|
 | 200 | Done. |
-| 400 | Bad input (unknown mode, bad JSON, missing field). |
+| 400 | Bad input (unknown mode, bad JSON, missing field, a field of the wrong type). |
 | 401 | Wrong or missing token. |
 | 404 | Unknown path, room, streamer, monitor or window. |
 | 405 | Method other than GET, POST, OPTIONS. |
 | 409 | Not possible now (not in a room, already live, a join is running, the join failed, "still running; check /status" after a timeout). |
+| 408 | The request did not arrive whole within 5 s. |
+| 411 | A chunked body: send `Content-Length`. |
 | 413, 431 | Body over 64 KB, headers over 16 KB. |
 | 503 | Over 16 calls at once. |
 
@@ -288,7 +291,7 @@ app's "Go live" dialog chooses them (the settings' Stream tab first).
 | `source.kind` | `"monitor"`, `"window"` | `"monitor"` |
 | `source.id` | an id from `/sources` | the primary monitor (a window needs an id) |
 | `mode` | one of `modes` | the settings', else by the source's height (1440 / 1080 / 720), 60 fps |
-| `kbit` | one of `kbit_presets` | the settings', else 20000 (15000 for AV1) |
+| `kbit` | one of `kbit_presets` | the settings', else 20000 (15000 when AV1 was picked because no codec was set) |
 | `codec` | one of `codecs` | the settings', else the first of `codecs` |
 | `audio` | `"system"` (the whole PC's sound), `"app"` (only the window's program), `"none"` | the settings', else `system` for a monitor and `app` for a window |
 

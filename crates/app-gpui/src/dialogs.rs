@@ -282,6 +282,32 @@ impl Shell {
             self.subs.push(sub);
         }
         g.editing = editing;
+        // Changing: start from what runs now. It may have been started or changed through the
+        // API, and the dialog's last state would undo that (or offer another codec).
+        // STREAMER_DEBUG_CHANGE_FROM_DIALOG: the dialog's last state, the spoiled variant.
+        if let Some(l) = core::live_now(&self.core).filter(|_| editing && std::env::var_os("STREAMER_DEBUG_CHANGE_FROM_DIALOG").is_none()) {
+            g.screen = l.kind != "window";
+            g.pick = Some(l.id);
+            if let Some((r, f)) = l.mode.split_once('p') {
+                if let Some(r) = ["720", "1080", "1440"].into_iter().find(|x| *x == r) {
+                    g.res = r;
+                }
+                if let Some(f) = ["30", "60"].into_iter().find(|x| *x == f) {
+                    g.fps = f;
+                }
+            }
+            g.kbit = l.kbit;
+            if let Some(c) = l.codec.clone() {
+                g.codec = c;
+            }
+            g.audio = match l.audio.as_str() {
+                "none" => Audio::None,
+                "app" => Audio::App,
+                _ => Audio::System,
+            };
+            g.live_audio_none = l.audio == "none";
+            (g.res_picked, g.codec_picked, g.audio_picked) = (true, true, true);
+        }
         g.error = None;
         g.busy = false;
         g.thumbs.clear();
@@ -310,6 +336,9 @@ impl Shell {
         let limit = upload_limit();
         g.limit.update(cx, |i, cx| i.set_value(if limit > 0.0 { format!("{limit}") } else { String::new() }, window, cx));
         g.sources = Some(core::sources());
+        if editing && std::env::var_os("STREAMER_APP_TEST_PEEK_CHANGE").is_some() {
+            eprintln!("test: change dialog shows {} {:?} {}p{} {} {} {}", if g.screen { "monitor" } else { "window" }, g.pick, g.res, g.fps, g.kbit, g.codec, g.audio.key());
+        }
         self.dialogs.golive = Some(g);
         self.dialogs.open = Some(Open::GoLive);
         self.golive_fixups();
@@ -1235,6 +1264,34 @@ impl Shell {
 /// once the pictures came, and with "start" presses Start streaming.
 /// STREAMER_APP_TEST_CHANGE="720p30 4000": 12 s after going live, opens the dialog to change
 /// the stream, picks that mode and bitrate and presses Apply.
+/// Tests only: STREAMER_APP_TEST_PEEK_CHANGE opens the "Change" dialog each time the running
+/// stream changes (by the API too), says what it shows, and closes it.
+pub fn test_peek_change(window: &mut Window, cx: &mut Context<Shell>) {
+    if std::env::var_os("STREAMER_APP_TEST_PEEK_CHANGE").is_none() {
+        return;
+    }
+    cx.spawn_in(window, async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| {
+        let mut last = String::new();
+        loop {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let alive = this.update_in(cx, |s, window, cx| {
+                let now = core::live_now(&s.core).map(|l| format!("{l:?}")).unwrap_or_default();
+                if now != last {
+                    last = now.clone();
+                    if !now.is_empty() {
+                        s.open_golive(true, window, cx);
+                        s.close_dialog(cx);
+                    }
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 pub fn test_dialogs(window: &mut Window, cx: &mut Context<Shell>) {
     let prefs = std::env::var("STREAMER_APP_TEST_PREFS_UI").ok();
     let golive = std::env::var("STREAMER_APP_OPEN_GOLIVE").ok();
