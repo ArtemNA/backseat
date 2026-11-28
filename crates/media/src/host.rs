@@ -167,6 +167,8 @@ struct Branch {
     handled: Arc<AtomicBool>,
     /// A punch for its connection is running.
     punching: Arc<AtomicBool>,
+    /// The viewer's "restart" was taken (once per branch).
+    restarted: AtomicBool,
 }
 
 /// Told when the connection `w` with viewer `id` fails (`was_up`: it had worked).
@@ -1689,12 +1691,14 @@ impl Host {
         *self.on_viewer_failed.lock().unwrap() = Some(f);
     }
 
-    /// Takes the failure of connection `w` with `id` to handle: its "punching" flag, or None
-    /// when `w` is no longer that viewer's connection or its failure is handled already.
+    /// Takes the failure of connection `w` with `id` to punch for: its "punching" flag, or
+    /// None when `w` is no longer that viewer's connection, its failure is handled already,
+    /// or it was on a punched hole already (punching again would go round and round).
     pub fn claim_viewer(&self, id: u64, w: &gst::Element) -> Option<Arc<AtomicBool>> {
         let viewers = self.viewers.lock().unwrap();
         let b = viewers.get(&id).filter(|b| b.webrtc == *w)?;
-        (!b.handled.swap(true, Ordering::SeqCst)).then(|| b.punching.clone())
+        let first = !b.handled.swap(true, Ordering::SeqCst);
+        (first && b.hole.is_none()).then(|| b.punching.clone())
     }
 
     /// The connection with viewer `id` now, and whether it is up.
@@ -1717,14 +1721,24 @@ impl Host {
     /// new connection itself. Only for a connection that never came up.
     pub fn restart_viewer(&self, id: u64, link: Arc<dyn Outbox>) -> Result<(), String> {
         use gst_webrtc::WebRTCICEConnectionState as State;
-        let want = {
+        let (webrtc, want) = {
             let viewers = self.viewers.lock().unwrap();
             let Some(b) = viewers.get(&id) else { return Err(format!("no viewer {id}")) };
-            if matches!(b.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed) {
-                return Err(format!("viewer {id}: the connection is up"));
+            // On a punched hole already: its failure is final (punching again would go round).
+            if b.hole.is_some() {
+                return Err(format!("viewer {id}: restart refused (on a punched hole already)"));
             }
-            b.want
+            // Only after our side of it failed too (and so punched), once per branch: a
+            // viewer cannot make us take its branch down again and again.
+            // Not while our punch for it runs either (its hole is not kept yet).
+            if !b.handled.load(Ordering::SeqCst) || b.punching.load(Ordering::SeqCst) || b.restarted.swap(true, Ordering::SeqCst) {
+                return Err(format!("viewer {id}: restart refused (not failed here, or done already)"));
+            }
+            (b.webrtc.clone(), b.want)
         };
+        if matches!(webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed) {
+            return Err(format!("viewer {id}: the connection is up"));
+        }
         eprintln!("host: viewer {id} asked to start over");
         self.remove_viewer(id);
         self.add_viewer(id, link, want)
@@ -1735,20 +1749,25 @@ impl Host {
         use crate::viewer::Link;
         use gst_webrtc::WebRTCICEConnectionState as State;
         let no_hole = std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_some();
-        self.viewers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, b)| {
-                let up = matches!(b.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
+        // The elements' state is read outside the lock (one viewer's busy element must not
+        // hold up the others).
+        let branches: Vec<_> = self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone(), b.hole.is_some(), b.punching.clone(), b.handled.clone())).collect();
+        branches
+            .into_iter()
+            .map(|(id, webrtc, hole, punching, handled)| {
+                let state = webrtc.property::<State>("ice-connection-state");
+                let up = matches!(state, State::Connected | State::Completed);
                 let link = if up {
-                    if b.hole.is_some() && !no_hole { Link::Punched } else { Link::Direct }
-                } else if b.punching.load(Ordering::SeqCst) {
+                    if hole && !no_hole { Link::Punched } else { Link::Direct }
+                } else if punching.load(Ordering::SeqCst) {
                     Link::Punching
+                } else if handled.load(Ordering::SeqCst) || state == State::Failed {
+                    // Failed, and no punch for it now: nothing more to come for this one.
+                    Link::Failed
                 } else {
                     Link::Connecting
                 };
-                (*id, link)
+                (id, link)
             })
             .collect()
     }
@@ -1948,6 +1967,7 @@ impl Host {
             hole: ice.pinned,
             handled: Arc::default(),
             punching: Arc::default(),
+            restarted: AtomicBool::new(false),
         };
         // Between the queue and the payloader, so dropped frames leave no gaps in RTP
         // sequence numbers.

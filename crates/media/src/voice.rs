@@ -1044,20 +1044,20 @@ impl Voice {
         self.peers.lock().unwrap().iter().map(|(id, p)| (*id, p.level.db())).collect()
     }
 
-    /// Leaves voice: the peers' connections and the microphone chain go out of the shared
     /// How the connection with each peer stands, for the UI. STREAMER_DEBUG_LINK_NO_HOLE
     /// (tests only, the spoiled variant): a punched hole is not told.
     pub fn links(&self) -> Vec<(PeerId, Link)> {
         use gst_webrtc::WebRTCICEConnectionState as State;
         let puncher = self.puncher.lock().unwrap().clone();
         let no_hole = std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_some();
-        let peers = self.peers.lock().unwrap();
+        // The elements' state is read outside the lock (a property read may wait on them).
+        let peers: Vec<(PeerId, gst::Element, bool)> = self.peers.lock().unwrap().iter().map(|(id, p)| (*id, p.webrtc.clone(), p.hole.is_some())).collect();
         peers
             .iter()
-            .map(|(id, p)| {
-                let up = matches!(p.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
+            .map(|(id, webrtc, hole)| {
+                let up = matches!(webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
                 let link = if up {
-                    if p.hole.is_some() && !no_hole { Link::Punched } else { Link::Direct }
+                    if *hole && !no_hole { Link::Punched } else { Link::Direct }
                 } else if puncher.as_ref().is_some_and(|x| x.busy(*id, "voice")) {
                     Link::Punching
                 } else {
@@ -1068,6 +1068,7 @@ impl Voice {
             .collect()
     }
 
+    /// Leaves voice: the peers' connections and the microphone chain go out of the shared
     /// pipeline (which keeps playing the streams and sounds).
     pub fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {

@@ -52,6 +52,8 @@ pub enum Link {
     Punching,
     Direct,
     Punched,
+    /// No connection could be made (or it broke for good).
+    Failed,
 }
 
 pub struct Viewer {
@@ -68,6 +70,8 @@ pub struct Viewer {
     on_failed: Arc<Mutex<Option<FailHook>>>,
     /// The ICE settings the watch started with.
     ice: crate::config::IceConfig,
+    /// Media came through the connection (its branches are built): it is not replaced then.
+    media_came: Arc<std::sync::atomic::AtomicBool>,
     /// A punch for this connection is running (set by whoever punches).
     pub punching: std::sync::atomic::AtomicBool,
     pub stats: ViewerStats,
@@ -165,7 +169,10 @@ impl Viewer {
                     let hook = h.lock().unwrap().clone();
                     match (hook, w.upgrade()) {
                         (Some(hook), Some(w)) => hook(w, was_up),
-                        _ => f.store(true, Ordering::SeqCst),
+                        (None, Some(_)) => f.store(true, Ordering::SeqCst),
+                        // Gone: it was replaced (`rebuild`), and this is its late timer. Not
+                        // the new connection's failure.
+                        (_, None) => {}
                     }
                 });
                 webrtc.set_property("latency", latency);
@@ -288,10 +295,13 @@ impl Viewer {
             // Its controls start as the saved sound, not at full volume.
             w.sync_audio(audio.muted.load(Ordering::SeqCst), audio.volume.load(Ordering::SeqCst) as f32 / 100.0);
         }
+        let media_came: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let mc = media_came.clone();
         let pad_added = Arc::new(move |pad: &gst::Pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
             }
+            mc.store(true, Ordering::SeqCst);
             let Some(pipeline) = pipeline_weak.upgrade() else { return };
             let Some(caps) = pad.current_caps() else { return };
             let s = caps.structure(0).unwrap();
@@ -362,6 +372,7 @@ impl Viewer {
             handled: Default::default(),
             on_failed,
             ice: cfg.ice.clone(),
+            media_came,
             punching: Default::default(),
             stats,
             #[cfg(windows)]
@@ -490,6 +501,22 @@ impl Viewer {
         *cur == *w && !self.handled.swap(true, Ordering::SeqCst)
     }
 
+    /// The failure of the current connection is not handled after all (it came up meanwhile):
+    /// a later failure of it is handled again.
+    pub fn unclaim(&self) {
+        self.handled.store(false, Ordering::SeqCst);
+    }
+
+    /// Media came through a connection of this watch (its decoding branches are built).
+    pub fn media_came(&self) -> bool {
+        self.media_came.load(Ordering::SeqCst)
+    }
+
+    /// The current connection is on a punched hole.
+    pub fn on_hole(&self) -> bool {
+        self.hole.lock().unwrap().is_some()
+    }
+
     /// Whether the connection is up now.
     pub fn connected(&self) -> bool {
         use gst_webrtc::WebRTCICEConnectionState as State;
@@ -501,6 +528,8 @@ impl Viewer {
         if self.connected() {
             let hole = self.hole.lock().unwrap().is_some() && std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_none();
             if hole { Link::Punched } else { Link::Direct }
+        } else if self.ice_failed.load(Ordering::SeqCst) {
+            Link::Failed
         } else if self.punching.load(Ordering::SeqCst) {
             Link::Punching
         } else {

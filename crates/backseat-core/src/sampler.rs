@@ -55,6 +55,7 @@ pub fn link_name(l: media::viewer::Link) -> &'static str {
         Link::Punching => "punching",
         Link::Punched => "punched",
         Link::Direct => "direct",
+        Link::Failed => "failed",
     }
 }
 

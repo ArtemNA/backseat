@@ -45,9 +45,10 @@ const STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com
 const SOCKETS: usize = if cfg!(windows) { 256 } else { 128 };
 /// The slots punching is for (messages for others are ignored): "voice", and "w<id>" for
 /// watching the stream of member <id> (both sides name it by the streamer, so two members
-/// watching each other's streams punch two holes, not one).
-fn slot_ok(slot: &str) -> bool {
-    slot == "voice" || slot.strip_prefix('w').is_some_and(|d| !d.is_empty() && d.len() <= 20 && d.bytes().all(|b| b.is_ascii_digit()))
+/// watching each other's streams punch two holes, not one). Between `me` and `from`, the
+/// streamer is one of them.
+fn slot_ok(slot: &str, me: PeerId, from: PeerId) -> bool {
+    slot == "voice" || slot == watch_slot(me) || slot == watch_slot(from)
 }
 
 /// The slot for watching the stream of `streamer`.
@@ -319,6 +320,8 @@ const GIVE_UP_FOR: Duration = Duration::from_secs(180);
 /// One session's punching: talks to the others through `send`, hears them through
 /// `on_message`.
 pub struct Puncher {
+    /// Our member id.
+    me: PeerId,
     send: Send,
     /// What came from each peer: ("info:<slot>" or "done:<slot>") -> (payload, when).
     heard: Mutex<HashMap<(PeerId, String), (String, Instant)>>,
@@ -344,8 +347,8 @@ impl Drop for Running<'_> {
 }
 
 impl Puncher {
-    pub fn new(send: Send) -> Arc<Self> {
-        Arc::new(Self { send, heard: Mutex::default(), heard_cv: std::sync::Condvar::new(), failed: Mutex::default(), running: Mutex::default(), on_info: Mutex::default() })
+    pub fn new(me: PeerId, send: Send) -> Arc<Self> {
+        Arc::new(Self { me, send, heard: Mutex::default(), heard_cv: std::sync::Condvar::new(), failed: Mutex::default(), running: Mutex::default(), on_info: Mutex::default() })
     }
 
     /// `f(peer, slot)` when a peer's "info" comes for a slot of `class` ("voice" or "watch")
@@ -356,7 +359,7 @@ impl Puncher {
 
     /// A "p/" message from `from` (the "p/" taken off `kind`): "info:<slot>" or "done:<slot>".
     pub fn on_message(&self, from: PeerId, kind: &str, payload: &str) {
-        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done") && slot_ok(slot));
+        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done") && slot_ok(slot, self.me, from));
         if !known || payload.len() > 100 {
             return;
         }
@@ -528,14 +531,14 @@ mod tests {
 
     #[test]
     fn slots_are_checked() {
-        assert!(slot_ok("voice") && slot_ok("w12") && slot_ok(&watch_slot(u64::MAX)));
-        assert!(!slot_ok("watch") && !slot_ok("w") && !slot_ok("w1x") && !slot_ok("x"));
+        assert!(slot_ok("voice", 1, 2) && slot_ok("w1", 1, 2) && slot_ok("w2", 1, 2));
+        assert!(!slot_ok("w3", 1, 2) && !slot_ok("watch", 1, 2) && !slot_ok("w", 1, 2) && !slot_ok("x", 1, 2));
         assert_eq!((slot_class("voice"), slot_class("w7")), ("voice", "watch"));
     }
 
     #[test]
     fn a_second_punch_is_busy() {
-        let p = Puncher::new(Arc::new(|_, _, _| {}));
+        let p = Puncher::new(1, Arc::new(|_, _, _| {}));
         p.running.lock().unwrap().insert((7, "voice".to_string()));
         assert_eq!(p.punch(7, "voice"), Err(Busy));
         assert!(p.busy(7, "voice"));

@@ -1048,8 +1048,6 @@ fn row() -> Div {
     div().flex().items_center().gap_2p5().px_4().py_1p5()
 }
 
-/// An avatar with a green ring while its person speaks (the ring's room is always kept, so
-/// nothing moves when it shows).
 /// How our voice connection with `id` stands, by its name in `link_badge`.
 fn voice_link(v: &backseat_core::VoiceView, id: u64) -> &'static str {
     if v.punching.contains(&id) {
@@ -1083,6 +1081,8 @@ pub(crate) fn link_badge(id: String, link: &str) -> Option<Stateful<Div>> {
     )
 }
 
+/// An avatar with a green ring while its person speaks (the ring's room is always kept, so
+/// nothing moves when it shows).
 fn voice_avatar(name: &str, speaking: bool) -> Div {
     div().p(px(2.)).flex_none().rounded_full().border_2().border_color(rgb(if speaking { color::GREEN } else { color::SIDE })).child(avatar(name).size_6().text_xs())
 }

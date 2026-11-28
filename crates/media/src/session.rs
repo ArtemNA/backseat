@@ -184,7 +184,7 @@ impl Session {
         let mut peers = client.peers.clone();
         peers.push(me);
         let c = client.clone();
-        let puncher = crate::punch::Puncher::new(Arc::new(move |to, kind: &str, payload: &str| {
+        let puncher = crate::punch::Puncher::new(client.id, Arc::new(move |to, kind: &str, payload: &str| {
             c.to_peer(to).send(&format!("{PUNCH}{kind}"), payload);
         }));
         let s = Arc::new(Self {
@@ -344,7 +344,10 @@ impl Session {
             punching.store(true, Ordering::SeqCst);
             let hole = puncher.punch_waiting(viewer, &slot, current);
             punching.store(false, Ordering::SeqCst);
-            if let Some(hole) = hole.filter(|_| current()) {
+            // Not for a connection that came up meanwhile: a later one would take a hole the
+            // viewer does not use.
+            let up = host.viewer_connection(viewer).is_some_and(|(c, up)| c == w && up);
+            if let Some(hole) = hole.filter(|_| current() && !up) {
                 host.set_pinned(viewer, hole);
                 puncher.send_done(viewer, &slot);
             }
@@ -364,7 +367,8 @@ impl Session {
             if !mine(&s) || !w.viewer.claim(&conn) {
                 return;
             }
-            if was_up || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
+            // A connection on a punched hole already: punching again would go round and round.
+            if was_up || w.viewer.on_hole() || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
                 w.viewer.give_up();
                 return;
             }
@@ -382,10 +386,20 @@ impl Session {
                 current()
             });
             w.viewer.punching.store(false, Ordering::SeqCst);
-            let Some(hole) = hole else {
-                if current() {
-                    w.viewer.give_up();
-                }
+            if !current() {
+                return;
+            }
+            // It came up meanwhile (late candidates while punching), hole or not: it works,
+            // keep it; a later failure of it is handled again.
+            if w.viewer.connected() {
+                eprintln!("viewer: the connection with {streamer} came up meanwhile; keeping it");
+                w.viewer.unclaim();
+                return;
+            }
+            // No hole; or media came through it before it failed (it came up and broke while
+            // we punched): its branches are built, so it is not replaced.
+            let Some(hole) = hole.filter(|_| !w.viewer.media_came()) else {
+                w.viewer.give_up();
                 return;
             };
             eprintln!("viewer: connecting with {streamer} again through a punched hole (local port {})", hole.port);
@@ -821,12 +835,11 @@ impl Session {
                     if let (Some(host), Some(out)) = (st.host.clone(), st.viewers.get(&from).cloned()) {
                         drop(st);
                         if k == RESTART {
-                            // Off the session thread: the branch is taken down and made again.
-                            std::thread::spawn(move || {
-                                if let Err(e) = host.restart_viewer(from, out) {
-                                    eprintln!("host: {e}");
-                                }
-                            });
+                            // Here on the session thread, as subscribing and unsubscribing are:
+                            // an unsubscribe cannot come while the branch is down.
+                            if let Err(e) = host.restart_viewer(from, out) {
+                                eprintln!("host: {e}");
+                            }
                         } else {
                             host.on_message(from, out.as_ref(), k, &payload);
                         }
