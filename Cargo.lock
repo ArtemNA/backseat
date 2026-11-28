@@ -221,7 +221,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app-gpui"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "backseat-core",
  "base64 0.22.1",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "app-webview"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "backseat-core",
  "media",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "backseat-core"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "gstreamer",
  "media",
@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "host"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "gstreamer",
  "media",
@@ -5177,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "media"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "base64 0.22.1",
  "deep_filter",
@@ -5390,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "nat"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 
 [[package]]
 name = "native-tls"
@@ -6790,7 +6790,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -8008,7 +8008,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -9942,7 +9942,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "viewer"
-version = "0.2.26"
+version = "0.2.27-beta.1"
 dependencies = [
  "gstreamer",
  "gstreamer-app",

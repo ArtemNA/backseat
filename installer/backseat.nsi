@@ -15,7 +15,7 @@ Name "${NAME}"
 OutFile "${OUT}"
 InstallDir "$LOCALAPPDATA\Programs\${NAME}"
 InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
-; NUMVER: the version in numbers only (a beta "0.2.26-beta.1" is "0.2.26" here).
+; NUMVER: the version in numbers only (a beta "0.2.27-beta.1" is "0.2.27" here).
 !ifndef NUMVER
   !define NUMVER ${VERSION}
 !endif

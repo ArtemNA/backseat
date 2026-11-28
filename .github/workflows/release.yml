@@ -1,10 +1,11 @@
 # Builds the Windows installer. A pushed tag vX.Y.Z also publishes it as the GitHub
-# release "Backseat X.Y.Z"; a manual run only uploads it as a workflow artifact.
+# release "Backseat X.Y.Z"; a manual run only uploads it as a workflow artifact. Betas
+# (tags with a "-", v0.2.27-beta.1) are built and published by hand as pre-releases, not here.
 name: release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '!v*-*']
   workflow_dispatch:
 
 permissions:
@@ -123,6 +124,9 @@ jobs:
           }
           $ghArgs = @($env:GITHUB_REF_NAME, "dist/backseat-setup-$env:VERSION.exe", 'dist/SHA256SUMS.txt',
                     '--title', "Backseat $env:VERSION", '--verify-tag')
+          # A version with a "-" (0.2.27-beta.1) is a beta: a pre-release, which GitHub's
+          # "latest" (what the app checks without betas) leaves out.
+          if ($env:VERSION -like '*-*') { $ghArgs += '--prerelease' }
           if ($notes) {
             Set-Content -Path notes.md -Value $notes -Encoding utf8NoBOM
             $ghArgs += @('--notes-file', 'notes.md')

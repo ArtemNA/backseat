@@ -971,11 +971,18 @@ pub fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The latest release and whether it is newer than this app. Blocks.
+/// Whether to take betas too (the settings' "betas").
+pub fn update_betas() -> bool {
+    state_load().get("settings").and_then(|s| s.get("betas")).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// The latest release (with betas when the settings say so) and whether it is newer than
+/// this app. Blocks.
 pub fn check_update(app: &App) -> Result<update::Release, String> {
-    let r = update::check();
+    let betas = update_betas();
+    let r = update::check(betas);
     match &r {
-        Ok(r) => eprintln!("update: this {} latest {} newer {}", r.current, r.latest, r.newer),
+        Ok(r) => eprintln!("update: this {} latest {} newer {}{}", r.current, r.latest, r.newer, if betas { " (betas on)" } else { "" }),
         Err(e) => eprintln!("update: check failed: {e}"),
     }
     let r = r?;

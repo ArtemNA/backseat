@@ -1240,6 +1240,18 @@ impl Shell {
                     set_setting("autoUpdate", serde_json::Value::Bool(*v));
                     cx.notify();
                 })))
+                // Betas: the next check takes pre-releases too.
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Checkbox::new("set-betas").cursor_pointer().label(t("set.betas")).checked(core::update_betas()).on_click(cx.listener(|_, v: &bool, _, cx| {
+                            set_setting("betas", serde_json::Value::Bool(*v));
+                            cx.notify();
+                        })))
+                        .child(small(t("set.betas_hint"))),
+                )
                 .child(
                     div()
                         .flex()

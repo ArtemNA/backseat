@@ -4,7 +4,7 @@ members = ["crates/protocol", "crates/server", "crates/media", "crates/deep_filt
 exclude = ["probes"]
 
 [workspace.package]
-version = "0.2.26"
+version = "0.2.27-beta.1"
 edition = "2021"
 publish = false
 
