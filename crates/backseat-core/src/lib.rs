@@ -171,6 +171,11 @@ pub struct VoiceView {
     /// Others in voice with their microphone off / sound off.
     pub muted: Vec<u64>,
     pub deaf: Vec<u64>,
+    /// Others in voice whose connection with us is being made / punched through the NAT /
+    /// up through a punched hole (when we are in voice; the rest are up the usual way).
+    pub connecting: Vec<u64>,
+    pub punching: Vec<u64>,
+    pub punched: Vec<u64>,
     /// Push-to-talk is on, and whether its key is down now.
     pub ptt: bool,
     pub talking: bool,
@@ -222,7 +227,19 @@ pub fn voice_view(app: &App) -> VoiceView {
     let mut speaking = vec![];
     let voice = s.voice();
     let mut talking = false;
+    let (mut connecting, mut punching, mut punched) = (vec![], vec![], vec![]);
     if let Some(v) = &voice {
+        let links = v.links();
+        for id in members.iter().copied().filter(|id| *id != s.id) {
+            use media::voice::Link;
+            match links.iter().find(|(p, _)| *p == id).map(|(_, l)| *l) {
+                // In voice, but no connection with them yet.
+                None | Some(Link::Connecting) => connecting.push(id),
+                Some(Link::Punching) => punching.push(id),
+                Some(Link::Punched) => punched.push(id),
+                Some(Link::Direct) => {}
+            }
+        }
         members.push(s.id);
         talking = v.transmitting();
         if talking && v.mic_db() > SPEAKING_DB {
@@ -244,7 +261,10 @@ pub fn voice_view(app: &App) -> VoiceView {
     deaf.sort_unstable();
     let elsewhere = if voice.is_some() { None } else { voice_session(app).filter(|v| v.voice().is_some()).map(|v| v.room.clone()) };
     let talking = talking || voice_session(app).and_then(|v| v.voice()).is_some_and(|v| v.transmitting());
-    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened, muted, deaf, ptt, talking, elsewhere }
+    for l in [&mut connecting, &mut punching, &mut punched] {
+        l.sort_unstable();
+    }
+    VoiceView { joined: voice.is_some(), members, speaking, mic_muted, deafened, muted, deaf, connecting, punching, punched, ptt, talking, elsewhere }
 }
 
 fn cue(app: &App, c: media::sounds::Cue) {

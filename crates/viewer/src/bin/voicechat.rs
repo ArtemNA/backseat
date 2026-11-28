@@ -141,6 +141,7 @@ fn main() {
     }
     println!("voice: in room {room} as {name} (id {})", session.id);
     let t0 = Instant::now();
+    let mut last_links = std::collections::HashMap::new();
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let s = t0.elapsed().as_secs();
@@ -173,6 +174,11 @@ fn main() {
                     let up = pad.peer().and_then(|x| x.parent_element()).map(|e| e.name().to_string()).unwrap_or_default();
                     eprintln!("  mixer input {} from {up}: ok {ok} live {live} min {} ms max {:?}", pad.name(), min.mseconds(), max.map(|m| m.mseconds()));
                 }
+            }
+        }
+        for (id, l) in voice.links() {
+            if last_links.insert(id, l) != Some(l) {
+                eprintln!("link: {id} {l:?}");
             }
         }
         let mut line = format!("t {s:>3} mic {:>6.1} max {:>6.1} raw {:>6.1} out {out:>6.1}", voice.mic_db(), voice.mic_max_db(), voice.raw_max_db());

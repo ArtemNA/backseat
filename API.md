@@ -183,6 +183,7 @@ No token needed. Use it to check that the address is right.
 | `members[].streaming` | They are live; you can watch them. |
 | `members[].watching` | You are watching them. |
 | `members[].in_voice`, `speaking`, `mic_muted`, `deafened` | Voice chat state. `speaking` is true while their sound is above the speaking threshold. |
+| `members[].voice_link` | Our voice connection with them, while we are both in voice (else null): `connecting`, `punching` (no direct connection, a hole is being punched in the NAT), `punched` (connected through that hole) or `direct`. |
 | `members[].volume` | How loud they are for you, percent (100: as they speak); `null` for you, for those not in voice, and for everyone while your voice is in another room. |
 | `background_rooms` | Codes of rooms kept connected in the background (you switched away while watching, streaming or in voice there). |
 | `voice.joined`, `voice.room` | You are in voice, and in which room's (it may be a background room). |

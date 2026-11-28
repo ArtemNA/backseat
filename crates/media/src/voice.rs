@@ -215,6 +215,19 @@ struct Peer {
 /// answer, or "I am still here") leaves a working connection as it is.
 pub const JOIN: &str = "join";
 
+/// How a voice connection with a peer stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// Being made (or made again after it broke).
+    Connecting,
+    /// The direct connection failed; a hole in the NAT is being punched.
+    Punching,
+    /// Up, the usual way.
+    Direct,
+    /// Up through a punched hole.
+    Punched,
+}
+
 pub struct Voice {
     /// Punches a hole when a peer's direct connection fails, and the holes got so far
     /// (`crate::punch`).
@@ -1032,6 +1045,29 @@ impl Voice {
     }
 
     /// Leaves voice: the peers' connections and the microphone chain go out of the shared
+    /// How the connection with each peer stands, for the UI. STREAMER_DEBUG_LINK_NO_HOLE
+    /// (tests only, the spoiled variant): a punched hole is not told.
+    pub fn links(&self) -> Vec<(PeerId, Link)> {
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        let puncher = self.puncher.lock().unwrap().clone();
+        let no_hole = std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_some();
+        let peers = self.peers.lock().unwrap();
+        peers
+            .iter()
+            .map(|(id, p)| {
+                let up = matches!(p.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
+                let link = if up {
+                    if p.hole.is_some() && !no_hole { Link::Punched } else { Link::Direct }
+                } else if puncher.as_ref().is_some_and(|x| x.busy(*id, "voice")) {
+                    Link::Punching
+                } else {
+                    Link::Connecting
+                };
+                (*id, link)
+            })
+            .collect()
+    }
+
     /// pipeline (which keeps playing the streams and sounds).
     pub fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {

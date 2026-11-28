@@ -41,6 +41,9 @@ pub(crate) mod color {
     pub const GREEN: u32 = 0x23a55a;
     pub const LIVE: u32 = 0xed4245;
     pub const BAR: u32 = 0x232428;
+    /// Hints that stay on screen without drawing the eye.
+    pub const QUIET: u32 = 0x80848e;
+    pub const PUNCHING: u32 = 0xf0b232;
 }
 
 /// A saved room, as the Tauri UI keeps it in the state file.
@@ -769,6 +772,17 @@ impl Shell {
                         }))
                         .child(voice_avatar(&p.name, v.speaking.contains(&p.id)))
                         .child(div().flex_1().min_w_0().truncate().text_color(rgb(if v.speaking.contains(&p.id) { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
+                        // How our connection with them stands: being made, punched through the
+                        // NAT, or up through a punched hole (quiet grey, always there while so).
+                        .when_some(voice_link_icon(v, id), |d, (icon, colour, tip)| {
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!("voice-link-{id}")))
+                                    .text_color(rgb(colour))
+                                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(t(tip)).build(window, cx))
+                                    .child(Icon::default().path(icon).xsmall()),
+                            )
+                        })
                         .when(muted, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/mic-off.svg").small())))
                         .when(deaf, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/headphone-off.svg").small())))
                 };
@@ -1044,6 +1058,20 @@ fn row() -> Div {
 
 /// An avatar with a green ring while its person speaks (the ring's room is always kept, so
 /// nothing moves when it shows).
+/// The icon, its colour and tooltip key for how our voice connection with `id` stands; None
+/// when it is up the usual way (or it is us, or we are not in voice).
+fn voice_link_icon(v: &backseat_core::VoiceView, id: u64) -> Option<(&'static str, u32, &'static str)> {
+    if v.punching.contains(&id) {
+        Some(("icons/zap.svg", color::PUNCHING, "voice.link_punching"))
+    } else if v.connecting.contains(&id) {
+        Some(("icons/loader-circle.svg", color::MUTED, "voice.link_connecting"))
+    } else if v.punched.contains(&id) {
+        Some(("icons/link-2.svg", color::QUIET, "voice.link_punched"))
+    } else {
+        None
+    }
+}
+
 fn voice_avatar(name: &str, speaking: bool) -> Div {
     div().p(px(2.)).flex_none().rounded_full().border_2().border_color(rgb(if speaking { color::GREEN } else { color::SIDE })).child(avatar(name).size_6().text_xs())
 }
@@ -1098,7 +1126,7 @@ impl Render for Shell {
 
 // Icons (lucide): gpui-kit's default set for its components, plus the few this app uses that
 // the default set leaves out. Only these are in the exe, not the whole catalog.
-gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus, Settings, Monitor, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [UserPlus, LogOut, Volume2, VolumeX, SquareArrowOutUpRight, PictureInPicture, Maximize, Plus, Settings, Monitor, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff, Zap, Link2]);
 
 struct AppAssets;
 

@@ -652,6 +652,19 @@ fn status(core: &Arc<Core>) -> Value {
                     "speaking": v.speaking.contains(&p.id),
                     "mic_muted": in_voice && if p.me { v.mic_muted || v.deafened } else { v.muted.contains(&p.id) },
                     "deafened": in_voice && if p.me { v.deafened } else { v.deaf.contains(&p.id) },
+                    // Our voice connection with them (we in voice, they not us): "connecting",
+                    // "punching", "punched" (through a hole punched in the NAT) or "direct".
+                    "voice_link": (!p.me && in_voice && v.joined).then(|| {
+                        if v.connecting.contains(&p.id) {
+                            "connecting"
+                        } else if v.punching.contains(&p.id) {
+                            "punching"
+                        } else if v.punched.contains(&p.id) {
+                            "punched"
+                        } else {
+                            "direct"
+                        }
+                    }),
                     "volume": (!p.me && in_voice && v.joined).then(|| (core::peer_volume(core, p.id) * 100.0).round()),
                 })
             }).collect::<Vec<_>>(),
