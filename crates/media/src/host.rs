@@ -50,6 +50,9 @@ pub struct Host {
     preview: Mutex<Option<Preview>>,
     /// The capture failed for good (its window closed).
     lost: Arc<SourceLost>,
+    /// Holes punched for viewers, for their next connection (good for a moment only).
+    pinned: Mutex<HashMap<u64, (crate::punch::Pinned, std::time::Instant)>>,
+    on_viewer_failed: Arc<Mutex<Option<ViewerFailHook>>>,
 }
 
 /// The capture failed (its window was closed): the stream cannot go on with it. Told once,
@@ -158,7 +161,16 @@ struct Branch {
     /// pushing into a branch still in NULL gets FLUSHING and passes it up, which stopped
     /// the layer, the capture tee and the capture (stress test, 2026-11-06).
     unlinked: Vec<(gst::Pad, gst::Pad)>,
+    /// The punched hole this branch's connection uses, if any (told to ICE with the answer).
+    hole: Option<crate::punch::Pinned>,
+    /// Its connection's failure is being (or was) handled.
+    handled: Arc<AtomicBool>,
+    /// A punch for its connection is running.
+    punching: Arc<AtomicBool>,
 }
+
+/// Told when the connection `w` with viewer `id` fails (`was_up`: it had worked).
+pub type ViewerFailHook = Arc<dyn Fn(u64, gst::Element, bool) + Send + Sync>;
 
 /// The capture as a pipeline description. The caps end in a named capsfilter, not bare caps:
 /// a description that ends in caps parses inside the whole pipeline (`Host::new`) but not as
@@ -1071,6 +1083,8 @@ impl Host {
             layers: Mutex::default(),
             preview: Mutex::default(),
             lost,
+            pinned: Mutex::default(),
+            on_viewer_failed: Arc::default(),
         })
     }
 
@@ -1670,6 +1684,75 @@ impl Host {
         Ok(())
     }
 
+    /// `f(viewer, connection, was_up)` when a connection with a viewer fails.
+    pub fn on_viewer_failed(&self, f: ViewerFailHook) {
+        *self.on_viewer_failed.lock().unwrap() = Some(f);
+    }
+
+    /// Takes the failure of connection `w` with `id` to handle: its "punching" flag, or None
+    /// when `w` is no longer that viewer's connection or its failure is handled already.
+    pub fn claim_viewer(&self, id: u64, w: &gst::Element) -> Option<Arc<AtomicBool>> {
+        let viewers = self.viewers.lock().unwrap();
+        let b = viewers.get(&id).filter(|b| b.webrtc == *w)?;
+        (!b.handled.swap(true, Ordering::SeqCst)).then(|| b.punching.clone())
+    }
+
+    /// The connection with viewer `id` now, and whether it is up.
+    pub fn viewer_connection(&self, id: u64) -> Option<(gst::Element, bool)> {
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        let w = self.viewers.lock().unwrap().get(&id).map(|b| b.webrtc.clone())?;
+        let up = matches!(w.property::<State>("ice-connection-state"), State::Connected | State::Completed);
+        Some((w, up))
+    }
+
+    /// Keeps a hole punched for viewer `id` for its next connection (`restart_viewer`).
+    pub fn set_pinned(&self, id: u64, hole: crate::punch::Pinned) {
+        let mut p = self.pinned.lock().unwrap();
+        p.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(15));
+        p.insert(id, (hole, std::time::Instant::now()));
+    }
+
+    /// Builds viewer `id`'s branch again (a new connection, on a hole punched for it if one
+    /// is kept), at the quality it has; the viewer asked for it ("restart"), having made a
+    /// new connection itself. Only for a connection that never came up.
+    pub fn restart_viewer(&self, id: u64, link: Arc<dyn Outbox>) -> Result<(), String> {
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        let want = {
+            let viewers = self.viewers.lock().unwrap();
+            let Some(b) = viewers.get(&id) else { return Err(format!("no viewer {id}")) };
+            if matches!(b.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed) {
+                return Err(format!("viewer {id}: the connection is up"));
+            }
+            b.want
+        };
+        eprintln!("host: viewer {id} asked to start over");
+        self.remove_viewer(id);
+        self.add_viewer(id, link, want)
+    }
+
+    /// How each viewer's connection stands. STREAMER_DEBUG_LINK_NO_HOLE: a hole is not told.
+    pub fn viewer_links(&self) -> Vec<(u64, crate::viewer::Link)> {
+        use crate::viewer::Link;
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        let no_hole = std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_some();
+        self.viewers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, b)| {
+                let up = matches!(b.webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
+                let link = if up {
+                    if b.hole.is_some() && !no_hole { Link::Punched } else { Link::Direct }
+                } else if b.punching.load(Ordering::SeqCst) {
+                    Link::Punching
+                } else {
+                    Link::Connecting
+                };
+                (*id, link)
+            })
+            .collect()
+    }
+
     /// Removes a viewer branch while the others keep playing. The last viewer stops capture
     /// and encoding. Must not run on a streaming thread.
     pub fn remove_viewer(&self, id: u64) {
@@ -1782,14 +1865,31 @@ impl Host {
             .build()
             .unwrap();
         webrtc.set_property_from_str("bundle-policy", "max-bundle");
-        crate::ice::configure(&webrtc, &self.cfg().ice);
-        let _ = crate::ice::watch(&webrtc, format!("viewer {id}"), self.cfg().ice.turn.is_some(), |_| {});
+        // A hole punched for this viewer (its connection failed before): its port, once.
+        let mut ice = self.cfg().ice;
+        ice.pinned = self.pinned.lock().unwrap().remove(&id).filter(|(_, at)| at.elapsed() < Duration::from_secs(15)).map(|(p, _)| p);
+        if let Some(p) = ice.pinned {
+            eprintln!("host: connecting with viewer {id} through a punched hole (local port {})", p.port);
+        }
+        crate::ice::configure(&webrtc, &ice);
+        let (hook, w) = (self.on_viewer_failed.clone(), webrtc.downgrade());
+        let _ = crate::ice::watch(&webrtc, format!("viewer {id}"), ice.turn.is_some(), move |was_up| {
+            let f = hook.lock().unwrap().clone();
+            if let (Some(f), Some(w)) = (f, w.upgrade()) {
+                f(id, w, was_up);
+            }
+        });
 
         let l = link.clone();
+        // Tests only: STREAMER_DEBUG_ICE_NO_CANDIDATES: our candidates are not sent (a
+        // connection without a punched hole fails, as between two NATs).
+        let send_candidates = std::env::var_os("STREAMER_DEBUG_ICE_NO_CANDIDATES").is_none();
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
             let cand = v[2].get::<String>().unwrap();
-            l.send("ice", &format!("{mline} {cand}"));
+            if send_candidates {
+                l.send("ice", &format!("{mline} {cand}"));
+            }
             None
         });
 
@@ -1845,6 +1945,9 @@ impl Host {
             video: Arc::new(Mutex::new(video)),
             video_in,
             unlinked,
+            hole: ice.pinned,
+            handled: Arc::default(),
+            punching: Arc::default(),
         };
         // Between the queue and the payloader, so dropped frames leave no gaps in RTP
         // sequence numbers.
@@ -1883,7 +1986,7 @@ impl Host {
 
     /// Applies one signaling message from viewer `id`.
     pub fn on_message(&self, id: u64, link: &dyn Outbox, kind: &str, payload: &str) {
-        let Some((webrtc, gate)) = self.viewers.lock().unwrap().get(&id).map(|b| (b.webrtc.clone(), b.gate.clone())) else {
+        let Some((webrtc, gate, hole)) = self.viewers.lock().unwrap().get(&id).map(|b| (b.webrtc.clone(), b.gate.clone(), b.hole)) else {
             return;
         };
         let webrtc = &webrtc;
@@ -1892,6 +1995,8 @@ impl Host {
                 if let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) {
                     let answer = WebRTCSessionDescription::new(WebRTCSDPType::Answer, sdp);
                     webrtc.emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
+                    // A punched hole: the viewer's address there as a candidate.
+                    crate::ice::add_pinned(webrtc, hole);
                 }
             }
             "ice" => add_ice(webrtc, payload),

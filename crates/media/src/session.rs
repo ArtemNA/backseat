@@ -25,6 +25,9 @@ const TO_VIEWER: &str = "s/";
 const VOICE: &str = "c/";
 /// Hole punching between two members (`crate::punch`).
 const PUNCH: &str = "p/";
+/// A viewer to the streamer: "my connection with you is new (on a punched hole), make yours
+/// again". Not passed to the host's own messages.
+const RESTART: &str = "restart";
 
 /// What changed, for the UI or a command-line report.
 #[derive(Debug, Clone)]
@@ -196,6 +199,14 @@ impl Session {
             voice_join: Mutex::new(()),
         });
         let _ = s.events.send(Event::Peers(peers));
+        {
+            let weak = Arc::downgrade(&s);
+            s.puncher.on_info("watch", move |from, slot| {
+                if let Some(s) = weak.upgrade() {
+                    s.on_watch_info(from, slot);
+                }
+            });
+        }
         let weak = Arc::downgrade(&s);
         std::thread::Builder::new()
             .name("session".into())
@@ -295,6 +306,99 @@ impl Session {
         self.state.lock().unwrap().host.clone()
     }
 
+    /// A peer started punching for a stream connection with us (its failure came first):
+    /// ours joins in if that connection is not up. Slot "w<streamer>": we are the streamer
+    /// and they watch, or they are the streamer we watch.
+    fn on_watch_info(self: &Arc<Self>, from: PeerId, slot: &str) {
+        if slot == crate::punch::watch_slot(self.id) {
+            if let Some((w, false)) = self.host().and_then(|h| h.viewer_connection(from)) {
+                eprintln!("host: viewer {from} started punching; joining in");
+                self.viewer_failed(from, w, false);
+            }
+        } else if slot == crate::punch::watch_slot(from) {
+            let w = self.state.lock().unwrap().watches.get(&from).cloned();
+            if let Some(w) = w.filter(|w| !w.viewer.connected()) {
+                eprintln!("viewer: {from} started punching; joining in");
+                let conn = w.viewer.webrtc();
+                self.watch_failed(w, conn, false);
+            }
+        }
+    }
+
+    /// Our connection `w` with a viewer failed. One that never came up: a hole is punched for
+    /// it and kept for the viewer's next connection; the viewer, punching too, makes its own
+    /// again on its hole and asks us to start over ("restart"). One that worked: as before
+    /// (nothing; the viewer sees the stream stop). STREAMER_DEBUG_PUNCH_OFF: no punching.
+    fn viewer_failed(self: &Arc<Self>, viewer: PeerId, w: gst::Element, was_up: bool) {
+        if was_up || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let Some(s) = me.upgrade() else { return };
+            let Some(host) = s.host() else { return };
+            let Some(punching) = host.claim_viewer(viewer, &w) else { return };
+            let (puncher, slot) = (s.puncher.clone(), crate::punch::watch_slot(s.id));
+            drop(s);
+            let current = || host.viewer_connection(viewer).is_some_and(|(c, _)| c == w);
+            punching.store(true, Ordering::SeqCst);
+            let hole = puncher.punch_waiting(viewer, &slot, current);
+            punching.store(false, Ordering::SeqCst);
+            if let Some(hole) = hole.filter(|_| current()) {
+                host.set_pinned(viewer, hole);
+                puncher.send_done(viewer, &slot);
+            }
+        });
+    }
+
+    /// Our connection `conn` with the streamer of `w` failed. One that never came up: a
+    /// hole is punched; once the streamer has kept its side ("done"), the connection is made
+    /// again on it (the window and decoder stay) and the streamer asked to start over.
+    /// One that worked, or no hole: as before (the watch shows no connection).
+    fn watch_failed(self: &Arc<Self>, w: Arc<Watch>, conn: gst::Element, was_up: bool) {
+        let me = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let Some(s) = me.upgrade() else { return };
+            let streamer = w.streamer;
+            let mine = |s: &Session| s.state.lock().unwrap().watches.get(&streamer).is_some_and(|x| Arc::ptr_eq(x, &w)) && w.viewer.webrtc() == conn;
+            if !mine(&s) || !w.viewer.claim(&conn) {
+                return;
+            }
+            if was_up || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
+                w.viewer.give_up();
+                return;
+            }
+            let (puncher, slot) = (s.puncher.clone(), crate::punch::watch_slot(streamer));
+            drop(s);
+            let current = || me.upgrade().is_some_and(|s| mine(&s));
+            let started = std::time::Instant::now();
+            w.viewer.punching.store(true, Ordering::SeqCst);
+            let hole = puncher.punch_waiting(streamer, &slot, current);
+            let hole = hole.filter(|_| {
+                // The streamer keeps its hole first, or its new connection would not use it.
+                if !puncher.wait_done(streamer, &slot, started, Duration::from_secs(8)) {
+                    eprintln!("viewer: {streamer} did not say its hole is ready; starting over anyway");
+                }
+                current()
+            });
+            w.viewer.punching.store(false, Ordering::SeqCst);
+            let Some(hole) = hole else {
+                if current() {
+                    w.viewer.give_up();
+                }
+                return;
+            };
+            eprintln!("viewer: connecting with {streamer} again through a punched hole (local port {})", hole.port);
+            match w.viewer.rebuild(hole) {
+                Ok(()) => w.link.send(RESTART, ""),
+                Err(e) => {
+                    eprintln!("viewer: cannot make the connection again: {e}");
+                    w.viewer.give_up();
+                }
+            }
+        });
+    }
+
     /// Starts streaming with `cfg`. The encoder only runs while someone watches.
     /// A capture that fails for good (its window closed) ends the stream as Stop does, and
     /// `Event::LiveEnded` says why; the viewers would otherwise keep its last frame.
@@ -309,6 +413,12 @@ impl Session {
         }
         self.client.send(ClientMsg::SetStreaming { streaming: true });
         self.set_streaming_flag(true);
+        let me = Arc::downgrade(self);
+        host.on_viewer_failed(Arc::new(move |viewer, w, was_up| {
+            if let Some(s) = me.upgrade() {
+                s.viewer_failed(viewer, w, was_up);
+            }
+        }));
         let (s, h) = (Arc::downgrade(self), Arc::downgrade(&host));
         host.on_source_lost(Box::new(move |reason| {
             let (s, h) = (s.clone(), h.clone());
@@ -392,6 +502,14 @@ impl Session {
             stop: Arc::new(AtomicBool::new(false)),
         });
         self.state.lock().unwrap().watches.insert(streamer, w.clone());
+        {
+            let (me, weak_w) = (Arc::downgrade(self), Arc::downgrade(&w));
+            w.viewer.on_failed(Arc::new(move |conn, was_up| {
+                if let (Some(s), Some(w)) = (me.upgrade(), weak_w.upgrade()) {
+                    s.watch_failed(w, conn, was_up);
+                }
+            }));
+        }
         self.client.send(ClientMsg::Subscribe { streamer, quality });
         // Clock sync for latency figures; also notices a closed window.
         let (weak, w2) = (Arc::downgrade(self), w.clone());
@@ -702,7 +820,16 @@ impl Session {
                     let st = self.state.lock().unwrap();
                     if let (Some(host), Some(out)) = (st.host.clone(), st.viewers.get(&from).cloned()) {
                         drop(st);
-                        host.on_message(from, out.as_ref(), k, &payload);
+                        if k == RESTART {
+                            // Off the session thread: the branch is taken down and made again.
+                            std::thread::spawn(move || {
+                                if let Err(e) = host.restart_viewer(from, out) {
+                                    eprintln!("host: {e}");
+                                }
+                            });
+                        } else {
+                            host.on_message(from, out.as_ref(), k, &payload);
+                        }
                     }
                 } else if let Some(k) = kind.strip_prefix(VOICE) {
                     self.on_voice(from, k, &payload);

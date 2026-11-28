@@ -301,6 +301,7 @@ fn main() {
             last_net = net;
         }
         eprintln!("viewer net | {mbit:.1} Mbit/s loss {loss:.1}%");
+        eprintln!("viewer link | {:?}", viewer.link());
         let (iv, lat, pre, alat) = (
             st.frame_interval.take(),
             st.video_latency.take(),

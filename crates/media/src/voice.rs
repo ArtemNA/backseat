@@ -598,8 +598,8 @@ impl Voice {
     /// (its connection failed before ours noticed), ours joins in at once.
     pub fn set_puncher(&self, p: Arc<crate::punch::Puncher>) {
         let me = self.me.lock().unwrap().clone();
-        p.on_info(move |id, slot| {
-            let Some(v) = me.upgrade().filter(|_| slot == "voice") else { return };
+        p.on_info("voice", move |id, _| {
+            let Some(v) = me.upgrade() else { return };
             let found = v.peers.lock().unwrap().get(&id).filter(|p| !p.up.load(Ordering::SeqCst)).map(|p| (p.webrtc.clone(), p.offerer));
             if let Some((w, offerer)) = found {
                 eprintln!("voice: {id} started punching; joining in");

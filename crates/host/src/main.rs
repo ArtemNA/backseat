@@ -310,6 +310,9 @@ fn main() {
                 keys,
             );
         }
+        for (id, l) in host.viewer_links() {
+            eprintln!("host link | viewer {id} {l:?}");
+        }
         for q in host.viewer_quality() {
             let problems = marker.assess(&q);
             let mark = if problems.is_empty() {

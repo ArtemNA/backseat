@@ -42,6 +42,20 @@ pub struct WatchStats {
     pub muted: bool,
     /// "AV1 · GPU", "AV1 · CPU (dav1d)", "H265 · GPU"; empty before video arrives.
     pub codec: String,
+    /// The connection with the streamer: "connecting", "punching" (through the NAT),
+    /// "punched" (up through a punched hole) or "direct".
+    pub link: &'static str,
+}
+
+/// A connection's state as the UI and the local API name it.
+pub fn link_name(l: media::viewer::Link) -> &'static str {
+    use media::viewer::Link;
+    match l {
+        Link::Connecting => "connecting",
+        Link::Punching => "punching",
+        Link::Punched => "punched",
+        Link::Direct => "direct",
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -54,6 +68,8 @@ pub struct ViewerRow {
     pub catchups: u64,
     /// Short codes the UI translates: "loss:4.7", "queue:1748".
     pub problems: Vec<String>,
+    /// The connection with this viewer (as `WatchStats::link`).
+    pub link: &'static str,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -201,12 +217,17 @@ enum Pending {
     NoAnswer,
     /// Offer and answer went through, the direct connection did not.
     Network,
+    /// The direct connection failed; a hole in the NAT is being punched.
+    Punching,
 }
 
 fn window_status(name: &str, p: Pending) -> String {
     let lang = UI_LANG.lock().unwrap().clone();
     match (lang.as_str(), p) {
         ("uk", Pending::Connecting) => format!("З'єднання з {name}…"),
+        ("uk", Pending::Punching) => format!("Прямого з'єднання з {name} немає: пробиваю NAT…"),
+        ("ru", Pending::Punching) => format!("Прямого соединения с {name} нет: пробиваю NAT…"),
+        (_, Pending::Punching) => format!("No direct connection to {name}: punching through the NAT…"),
         ("uk", Pending::NoAnswer) => format!("{name} не відповів на запит. Спробуйте ще раз; якщо не допоможе, хай {name} перезапустить стрім."),
         ("uk", Pending::Network) => format!("Немає прямого з'єднання з {name}. Мережа однієї зі сторін його блокує; допомогти може сервер TURN."),
         ("ru", Pending::Connecting) => format!("Соединение с {name}…"),
@@ -253,6 +274,7 @@ fn sample(inner: &Mutex<Inner>) {
             embedded: st.embedded,
             popped: w.viewer.window.is_some() && !st.embedded,
             muted: w.viewer.muted(),
+            link: link_name(w.viewer.link()),
             codec: w
                 .viewer
                 .video_codec
@@ -284,6 +306,7 @@ fn sample(inner: &Mutex<Inner>) {
             if w.viewer.stats.frames.load(Ordering::Relaxed) == 0 {
                 let name = names.get(&w.streamer).cloned().unwrap_or_default();
                 let p = match (w.viewer.ice_failed.load(Ordering::Relaxed), w.viewer.offered.load(Ordering::Relaxed)) {
+                    (false, _) if w.viewer.punching.load(Ordering::Relaxed) => Pending::Punching,
                     (false, _) => Pending::Connecting,
                     (true, false) => Pending::NoAnswer,
                     (true, true) => Pending::Network,
@@ -373,10 +396,12 @@ fn sample(inner: &Mutex<Inner>) {
         let rate: HashMap<String, f64> = layers.iter().map(|l| (l.quality.clone(), l.mbit)).collect();
         let layer_of: HashMap<u64, String> = h.viewer_layers().into_iter().map(|(id, q)| (id, q.to_string())).collect();
         let mut i = inner.lock().unwrap();
+        let links = h.viewer_links();
         let viewers: Vec<ViewerRow> = h
             .viewer_quality()
             .iter()
             .map(|q| ViewerRow {
+                link: links.iter().find(|(id, _)| *id == q.id).map(|(_, l)| link_name(*l)).unwrap_or("connecting"),
                 id: q.id,
                 name: names.get(&q.id).cloned().unwrap_or_else(|| format!("#{}", q.id)),
                 quality: layer_of.get(&q.id).cloned().unwrap_or_default(),

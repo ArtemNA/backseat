@@ -774,15 +774,7 @@ impl Shell {
                         .child(div().flex_1().min_w_0().truncate().text_color(rgb(if v.speaking.contains(&p.id) { color::BRIGHT } else { color::TEXT })).child(p.name.clone()))
                         // How our connection with them stands: being made, punched through the
                         // NAT, or up through a punched hole (quiet grey, always there while so).
-                        .when_some(voice_link_icon(v, id), |d, (icon, colour, tip)| {
-                            d.child(
-                                div()
-                                    .id(SharedString::from(format!("voice-link-{id}")))
-                                    .text_color(rgb(colour))
-                                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(t(tip)).build(window, cx))
-                                    .child(Icon::default().path(icon).xsmall()),
-                            )
-                        })
+                        .children(link_badge(format!("voice-link-{id}"), voice_link(v, id)))
                         .when(muted, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/mic-off.svg").small())))
                         .when(deaf, |d| d.child(div().text_color(rgb(color::LIVE)).child(Icon::default().path("icons/headphone-off.svg").small())))
                 };
@@ -1058,18 +1050,37 @@ fn row() -> Div {
 
 /// An avatar with a green ring while its person speaks (the ring's room is always kept, so
 /// nothing moves when it shows).
-/// The icon, its colour and tooltip key for how our voice connection with `id` stands; None
-/// when it is up the usual way (or it is us, or we are not in voice).
-fn voice_link_icon(v: &backseat_core::VoiceView, id: u64) -> Option<(&'static str, u32, &'static str)> {
+/// How our voice connection with `id` stands, by its name in `link_badge`.
+fn voice_link(v: &backseat_core::VoiceView, id: u64) -> &'static str {
     if v.punching.contains(&id) {
-        Some(("icons/zap.svg", color::PUNCHING, "voice.link_punching"))
+        "punching"
     } else if v.connecting.contains(&id) {
-        Some(("icons/loader-circle.svg", color::MUTED, "voice.link_connecting"))
+        "connecting"
     } else if v.punched.contains(&id) {
-        Some(("icons/link-2.svg", color::QUIET, "voice.link_punched"))
+        "punched"
     } else {
-        None
+        "direct"
     }
+}
+
+/// A small icon for how a connection stands ("connecting", "punching", "punched"), with a
+/// tooltip; nothing when it is up the usual way. Quiet grey while it stays punched.
+pub(crate) fn link_badge(id: String, link: &str) -> Option<Stateful<Div>> {
+    use gpui_kit::component::{Icon, Sizable as _};
+    let (icon, colour, tip) = match link {
+        "punching" => ("icons/zap.svg", color::PUNCHING, "voice.link_punching"),
+        "connecting" => ("icons/loader-circle.svg", color::MUTED, "voice.link_connecting"),
+        "punched" => ("icons/link-2.svg", color::QUIET, "voice.link_punched"),
+        _ => return None,
+    };
+    Some(
+        div()
+            .id(SharedString::from(id))
+            .flex_none()
+            .text_color(rgb(colour))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(t(tip)).build(window, cx))
+            .child(Icon::default().path(icon).xsmall()),
+    )
 }
 
 fn voice_avatar(name: &str, speaking: bool) -> Div {

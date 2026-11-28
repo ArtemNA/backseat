@@ -43,8 +43,22 @@ const STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com
 /// The hard side's sockets. Fewer outside Windows: a macOS app may have only 256 file
 /// descriptors in all.
 const SOCKETS: usize = if cfg!(windows) { 256 } else { 128 };
-/// The slots punching is for (messages for others are ignored).
-const SLOTS: [&str; 2] = ["voice", "watch"];
+/// The slots punching is for (messages for others are ignored): "voice", and "w<id>" for
+/// watching the stream of member <id> (both sides name it by the streamer, so two members
+/// watching each other's streams punch two holes, not one).
+fn slot_ok(slot: &str) -> bool {
+    slot == "voice" || slot.strip_prefix('w').is_some_and(|d| !d.is_empty() && d.len() <= 20 && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The slot for watching the stream of `streamer`.
+pub fn watch_slot(streamer: PeerId) -> String {
+    format!("w{streamer}")
+}
+
+/// What a slot is for: "voice" or "watch" (its hook in `Puncher::on_info`).
+fn slot_class(slot: &str) -> &'static str {
+    if slot == "voice" { "voice" } else { "watch" }
+}
 /// How long a punch may take before it is given up.
 const PUNCH_FOR: Duration = Duration::from_secs(15);
 /// Probes the easy side sends in a round at most. Each is an entry in its router's NAT table
@@ -316,8 +330,10 @@ pub struct Puncher {
     /// Told when a peer's "info" comes and no punch with it for that slot is running: the
     /// other side's connection failed first, and ours may start punching now instead of
     /// waiting for its own failure (more than INFO_WAIT apart, neither side punched).
-    on_info: Mutex<Option<Arc<dyn Fn(PeerId, &str) + std::marker::Send + Sync>>>,
+    on_info: Mutex<HashMap<&'static str, InfoHook>>,
 }
+
+type InfoHook = Arc<dyn Fn(PeerId, &str) + std::marker::Send + Sync>;
 
 /// Takes a running punch off the set however it ends.
 struct Running<'a>(&'a Puncher, (PeerId, String));
@@ -332,14 +348,15 @@ impl Puncher {
         Arc::new(Self { send, heard: Mutex::default(), heard_cv: std::sync::Condvar::new(), failed: Mutex::default(), running: Mutex::default(), on_info: Mutex::default() })
     }
 
-    /// `f(peer, slot)` when a peer's "info" comes while we are not punching with it.
-    pub fn on_info(&self, f: impl Fn(PeerId, &str) + std::marker::Send + Sync + 'static) {
-        *self.on_info.lock().unwrap() = Some(Arc::new(f));
+    /// `f(peer, slot)` when a peer's "info" comes for a slot of `class` ("voice" or "watch")
+    /// while we are not punching with it for that slot.
+    pub fn on_info(&self, class: &'static str, f: impl Fn(PeerId, &str) + std::marker::Send + Sync + 'static) {
+        self.on_info.lock().unwrap().insert(class, Arc::new(f));
     }
 
     /// A "p/" message from `from` (the "p/" taken off `kind`): "info:<slot>" or "done:<slot>".
     pub fn on_message(&self, from: PeerId, kind: &str, payload: &str) {
-        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done") && SLOTS.contains(&slot));
+        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done") && slot_ok(slot));
         if !known || payload.len() > 100 {
             return;
         }
@@ -352,7 +369,7 @@ impl Puncher {
         self.heard_cv.notify_all();
         drop(h);
         if let Some(slot) = kind.strip_prefix("info:") {
-            let hook = self.on_info.lock().unwrap().clone();
+            let hook = self.on_info.lock().unwrap().get(slot_class(slot)).cloned();
             // STREAMER_DEBUG_PUNCH_NO_JOIN: we wait for our own failure (the spoiled variant).
             let join = std::env::var_os("STREAMER_DEBUG_PUNCH_NO_JOIN").is_none();
             if let (Some(f), false, true) = (hook, self.busy(from, slot), join) {
@@ -428,6 +445,26 @@ impl Puncher {
         Ok(got)
     }
 
+    /// `punch`, but when one with `peer` for `slot` is running already (for a connection
+    /// before this one) it waits for that to end (40 s at most) and punches then, while
+    /// `still()` (this connection is still the one). None: no hole, or not wanted any more.
+    pub fn punch_waiting(&self, peer: PeerId, slot: &str, still: impl Fn() -> bool) -> Option<Pinned> {
+        loop {
+            match self.punch(peer, slot) {
+                Ok(hole) => return hole,
+                Err(Busy) => {
+                    let t = Instant::now();
+                    while self.busy(peer, slot) && t.elapsed() < Duration::from_secs(40) {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    if !still() || self.busy(peer, slot) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     /// The hole, and whether probing ran at all.
     fn punch_once(&self, peer: PeerId, slot: &str) -> (Option<Pinned>, bool) {
         let mut rng = Rng::new();
@@ -488,6 +525,13 @@ fn kind_name(k: Kind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slots_are_checked() {
+        assert!(slot_ok("voice") && slot_ok("w12") && slot_ok(&watch_slot(u64::MAX)));
+        assert!(!slot_ok("watch") && !slot_ok("w") && !slot_ok("w1x") && !slot_ok("x"));
+        assert_eq!((slot_class("voice"), slot_class("w7")), ("voice", "watch"));
+    }
 
     #[test]
     fn a_second_punch_is_busy() {

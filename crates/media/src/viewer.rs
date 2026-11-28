@@ -42,9 +42,34 @@ pub struct JitterReport {
     pub late: u64,
 }
 
+/// Told when the connection `w` with the streamer fails (`was_up`: it had worked).
+pub type FailHook = Arc<dyn Fn(gst::Element, bool) + Send + Sync>;
+
+/// How the connection with the streamer stands, for the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    Connecting,
+    Punching,
+    Direct,
+    Punched,
+}
+
 pub struct Viewer {
     pub pipeline: gst::Pipeline,
-    pub webrtc: gst::Element,
+    /// The connection with the streamer: replaced by `rebuild` (on a punched hole) while no
+    /// media has come through it yet; the window, decoder and sound stay.
+    webrtc: Mutex<gst::Element>,
+    /// Sets up a new webrtcbin as the first one was (signals, jitter buffers, ICE).
+    setup: Arc<dyn Fn(&gst::Element, &crate::config::IceConfig) + Send + Sync>,
+    /// The punched hole the connection uses, if any (told to ICE once the offer is in).
+    hole: Mutex<Option<crate::punch::Pinned>>,
+    /// The current connection's failure is being (or was) handled.
+    handled: std::sync::atomic::AtomicBool,
+    on_failed: Arc<Mutex<Option<FailHook>>>,
+    /// The ICE settings the watch started with.
+    ice: crate::config::IceConfig,
+    /// A punch for this connection is running (set by whoever punches).
+    pub punching: std::sync::atomic::AtomicBool,
     pub stats: ViewerStats,
     #[cfg(windows)]
     pub window_closed: Arc<std::sync::atomic::AtomicBool>,
@@ -121,29 +146,42 @@ impl Viewer {
     pub fn new(cfg: ViewerConfig, clock: HostClock, link: Arc<dyn Outbox>) -> Result<Self, String> {
         let pipeline = gst::Pipeline::with_name("viewer");
         crate::drain_bus(&pipeline, "viewer");
-        let webrtc = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
-        webrtc.set_property_from_str("bundle-policy", "max-bundle");
-        crate::ice::configure(&webrtc, &cfg.ice);
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (f, o) = (failed.clone(), offered.clone());
-        let _ = crate::ice::watch(&webrtc, "the streamer".into(), cfg.ice.turn.is_some(), move |_| {
-            if !o.load(Ordering::SeqCst) {
-                eprintln!("viewer: the streamer never answered the request to watch; the network was not tried");
-            }
-            f.store(true, Ordering::SeqCst)
-        });
-        webrtc.set_property("latency", cfg.latency_ms);
-        pipeline.add(&webrtc).unwrap();
-
-        webrtc.connect("on-new-transceiver", false, |v| {
-            if let Ok(t) = v[1].get::<gst_webrtc::WebRTCRTPTransceiver>() {
-                t.set_property("do-nack", true);
-            }
-            None
-        });
+        let on_failed: Arc<Mutex<Option<FailHook>>> = Arc::default();
+        // What each connection (webrtcbin) gets, the first one and any made later.
+        type Part = Box<dyn Fn(&gst::Element) + Send + Sync>;
+        let mut parts: Vec<Part> = vec![];
+        {
+            let (f, o, h, turn, latency) = (failed.clone(), offered.clone(), on_failed.clone(), cfg.ice.turn.is_some(), cfg.latency_ms);
+            parts.push(Box::new(move |webrtc: &gst::Element| {
+                let (f, o, h, w) = (f.clone(), o.clone(), h.clone(), webrtc.downgrade());
+                let _ = crate::ice::watch(webrtc, "the streamer".into(), turn, move |was_up| {
+                    if !o.load(Ordering::SeqCst) {
+                        eprintln!("viewer: the streamer never answered the request to watch; the network was not tried");
+                    }
+                    // Whoever listens (the session) says when it gives up (`give_up`): it may
+                    // punch a hole and connect again first.
+                    let hook = h.lock().unwrap().clone();
+                    match (hook, w.upgrade()) {
+                        (Some(hook), Some(w)) => hook(w, was_up),
+                        _ => f.store(true, Ordering::SeqCst),
+                    }
+                });
+                webrtc.set_property("latency", latency);
+                webrtc.connect("on-new-transceiver", false, |v| {
+                    if let Ok(t) = v[1].get::<gst_webrtc::WebRTCRTPTransceiver>() {
+                        t.set_property("do-nack", true);
+                    }
+                    None
+                });
+            }));
+        }
         let relay = cfg.impair.active().then(|| crate::netsim::LossRelay::start(cfg.impair));
-        let (l, r, no_ice) = (link.clone(), relay.clone(), cfg.debug_no_ice);
+        // STREAMER_DEBUG_ICE_NO_CANDIDATES (tests): our candidates are not sent.
+        let (l, r, no_ice) = (link.clone(), relay.clone(), cfg.debug_no_ice || std::env::var_os("STREAMER_DEBUG_ICE_NO_CANDIDATES").is_some());
+        parts.push(Box::new(move |webrtc: &gst::Element| {
+        let (l, r) = (l.clone(), r.clone());
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
             let mut cand = v[2].get::<String>().unwrap();
@@ -159,6 +197,7 @@ impl Viewer {
             l.send("ice", &format!("{mline} {cand}"));
             None
         });
+        }));
         let stats = ViewerStats::default();
         let jitterbuffers = Arc::new(Mutex::new(Vec::new()));
         let lag = Arc::new(crate::catchup::LagWatch::default());
@@ -177,8 +216,13 @@ impl Viewer {
                 }
             })
         };
-        tune_jitterbuffer(&webrtc, stats.transit.clone(), jitterbuffers.clone(), (lag.clone(), ask));
-        crate::diag::watch_jitterbuffers(&webrtc, "stream".into());
+        {
+            let (transit, jbs, lag) = (stats.transit.clone(), jitterbuffers.clone(), lag.clone());
+            parts.push(Box::new(move |webrtc: &gst::Element| {
+                tune_jitterbuffer(webrtc, transit.clone(), jbs.clone(), (lag.clone(), ask.clone()));
+                crate::diag::watch_jitterbuffers(webrtc, "stream".into());
+            }));
+        }
 
         // The video in a process of its own (decoder and window): a fault in the GPU driver
         // ends only that process. STREAMER_VIDEO_IN_PROCESS: here, as before.
@@ -244,7 +288,7 @@ impl Viewer {
             // Its controls start as the saved sound, not at full volume.
             w.sync_audio(audio.muted.load(Ordering::SeqCst), audio.volume.load(Ordering::SeqCst) as f32 / 100.0);
         }
-        webrtc.connect_pad_added(move |_, pad| {
+        let pad_added = Arc::new(move |pad: &gst::Pad| {
             if pad.direction() != gst::PadDirection::Src {
                 return;
             }
@@ -295,10 +339,30 @@ impl Viewer {
                 eprintln!("viewer: cannot build {media} branch: {e}");
             }
         });
+        parts.push(Box::new(move |webrtc: &gst::Element| {
+            let h = pad_added.clone();
+            webrtc.connect_pad_added(move |_, pad| h(pad));
+        }));
+        let setup: Arc<dyn Fn(&gst::Element, &crate::config::IceConfig) + Send + Sync> = Arc::new(move |webrtc, ice| {
+            webrtc.set_property_from_str("bundle-policy", "max-bundle");
+            crate::ice::configure(webrtc, ice);
+            for p in &parts {
+                p(webrtc);
+            }
+        });
+        let webrtc = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
+        setup(&webrtc, &cfg.ice);
+        pipeline.add(&webrtc).unwrap();
 
         Ok(Self {
             pipeline,
-            webrtc,
+            webrtc: Mutex::new(webrtc),
+            setup,
+            hole: Mutex::default(),
+            handled: Default::default(),
+            on_failed,
+            ice: cfg.ice.clone(),
+            punching: Default::default(),
             stats,
             #[cfg(windows)]
             window_closed: match &remote {
@@ -360,7 +424,7 @@ impl Viewer {
     /// Video receive counters from webrtcbin, or None before the stream starts.
     pub fn inbound(&self) -> Option<Inbound> {
         let promise = gst::Promise::new();
-        self.webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        self.webrtc().emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
         if promise.wait() != gst::PromiseResult::Replied {
             return None;
         }
@@ -402,6 +466,70 @@ impl Viewer {
         }
         #[cfg(not(windows))]
         None
+    }
+
+    /// The connection with the streamer now.
+    pub fn webrtc(&self) -> gst::Element {
+        self.webrtc.lock().unwrap().clone()
+    }
+
+    /// `f(connection, was_up)` when a connection with the streamer fails.
+    pub fn on_failed(&self, f: FailHook) {
+        *self.on_failed.lock().unwrap() = Some(f);
+    }
+
+    /// No connection with the streamer could be made (`ice_failed`).
+    pub fn give_up(&self) {
+        self.ice_failed.store(true, Ordering::SeqCst);
+    }
+
+    /// Takes the failure of connection `w` to handle: false when it is no longer the
+    /// connection, or its failure is handled already.
+    pub fn claim(&self, w: &gst::Element) -> bool {
+        let cur = self.webrtc.lock().unwrap();
+        *cur == *w && !self.handled.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether the connection is up now.
+    pub fn connected(&self) -> bool {
+        use gst_webrtc::WebRTCICEConnectionState as State;
+        matches!(self.webrtc().property::<State>("ice-connection-state"), State::Connected | State::Completed)
+    }
+
+    /// How the connection stands. STREAMER_DEBUG_LINK_NO_HOLE: a hole is not told (tests).
+    pub fn link(&self) -> Link {
+        if self.connected() {
+            let hole = self.hole.lock().unwrap().is_some() && std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_none();
+            if hole { Link::Punched } else { Link::Direct }
+        } else if self.punching.load(Ordering::SeqCst) {
+            Link::Punching
+        } else {
+            Link::Connecting
+        }
+    }
+
+    /// Replaces the connection with a new one on the punched `hole`, for a connection that
+    /// never came up: no media came through it, so nothing else changes. The streamer is
+    /// asked to start over afterwards (its offer comes to the new one).
+    pub fn rebuild(&self, hole: crate::punch::Pinned) -> Result<(), String> {
+        let mut ice = self.ice.clone();
+        ice.pinned = Some(hole);
+        let ice = &ice;
+        let new = gst::ElementFactory::make("webrtcbin").build().map_err(|e| e.to_string())?;
+        (self.setup)(&new, ice);
+        self.pipeline.add(&new).map_err(|e| e.to_string())?;
+        let old = {
+            let mut cur = self.webrtc.lock().unwrap();
+            *self.hole.lock().unwrap() = ice.pinned;
+            self.handled.store(false, Ordering::SeqCst);
+            self.ice_failed.store(false, Ordering::SeqCst);
+            self.offered.store(false, Ordering::SeqCst);
+            std::mem::replace(&mut *cur, new.clone())
+        };
+        let _ = old.set_state(gst::State::Null);
+        let _ = self.pipeline.remove(&old);
+        new.sync_state_with_parent().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn start(&self) -> Result<(), String> {
@@ -475,22 +603,25 @@ impl Viewer {
                 self.offered.store(true, Ordering::SeqCst);
                 let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) else { return };
                 let offer = WebRTCSessionDescription::new(WebRTCSDPType::Offer, sdp);
-                self.webrtc.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
-                let (w, l) = (self.webrtc.clone(), link.clone());
+                let webrtc = self.webrtc();
+                webrtc.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
+                // A punched hole: its address as a candidate (ICE knows no other way there).
+                crate::ice::add_pinned(&webrtc, *self.hole.lock().unwrap());
+                let (w, l) = (webrtc.clone(), link.clone());
                 let promise = gst::Promise::with_change_func(move |reply| {
                     let Ok(Some(reply)) = reply else { return };
                     let Ok(answer) = reply.get::<WebRTCSessionDescription>("answer") else { return };
                     w.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
                     l.send("answer", &answer.sdp().as_text().unwrap());
                 });
-                self.webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
+                webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
             }
             "ice" => match &self.relay {
-                None => add_ice(&self.webrtc, payload),
+                None => add_ice(&self.webrtc(), payload),
                 Some(r) => {
                     if let Some((mline, cand)) = payload.split_once(' ') {
                         if let Some(c) = r.rewrite_remote(cand) {
-                            add_ice(&self.webrtc, &format!("{mline} {c}"));
+                            add_ice(&self.webrtc(), &format!("{mline} {c}"));
                         }
                     }
                 }

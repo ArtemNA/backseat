@@ -450,6 +450,7 @@ impl Shell {
                     .px_2p5()
                     .py_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color::BRIGHT)).child(p.name.clone()))
+                    .children(crate::link_badge(format!("watch-link-{id}"), w.link))
                     .child(div().flex_1().text_xs().whitespace_nowrap().text_color(rgb(if throttled { 0xf0b232 } else { color::MUTED })).child(stat))
                     .when_some(tile, |d, t| d.child(div().w(px(150.)).cursor_pointer().child(Select::new(&t.mode).small())).child(div().w(px(110.)).cursor_pointer().child(Select::new(&t.kbit).small())))
                     .child(Button::new(SharedString::from(format!("mute-{id}"))).cursor_pointer().small().icon(Icon::default().path(if w.muted { "icons/volume-x.svg" } else { "icons/volume-2.svg" })).tooltip(t(if w.muted { "tile.unmute" } else { "tile.mute" })).on_click(cx.listener(move |s, _, _, cx| {
@@ -558,7 +559,7 @@ impl Shell {
                         } else {
                             div().flex().items_center().gap_1p5().text_color(rgb(0x3fbf7f)).child(dot(0x3fbf7f)).child(t("live.ok"))
                         };
-                        row([div().flex().items_center().gap_2p5().child(crate::avatar(&v.name)).child(v.name.clone()).into_any_element(), div().child(short_quality(&v.quality)).into_any_element(), div().child(ms(v.rtt_ms)).into_any_element(), state.into_any_element()], false)
+                        row([div().flex().items_center().gap_2p5().child(crate::avatar(&v.name)).child(v.name.clone()).children(crate::link_badge(format!("viewer-link-{}", v.id), v.link)).into_any_element(), div().child(short_quality(&v.quality)).into_any_element(), div().child(ms(v.rtt_ms)).into_any_element(), state.into_any_element()], false)
                     }))
                     .into_any_element()
             })
