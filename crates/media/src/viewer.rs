@@ -127,7 +127,7 @@ impl Viewer {
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (f, o) = (failed.clone(), offered.clone());
-        crate::ice::watch(&webrtc, "the streamer".into(), cfg.ice.turn.is_some(), move || {
+        let _ = crate::ice::watch(&webrtc, "the streamer".into(), cfg.ice.turn.is_some(), move |_| {
             if !o.load(Ordering::SeqCst) {
                 eprintln!("viewer: the streamer never answered the request to watch; the network was not tried");
             }
