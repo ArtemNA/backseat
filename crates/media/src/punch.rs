@@ -47,6 +47,11 @@ const SOCKETS: usize = if cfg!(windows) { 256 } else { 128 };
 const SLOTS: [&str; 2] = ["voice", "watch"];
 /// How long a punch may take before it is given up.
 const PUNCH_FOR: Duration = Duration::from_secs(15);
+/// Probes the easy side sends in a round at most. Each is an entry in its router's NAT table
+/// (a cheap router has a few thousand); against 256 of the hard side's ports 3,000 random
+/// ones miss all of them with odds of e^(-3000*256/64512), about 1 in 150,000 (128 sockets
+/// outside Windows: 1 in 400). Then it only listens for an answer till the round ends.
+const MAX_PROBES: u64 = 3000;
 /// How long to wait for the other side's "info".
 const INFO_WAIT: Duration = Duration::from_secs(6);
 
@@ -226,7 +231,7 @@ fn punch_easy_hard(sock: &UdpSocket, ip: Ipv4Addr, until: Instant, rng: &mut Rng
     let mut sent = 0u64;
     while Instant::now() < until {
         let mut burst = 0;
-        while Instant::now() >= next && burst < 10 {
+        while sent < MAX_PROBES && Instant::now() >= next && burst < 10 {
             let to = SocketAddr::new(ip.into(), 1024 + (rng.next() % (65536 - 1024)) as u16);
             let _ = sock.send_to(PROBE, to);
             filter.sent(to);
@@ -246,7 +251,8 @@ fn punch_easy_hard(sock: &UdpSocket, ip: Ipv4Addr, until: Instant, rng: &mut Rng
                 return Some(Pinned { port: sock.local_addr().ok()?.port(), peer: from });
             }
             Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_micros(300)),
+            // Only listening once all probes are out: no need to wake so often.
+            Err(_) => std::thread::sleep(Duration::from_micros(if sent < MAX_PROBES { 300 } else { 5000 })),
         }
     }
     eprintln!("punch: {sent} probes, none answered");
