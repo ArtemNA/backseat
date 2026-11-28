@@ -15,7 +15,11 @@ Name "${NAME}"
 OutFile "${OUT}"
 InstallDir "$LOCALAPPDATA\Programs\${NAME}"
 InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
-VIProductVersion "${VERSION}.0"
+; NUMVER: the version in numbers only (a beta "0.2.26-beta.1" is "0.2.26" here).
+!ifndef NUMVER
+  !define NUMVER ${VERSION}
+!endif
+VIProductVersion "${NUMVER}.0"
 VIAddVersionKey "ProductName" "${NAME}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}"

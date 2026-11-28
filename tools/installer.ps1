@@ -21,6 +21,7 @@ if (-not (Test-Path $makensis)) {
   if (-not $makensis) { $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
   if (-not (Test-Path $makensis)) { throw 'makensis.exe not found (NSIS)' }
 }
-& $makensis /V2 "/DVERSION=$version" "/DSRC=$src" "/DOUT=$out" "/DSIZE_KB=$sizeKb" "$root\installer\backseat.nsi"
+$numver = ($version -split '-')[0]
+& $makensis /V2 "/DVERSION=$version" "/DNUMVER=$numver" "/DSRC=$src" "/DOUT=$out" "/DSIZE_KB=$sizeKb" "$root\installer\backseat.nsi"
 if ($LASTEXITCODE) { throw 'makensis failed' }
 'installer {0}: {1:N1} MB (folder {2:N1} MB)' -f $out, ((Get-Item $out).Length / 1MB), ($sizeKb / 1KB)
