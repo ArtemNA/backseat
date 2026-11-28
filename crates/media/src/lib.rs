@@ -25,6 +25,7 @@ pub mod voice;
 pub mod mictest;
 pub mod denoise;
 pub mod diag;
+pub mod punch;
 pub mod audio_apps;
 
 #[cfg(windows)]

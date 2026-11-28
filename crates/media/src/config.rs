@@ -160,11 +160,14 @@ pub struct IceConfig {
     pub stun: Option<String>,
     /// The user's own TURN server, as turn(s)://user:pass@host:port. Never logged.
     pub turn: Option<String>,
+    /// A punched hole for this connection (`crate::punch`): the ICE agent sits on its port
+    /// and is told the other side's address there.
+    pub pinned: Option<crate::punch::Pinned>,
 }
 
 impl Default for IceConfig {
     fn default() -> Self {
-        Self { stun: Some("stun://stun.l.google.com:19302".into()), turn: None }
+        Self { stun: Some("stun://stun.l.google.com:19302".into()), turn: None, pinned: None }
     }
 }
 

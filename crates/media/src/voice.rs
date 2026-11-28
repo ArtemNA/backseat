@@ -206,6 +206,10 @@ struct Peer {
 pub const JOIN: &str = "join";
 
 pub struct Voice {
+    /// Punches a hole when a peer's direct connection fails, and the holes got so far
+    /// (`crate::punch`).
+    puncher: Mutex<Option<Arc<crate::punch::Puncher>>>,
+    pinned: Arc<Mutex<HashMap<PeerId, crate::punch::Pinned>>>,
     /// The process's shared output pipeline: the voice lives inside it (one clock, the
     /// peers' sound straight into its mixer, the echo probe next to the canceller).
     pipeline: gst::Pipeline,
@@ -562,9 +566,21 @@ impl Voice {
                 f(e);
             }
         })));
-        let v = Arc::new(Self { pipeline, mixer, mic_pipe, mic: send.to_vec(), mute, tee, room_stop, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), deafened: Arc::default(), mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate, me: Mutex::default(), on_mic_error });
+        let v = Arc::new(Self { puncher: Mutex::default(), pinned: Arc::default(), pipeline, mixer, mic_pipe, mic: send.to_vec(), mute, tee, room_stop, cfg, peers: Mutex::default(), mic_level, raw_level, stopped: AtomicBool::new(false), deafened: Arc::default(), mic_muted: AtomicBool::new(false), transmit: AtomicBool::new(true), volumes: Arc::default(), gate, me: Mutex::default(), on_mic_error });
         *v.me.lock().unwrap() = Arc::downgrade(&v);
         Ok(v)
+    }
+
+    /// Who punches holes for this voice (the session's).
+    pub fn set_puncher(&self, p: Arc<crate::punch::Puncher>) {
+        *self.puncher.lock().unwrap() = Some(p);
+    }
+
+    /// This peer's ICE settings: ours, with its punched hole if there is one.
+    fn ice_for(&self, id: PeerId) -> crate::config::IceConfig {
+        let mut ice = self.cfg.ice.clone();
+        ice.pinned = self.pinned.lock().unwrap().get(&id).copied();
+        ice
     }
 
     /// `f` is told the microphone's error (it was unplugged or another program took it).
@@ -626,27 +642,48 @@ impl Voice {
                 None
             });
         }
-        crate::ice::configure(&webrtc, &self.cfg.ice);
-        // A failed connection is started over by the offering side (the other one follows its
-        // "hi"), on a thread of its own: not on the element's streaming thread.
+        let ice = self.ice_for(id);
+        if let Some(p) = ice.pinned {
+            eprintln!("voice: connecting with {id} through a punched hole (local port {})", p.port);
+        }
+        crate::ice::configure(&webrtc, &ice);
+        // A failed connection: both sides punch a hole (`crate::punch`) and keep it for this
+        // peer; then the offering side starts the connection over (the other one follows its
+        // "hi") on that hole, or as before when punching did not work. On a thread of its own:
+        // not on the element's streaming thread. STREAMER_DEBUG_PUNCH_OFF: no punching.
         let me = self.me.lock().unwrap().clone();
+        let (puncher, pinned) = (self.puncher.lock().unwrap().clone(), self.pinned.clone());
         crate::ice::watch(&webrtc, format!("voice {id}"), self.cfg.ice.turn.is_some(), move || {
-            if !offerer {
-                return;
-            }
-            let me = me.clone();
+            let (me, puncher, pinned) = (me.clone(), puncher.clone(), pinned.clone());
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(1));
-                if let Some(v) = me.upgrade() {
-                    v.reconnect(id);
+                let punch = puncher.filter(|_| std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_none());
+                match punch.and_then(|p| p.punch(id, "voice")) {
+                    Some(hole) => {
+                        pinned.lock().unwrap().insert(id, hole);
+                    }
+                    None => {
+                        pinned.lock().unwrap().remove(&id);
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                if offerer {
+                    if let Some(v) = me.upgrade() {
+                        v.reconnect(id);
+                    }
                 }
             });
         });
         let l = link.clone();
+        // Tests only: STREAMER_DEBUG_ICE_NO_CANDIDATES: our candidates are not sent, so a
+        // connection without a punched hole fails (two processes on one machine would
+        // otherwise always connect directly).
+        let send_candidates = std::env::var_os("STREAMER_DEBUG_ICE_NO_CANDIDATES").is_none();
         webrtc.connect("on-ice-candidate", false, move |v| {
             let mline = v[1].get::<u32>().unwrap();
             let cand = v[2].get::<String>().unwrap();
-            l.send("ice", &format!("{mline} {cand}"));
+            if send_candidates {
+                l.send("ice", &format!("{mline} {cand}"));
+            }
             None
         });
         if offerer {
@@ -775,6 +812,7 @@ impl Voice {
             "offer" => {
                 let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) else { return };
                 webrtc.emit_by_name::<()>("set-remote-description", &[&WebRTCSessionDescription::new(WebRTCSDPType::Offer, sdp), &None::<gst::Promise>]);
+                crate::ice::add_pinned(&webrtc, &self.ice_for(id));
                 let w = webrtc.clone();
                 let promise = gst::Promise::with_change_func(move |reply| {
                     let Ok(Some(reply)) = reply else { return };
@@ -787,6 +825,7 @@ impl Voice {
             "answer" => {
                 if let Ok(sdp) = gst_sdp::SDPMessage::parse_buffer(payload.as_bytes()) {
                     webrtc.emit_by_name::<()>("set-remote-description", &[&WebRTCSessionDescription::new(WebRTCSDPType::Answer, sdp), &None::<gst::Promise>]);
+                    crate::ice::add_pinned(&webrtc, &self.ice_for(id));
                 }
             }
             "ice" => crate::host::add_ice(&webrtc, payload),

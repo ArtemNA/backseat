@@ -23,6 +23,8 @@ const TO_STREAMER: &str = "v/";
 const TO_VIEWER: &str = "s/";
 /// Voice chat between two members, both ways ("hi": I am in voice, "bye": I left it).
 const VOICE: &str = "c/";
+/// Hole punching between two members (`crate::punch`).
+const PUNCH: &str = "p/";
 
 /// What changed, for the UI or a command-line report.
 #[derive(Debug, Clone)]
@@ -134,6 +136,8 @@ pub struct Session {
     events: mpsc::Sender<Event>,
     /// Held while joining voice: two joins at once (a double click) opened two voices.
     voice_join: Mutex<()>,
+    /// Punches holes to members whose direct connection failed.
+    pub puncher: Arc<crate::punch::Puncher>,
 }
 
 impl Session {
@@ -176,7 +180,12 @@ impl Session {
         let me = PeerInfo { id: client.id, name: name.into(), streaming: false };
         let mut peers = client.peers.clone();
         peers.push(me);
+        let c = client.clone();
+        let puncher = crate::punch::Puncher::new(Arc::new(move |to, kind: &str, payload: &str| {
+            c.to_peer(to).send(&format!("{PUNCH}{kind}"), payload);
+        }));
         let s = Arc::new(Self {
+            puncher,
             id: client.id,
             room: room.into(),
             title: client.title.clone(),
@@ -504,6 +513,7 @@ impl Session {
             return Ok(v);
         }
         let voice = Voice::new(cfg)?;
+        voice.set_puncher(self.puncher.clone());
         let events = self.events.clone();
         voice.on_mic_error(move |e| {
             let _ = events.send(Event::Error(format!("microphone: {e}")));
@@ -696,6 +706,8 @@ impl Session {
                     }
                 } else if let Some(k) = kind.strip_prefix(VOICE) {
                     self.on_voice(from, k, &payload);
+                } else if let Some(k) = kind.strip_prefix(PUNCH) {
+                    self.puncher.on_message(from, k, &payload);
                 } else if let Some(k) = kind.strip_prefix(TO_VIEWER) {
                     let w = self.state.lock().unwrap().watches.get(&from).cloned();
                     if let Some(w) = w {

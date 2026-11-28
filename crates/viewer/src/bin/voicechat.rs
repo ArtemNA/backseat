@@ -73,7 +73,7 @@ fn main() {
             "--threshold" => threshold = val.parse().ok(),
             "--seconds" => seconds = val.parse().unwrap_or(0),
             "--leave-after" => leave_after = val.parse().unwrap_or(0),
-            "--stun" => cfg.ice = IceConfig { stun: (val != "none").then_some(val), turn: None },
+            "--stun" => cfg.ice = IceConfig { stun: (val != "none").then_some(val), turn: None, pinned: None },
             _ => {
                 eprintln!("unknown {key}\n{USAGE}");
                 std::process::exit(2);

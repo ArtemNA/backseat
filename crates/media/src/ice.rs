@@ -11,6 +11,12 @@ use std::time::Duration;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn configure(webrtc: &gst::Element, ice: &IceConfig) {
+    // A punched hole: the agent takes exactly its port (the NAT keeps the hole on it).
+    if let Some(p) = ice.pinned {
+        let agent = webrtc.property::<gst::glib::Object>("ice-agent");
+        agent.set_property("min-rtp-port", p.port as u32);
+        agent.set_property("max-rtp-port", p.port as u32);
+    }
     if let Some(stun) = &ice.stun {
         webrtc.set_property("stun-server", stun);
     }
@@ -19,6 +25,15 @@ pub fn configure(webrtc: &gst::Element, ice: &IceConfig) {
         if !ok {
             eprintln!("ice: the TURN server address was rejected (check its format: turn://user:pass@host:port)");
         }
+    }
+}
+
+/// After the remote description: the other side's punched address as one more candidate
+/// (theirs through the hole), when this connection has one.
+pub fn add_pinned(webrtc: &gst::Element, ice: &IceConfig) {
+    if let Some(p) = ice.pinned {
+        let cand = format!("candidate:9 1 UDP 1694498815 {} {} typ srflx raddr 0.0.0.0 rport 9", p.peer.ip(), p.peer.port());
+        webrtc.emit_by_name::<()>("add-ice-candidate", &[&0u32, &cand]);
     }
 }
 
