@@ -364,6 +364,53 @@ impl Playback {
             gst::PadProbeReturn::Ok
         });
         log_levels(mixer.downgrade(), levels.clone());
+        // Tests only: STREAMER_DEBUG_PLAYBACK_DUMP=<file> writes what goes to the speakers (S16
+        // stereo 48 kHz, raw), to find breaks in a test tone.
+        if let Some(path) = std::env::var_os("STREAMER_DEBUG_PLAYBACK_DUMP") {
+            if let Ok(f) = std::fs::File::create(path) {
+                let f = Mutex::new(std::io::BufWriter::new(f));
+                mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                    if let Some(m) = info.buffer().and_then(|b| b.map_readable().ok()) {
+                        use std::io::Write;
+                        let _ = f.lock().unwrap().write_all(m.as_slice());
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
+        // Tests only: STREAMER_DEBUG_PLAYBACK_BREAKS: counts breaks in what goes to the
+        // speakers, a sound that drops to silence for under 80 ms and comes back (a pause in
+        // speech is longer), logged every 10 s.
+        if std::env::var_os("STREAMER_DEBUG_PLAYBACK_BREAKS").is_some() {
+            // (loud run ms, silent run ms, breaks, since)
+            let st = Mutex::new((0u64, 0u64, 0u64, std::time::Instant::now()));
+            mixer.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(b) = info.buffer() {
+                    let ms = b.duration().map(|d| d.mseconds()).unwrap_or(10);
+                    let (sum, n) = b.map_readable().map(|m| sum_squares_s16(m.as_slice())).unwrap_or((0.0, 1));
+                    let ms2 = sum / n.max(1) as f64;
+                    let mut s = st.lock().unwrap();
+                    if ms2 > 1e-4 {
+                        if s.1 > 0 && s.1 < 80 && s.0 >= 100 {
+                            s.2 += 1;
+                        }
+                        if s.1 > 0 {
+                            s.0 = 0;
+                        }
+                        s.0 += ms;
+                        s.1 = 0;
+                    } else if ms2 < 1e-6 {
+                        s.1 += ms;
+                    }
+                    if s.3.elapsed() >= std::time::Duration::from_secs(10) {
+                        eprintln!("playback test: {} breaks in the sound over the last 10 s", s.2);
+                        s.2 = 0;
+                        s.3 = std::time::Instant::now();
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         Ok(Arc::new(Self { pipeline, mixer, levels, device: Mutex::new(device), silent }))
     }
 

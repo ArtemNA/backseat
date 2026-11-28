@@ -294,6 +294,22 @@ fn make(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory).build().map_err(|e| format!("{factory}: {e}"))
 }
 
+/// The microphone pipeline's clock: the system's. Tests only: STREAMER_DEBUG_VOICE_MIC_PPM=<n>
+/// gives it one that runs n parts per million fast, so a live test source makes that much more
+/// sound than a second holds, as a microphone whose crystal runs fast does (the voice delay
+/// grew over a long session until joining again, 2026-11-28).
+fn mic_clock() -> gst::Clock {
+    let ppm = std::env::var("STREAMER_DEBUG_VOICE_MIC_PPM").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    if ppm == 0 {
+        return gst::SystemClock::obtain();
+    }
+    let c: gst::Clock = gst::glib::Object::new::<gst::SystemClock>().upcast();
+    let now = c.internal_time();
+    c.set_calibration(now, now, (1_000_000 + ppm) as u64, 1_000_000);
+    eprintln!("voice: test: the microphone's clock runs {ppm} ppm fast");
+    c
+}
+
 fn mono_caps() -> gst::Element {
     let caps = gst::Caps::builder("audio/x-raw").field("format", "S16LE").field("rate", RATE).field("channels", 1i32).field("layout", "interleaved").build();
     gst::ElementFactory::make("capsfilter").property("caps", &caps).build().unwrap()
@@ -314,7 +330,7 @@ impl Voice {
         let mixer = out.mixer().clone();
         let room_stop = Arc::new(AtomicBool::new(false));
         let mic_pipe = gst::Pipeline::with_name("voice-mic");
-        mic_pipe.use_clock(Some(&gst::SystemClock::obtain()));
+        mic_pipe.use_clock(Some(&mic_clock()));
 
         // In.
         // Tests only: STREAMER_DEBUG_VOICE_ROOM makes the microphone hear what our speakers
@@ -443,6 +459,37 @@ impl Voice {
         let handoff = gst_app::AppSink::builder().sync(false).build();
         handoff.set_property("async", false);
         let mut inp = vec![src, make("audioconvert")?, make("audioresample")?, mono_caps(), dsp];
+        // Tests only: STREAMER_DEBUG_VOICE_TONE_PULSE: the test tone speaks 1 s and pauses 0.5 s,
+        // as speech has pauses (the drain drops pieces of pauses); "noise": the pauses hold
+        // noise at about -40 dBFS, as a microphone without noise suppression has.
+        if let (Some(_), Ok(mode)) = (cfg.test_tone, std::env::var("STREAMER_DEBUG_VOICE_TONE_PULSE")) {
+            let (n, noise) = (std::sync::atomic::AtomicU64::new(0), mode == "noise");
+            let seed = std::sync::atomic::AtomicU32::new(12345);
+            inp[3].static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                // 480 samples a buffer: 150 buffers = 1.5 s, the last 50 a pause.
+                let k = n.fetch_add(1, Ordering::Relaxed);
+                if k % 150 == 0 {
+                    eprintln!("voice test: tone starts at {} ns", gst::SystemClock::obtain().time().nseconds());
+                }
+                if k % 150 >= 100 {
+                    if let Some(b) = info.buffer_mut() {
+                        if let Ok(mut m) = b.make_mut().map_writable() {
+                            for c in m.as_mut_slice().chunks_exact_mut(2) {
+                                let v = if noise {
+                                    let x = seed.load(Ordering::Relaxed).wrapping_mul(1_103_515_245).wrapping_add(12345);
+                                    seed.store(x, Ordering::Relaxed);
+                                    ((x >> 16) as i16 as i32 * 570 / 32768) as i16
+                                } else {
+                                    0
+                                };
+                                c.copy_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         inp.extend(cfg.dsp.after(tested)?);
         inp.extend([mute.clone(), handoff.clone().upcast()]);
         mic_pipe.add_many(&inp).map_err(|e| e.to_string())?;
@@ -569,6 +616,12 @@ impl Voice {
             rtpbin.connect("new-jitterbuffer", false, move |v| {
                 if let Ok(jb) = v[1].get::<gst::Element>() {
                     jb.set_property("latency", ms);
+                    // Tests only: STREAMER_DEBUG_VOICE_JB_DROP: the jitter buffer drops what is late
+                    // (tried for the growing delay: three breaks a second; the gate's spoiled run
+                    // for its break counter).
+                    if std::env::var_os("STREAMER_DEBUG_VOICE_JB_DROP").is_some() {
+                        jb.set_property("drop-on-latency", true);
+                    }
                 }
                 None
             });
@@ -636,6 +689,20 @@ impl Voice {
             .property_from_str("leaky", "downstream")
             .build()
             .unwrap();
+        // Tests only: STREAMER_DEBUG_VOICE_SEND_JITTER_MS=<n>: each packet to a peer leaves
+        // 0..n ms late (a jittery network; below 20 on average it keeps up).
+        if let Some(j) = std::env::var("STREAMER_DEBUG_VOICE_SEND_JITTER_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|j| *j > 0) {
+            let seed = std::sync::atomic::AtomicU64::new(0x2545_f491_4f6c_dd1d);
+            queue.static_pad("src").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                let mut x = seed.load(Ordering::Relaxed);
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                seed.store(x, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(x % (j + 1)));
+                gst::PadProbeReturn::Ok
+            });
+        }
         let pay = make("rtpopuspay")?;
         pay.set_property("pt", VOICE_PT);
         self.pipeline.add_many([&webrtc, &queue, &pay]).map_err(|e| e.to_string())?;
@@ -837,7 +904,88 @@ impl Drop for Voice {
     }
 }
 
-/// A peer's audio: depay -> decode -> its volume -> the shared mixer (same pipeline).
+/// Mean square of S16 samples, 0..1.
+fn mean_square_s16(b: &[u8]) -> f64 {
+    let n = b.len() / 2;
+    if n == 0 {
+        return 0.0;
+    }
+    b.chunks_exact(2).map(|c| (i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0).powi(2)).sum::<f64>() / n as f64
+}
+
+/// Keeps a voice's wait before the mixer from growing. Sound that comes faster than the mixer
+/// takes it (the other side's microphone clock running fast, or a pile from the start) waited
+/// for good: the delay grew over a long session until joining again (2026-11-28,
+/// voice-drift-gate: +10 ms a second at 1%). It now waits in a queue in front of the mixer,
+/// whose level is the pile: above `HIGH_MS` pieces are dropped until it is under `LOW_MS`
+/// again, pauses only (nothing heard lost), or any piece once it is over `FORCE_MS`. After a
+/// drop the next piece starts from where the last one played ended and reaches its own sound
+/// over 5 ms, not to click. (The jitter buffer's own drop-on-latency
+/// dropped three pieces a second with nothing to catch up: a crackle.)
+struct Drain {
+    draining: bool,
+    /// The last sample of the last piece let through.
+    last: i16,
+    /// The quietest piece of each of the last six half seconds: the pauses' noise floor.
+    floors: [f64; 6],
+    block: (usize, usize),
+    fade: bool,
+}
+
+impl Drain {
+    /// Draining starts above HIGH_MS and stops under LOW_MS: about 100 ms stay as a cushion
+    /// for an uneven network. (Drained to 20 or 50 ms, a packet late by more than the jitter
+    /// buffer's 60 ms left a break the old, ever-growing pile had hidden: voice-drift-gate with
+    /// -Jitter 30.)
+    const HIGH_MS: u64 = 150;
+    const LOW_MS: u64 = 100;
+    const FORCE_MS: u64 = 300;
+    /// A pause is quieter than this (mean square of S16, about -45 dBFS)...
+    const QUIET: f64 = 3.2e-5;
+    /// ...or than twice the pauses' noise floor, up to about -35 dBFS (a noisy microphone,
+    /// noise suppression off: its pauses never got under -45 dBFS).
+    const QUIET_MAX: f64 = 3.2e-4;
+
+    fn new() -> Self {
+        Self { draining: false, last: 0, floors: [f64::MAX; 6], block: (0, 0), fade: false }
+    }
+
+    /// Whether a piece this loud counts as a pause. STREAMER_DEBUG_VOICE_DRAIN_ANY: every piece
+    /// does (the spoiled variant: speech is cut while draining).
+    fn quiet(&self, ms2: f64) -> bool {
+        static ANY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ANY.get_or_init(|| std::env::var_os("STREAMER_DEBUG_VOICE_DRAIN_ANY").is_some()) {
+            return true;
+        }
+        let floor = self.floors.iter().cloned().fold(f64::MAX, f64::min);
+        ms2 < Self::QUIET.max((floor * 2.0).min(Self::QUIET_MAX))
+    }
+
+    /// Whether to drop this piece, and whether it counted as a pause: `level_ms` is how much
+    /// waits in the queue, `ms2` the piece's mean square (0..1).
+    fn should_drop(&mut self, level_ms: u64, ms2: f64) -> (bool, bool) {
+        let (b, n) = self.block;
+        self.floors[b] = if n == 0 { ms2 } else { self.floors[b].min(ms2) };
+        self.block = if n + 1 >= 25 { ((b + 1) % 6, 0) } else { (b, n + 1) };
+        if level_ms > Self::HIGH_MS {
+            self.draining = true;
+        } else if level_ms < Self::LOW_MS {
+            self.draining = false;
+        }
+        let quiet = self.quiet(ms2);
+        let forced = level_ms > Self::FORCE_MS;
+        let drop = self.draining && (quiet || forced);
+        // STREAMER_DEBUG_VOICE_NO_FADE: no crossfade after a drop (spoiled: a splice clicks).
+        static NO_FADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if drop && !*NO_FADE.get_or_init(|| std::env::var_os("STREAMER_DEBUG_VOICE_NO_FADE").is_some()) {
+            self.fade = true;
+        }
+        (drop, quiet)
+    }
+}
+
+/// A peer's audio: depay -> decode -> the wait queue -> its volume -> the shared mixer (same
+/// pipeline).
 fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: PeerId, level: &Arc<Level>, volume: f64, deaf: bool) -> Result<(Vec<gst::Element>, gst::Pad), String> {
     let dec = make("opusdec")?;
     dec.set_property("plc", true);
@@ -847,9 +995,22 @@ fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: P
     // output every input waits for the slowest: a watched stream's sound came 170 ms later
     // while anyone was in voice. Loss concealment (plc) stays, as for a stream's sound.
     dec.set_property("use-inband-fec", false);
+    // Tests only: STREAMER_DEBUG_VOICE_PEER_VOLUME: every peer at that volume.
+    let volume = std::env::var("STREAMER_DEBUG_VOICE_PEER_VOLUME").ok().and_then(|v| v.parse().ok()).unwrap_or(volume);
     let vol = gst::ElementFactory::make("volume").name(format!("vvol-{id}")).property("volume", volume).property("mute", deaf).build().unwrap();
     let to_mix = gst::ElementFactory::make("capsfilter").property("caps", crate::playback::caps()).build().unwrap();
-    let chain = vec![make("rtpopusdepay")?, dec, make("audioconvert")?, make("audioresample")?, mono_caps(), vol.clone(), make("audioconvert")?, to_mix.clone()];
+    // What the mixer does not take yet waits here (not in the jitter buffer), so the pile is
+    // known: the queue's level (see `Drain`).
+    let wait_q = gst::ElementFactory::make("queue")
+        .name(format!("vwait-{id}"))
+        .property("max-size-time", 3_000_000_000u64)
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .build()
+        .unwrap();
+    // The queue before the volume: what is a pause is judged on the sound as it came, not as
+    // turned down here (at 5%, speech looked like a pause and could be cut).
+    let chain = vec![make("rtpopusdepay")?, dec, make("audioconvert")?, make("audioresample")?, mono_caps(), wait_q.clone(), vol.clone(), make("audioconvert")?, to_mix.clone()];
     pipeline.add_many(&chain).map_err(|e| e.to_string())?;
     gst::Element::link_many(&chain).map_err(|e| e.to_string())?;
     level.watch(&vol.static_pad("src").unwrap());
@@ -858,21 +1019,92 @@ fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: P
     // stream's sound came that much later while anyone was in voice. The jitter buffer still
     // evens out the network before this point. STREAMER_DEBUG_VOICE_OWN_LATENCY: the old way.
     if std::env::var_os("STREAMER_DEBUG_VOICE_OWN_LATENCY").is_none() {
-        let out = to_mix.static_pad("src").unwrap();
-        let pw = pipeline.downgrade();
+        let out = wait_q.static_pad("src").unwrap();
+        let (pw, qw) = (pipeline.downgrade(), wait_q.downgrade());
+        // How much sound waited in front of the mixer, logged once a minute: it grew when a
+        // voice's sound came faster than the mixer took it (a microphone's clock running fast;
+        // the delay grew until joining again, 2026-11-28). STREAMER_DEBUG_VOICE_WAIT_SECS:
+        // another period (tests).
+        let period = Duration::from_secs(std::env::var("STREAMER_DEBUG_VOICE_WAIT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60));
+        // (least wait, most wait, since, quiet pieces dropped, loud pieces dropped)
+        let wait = Mutex::new((u64::MAX, 0u64, Instant::now(), 0u64, 0u64));
+        // STREAMER_DEBUG_VOICE_NO_DRAIN: nothing dropped (the spoiled variant: the wait grows).
+        let drain = std::env::var_os("STREAMER_DEBUG_VOICE_NO_DRAIN").is_none().then(|| Mutex::new(Drain::new()));
+        // Tests only: STREAMER_DEBUG_VOICE_ONSETS: logs when a sound starts after a pause on its
+        // way into the mixer (system clock), to measure mouth-to-mixer delay against the
+        // sender's "tone starts" lines.
+        let onsets = std::env::var_os("STREAMER_DEBUG_VOICE_ONSETS").is_some().then(|| std::sync::atomic::AtomicBool::new(false));
         out.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             let Some(p) = pw.upgrade() else { return gst::PadProbeReturn::Ok };
             let (Some(clock), Some(base)) = (p.clock(), p.base_time()) else { return gst::PadProbeReturn::Ok };
             if let Some(gst::PadProbeData::Buffer(ref mut b)) = info.data {
                 if let Some(now) = clock.time().checked_sub(base) {
+                    // The pile: the queue's span of timestamps, but no more than its pieces hold
+                    // (a jump in the timestamps alone read as seconds).
+                    let piece = b.duration().map(|d| d.mseconds()).unwrap_or(20);
+                    let ms = qw
+                        .upgrade()
+                        .map(|q| (q.property::<u64>("current-level-time") / 1_000_000).min(q.property::<u32>("current-level-buffers") as u64 * piece))
+                        .unwrap_or(0);
+                    let ms2 = b.map_readable().map(|m| mean_square_s16(m.as_slice())).unwrap_or(1.0);
+                    let (dropped, quiet, fade) = match drain.as_ref() {
+                        Some(d) => {
+                            let mut d = d.lock().unwrap();
+                            let (dropped, quiet) = d.should_drop(ms, ms2);
+                            let fade = (!dropped && std::mem::take(&mut d.fade)).then_some(d.last);
+                            if !dropped {
+                                d.last = b.map_readable().ok().and_then(|m| m.as_slice().rchunks_exact(2).next().map(|c| i16::from_le_bytes([c[0], c[1]]))).unwrap_or(0);
+                            }
+                            (dropped, quiet, fade)
+                        }
+                        None => (false, true, None),
+                    };
+                    {
+                        let mut w = wait.lock().unwrap();
+                        w.0 = w.0.min(ms);
+                        w.1 = w.1.max(ms);
+                        if dropped {
+                            if quiet {
+                                w.3 += 1;
+                            } else {
+                                w.4 += 1;
+                            }
+                        }
+                        if w.2.elapsed() >= period {
+                            eprintln!("voice {id}: waited {}..{} ms before the mixer over the last {} s, {} pieces dropped to catch up ({} of them not quiet)", w.0, w.1, period.as_secs(), w.3 + w.4, w.4);
+                            *w = (u64::MAX, 0, Instant::now(), 0, 0);
+                        }
+                    }
+                    if dropped {
+                        return gst::PadProbeReturn::Drop;
+                    }
+                    if let Some(was_loud) = &onsets {
+                        let loud = ms2 > 1e-3;
+                        if loud && !was_loud.swap(true, Ordering::Relaxed) {
+                            eprintln!("voice {id} test: sound heard at {} ns", gst::SystemClock::obtain().time().nseconds());
+                        } else if ms2 < 3e-4 {
+                            was_loud.store(false, Ordering::Relaxed);
+                        }
+                    }
                     let b = b.make_mut();
+                    if let Some(last) = fade {
+                        // Mono at 48 kHz: 240 samples are 5 ms.
+                        if let Ok(mut m) = b.map_writable() {
+                            let n = (m.len() / 2).min(240);
+                            for (i, c) in m.as_mut_slice().chunks_exact_mut(2).take(n).enumerate() {
+                                let x = i16::from_le_bytes([c[0], c[1]]) as f32;
+                                let v = last as f32 + (x - last as f32) * i as f32 / n as f32;
+                                c.copy_from_slice(&(v as i16).to_le_bytes());
+                            }
+                        }
+                    }
                     b.set_pts(now);
                     b.set_dts(gst::ClockTime::NONE);
                 }
             }
             gst::PadProbeReturn::Ok
         });
-        out.add_probe(gst::PadProbeType::QUERY_UPSTREAM | gst::PadProbeType::PULL, |_, info| {
+        to_mix.static_pad("src").unwrap().add_probe(gst::PadProbeType::QUERY_UPSTREAM | gst::PadProbeType::PULL, |_, info| {
             if let Some(gst::PadProbeData::Query(ref mut q)) = info.data {
                 if let gst::QueryViewMut::Latency(l) = q.view_mut() {
                     let (live, _min, max) = l.result();
@@ -881,6 +1113,11 @@ fn receive(pipeline: &gst::Pipeline, mixer: &gst::Element, pad: &gst::Pad, id: P
             }
             gst::PadProbeReturn::Ok
         });
+    }
+    // Tests only: STREAMER_DEBUG_VOICE_MIX_GAPS: unevenness in what goes into the mixer (stamped
+    // as it goes; most of it is the network's rhythm, which the mixer evens out, not breaks).
+    if std::env::var_os("STREAMER_DEBUG_VOICE_MIX_GAPS").is_some() {
+        crate::diag::watch_ts(&to_mix.static_pad("src").unwrap(), format!("voice {id} into the mixer"));
     }
     let mix_pad = mixer.request_pad_simple("sink_%u").ok_or("no mixer pad")?;
     to_mix.static_pad("src").unwrap().link(&mix_pad).map_err(|e| format!("{e:?}"))?;

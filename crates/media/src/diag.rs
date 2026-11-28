@@ -77,8 +77,18 @@ impl TsStats {
     }
 }
 
+/// Tests only: STREAMER_DEBUG_NO_DIAG turns these watches off (to see whether they disturb
+/// what they watch).
+fn off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("STREAMER_DEBUG_NO_DIAG").is_some())
+}
+
 /// Watches the timestamps of the buffers through `pad`, naming them `name` in the log.
 pub fn watch_ts(pad: &gst::Pad, name: String) {
+    if off() {
+        return;
+    }
     let st = Mutex::new((TsStats::default(), Instant::now(), false));
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         let Some(b) = info.buffer() else { return gst::PadProbeReturn::Ok };
@@ -107,6 +117,9 @@ pub fn watch_ts(pad: &gst::Pad, name: String) {
 /// Once a minute, each jitter buffer of `webrtc` that lost, got late or duplicate packets in
 /// that minute: its counts and average jitter. `label` names the connection in the log.
 pub fn watch_jitterbuffers(webrtc: &gst::Element, label: String) {
+    if off() {
+        return;
+    }
     let Some(rtpbin) = webrtc.downcast_ref::<gst::Bin>().and_then(|b| b.by_name("rtpbin")) else { return };
     rtpbin.connect("new-jitterbuffer", false, move |v| {
         let jb = v[1].get::<gst::Element>().unwrap();
