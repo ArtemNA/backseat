@@ -2,6 +2,12 @@
 
 Each `## X.Y.Z` section becomes the notes of the GitHub release for tag `vX.Y.Z`.
 
+## 0.2.27-beta.2
+
+- **Connecting through a punched hole is much faster.** At the start of each connection both sides find out what kind of NAT they are behind (about a second); when one keeps its ports and the other changes them (a provider's shared address), the hole is punched at once instead of after the direct try gives up. Voice with such a friend now connects in a few seconds instead of about 12; a stream starts in a few seconds instead of about 25. Behind other NATs nothing changes: the direct try goes first, as before, and if a NAT becomes easier later, the direct way is used again.
+- If punching at once does not work, the punch after the direct try still comes, as in beta 1.
+- While a hole is being punched, your viewers list shows it, not "failed".
+
 ## 0.2.27-beta.1
 
 A beta: new things for those who want them sooner. It may have bugs.

@@ -198,6 +198,9 @@ struct Peer {
     /// Its failure is being (or was) handled: punched or started over once, whether its own
     /// failure or the other side's punch came first.
     handled: Arc<AtomicBool>,
+    /// A failure told while an early punch held `handled` (its `was_up`): handled when that
+    /// punch ends without a hole.
+    missed: Arc<Mutex<Option<bool>>>,
     /// The punched hole this connection uses, if any (its address is told to ICE once the
     /// other side's description is in).
     hole: Option<crate::punch::Pinned>,
@@ -622,21 +625,55 @@ impl Voice {
     /// streaming thread); nothing is done for a connection replaced meanwhile, before or after
     /// the punch. STREAMER_DEBUG_PUNCH_OFF: no punching.
     fn failed(self: &Arc<Self>, id: PeerId, w: gst::Element, offerer: bool, was_up: bool) {
+        self.punch_for(id, w, offerer, was_up, false);
+    }
+
+    /// The failure handling of `failed`, or (`early`) a punch at the start of a connection,
+    /// beside the direct try, when the NAT kinds say so (`Puncher::punch_early`); when they
+    /// do not, the connection is left to its direct try (its failure is handled later).
+    fn punch_for(self: &Arc<Self>, id: PeerId, w: gst::Element, offerer: bool, was_up: bool, early: bool) {
         let me = Arc::downgrade(self);
         std::thread::spawn(move || {
             let Some(v) = me.upgrade() else { return };
             // This connection, once: a second call (its own failure after the other side's
             // punch, or the other way round) leaves it to the first.
-            let found = v.peers.lock().unwrap().get(&id).filter(|p| p.webrtc == w).map(|p| p.handled.clone());
-            let Some(handled) = found else { return };
-            if handled.swap(true, Ordering::SeqCst) {
-                return;
+            let found = v.peers.lock().unwrap().get(&id).filter(|p| p.webrtc == w).map(|p| (p.handled.clone(), p.missed.clone()));
+            let Some((handled, missed)) = found else { return };
+            {
+                // Under the `missed` lock, as the early punch gives the claim back: a failure
+                // noted here is always seen there.
+                let mut m = missed.lock().unwrap();
+                if handled.swap(true, Ordering::SeqCst) {
+                    if !early {
+                        *m = Some(was_up);
+                    }
+                    return;
+                }
             }
             let puncher = v.puncher.lock().unwrap().clone();
             let punch = puncher.filter(|_| !was_up && std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_none());
             drop(v);
             let mut started = Instant::now();
-            let hole = loop {
+            let hole = if early {
+                match punch.as_ref().map(|p| p.punch_early(id, "voice")) {
+                    Some(Ok(Some(hole))) => Some(hole),
+                    // Not needed (or no puncher, or one running): the direct try goes on; a
+                    // failure of it told meanwhile is handled now.
+                    _ => {
+                        let failed = {
+                            let mut m = missed.lock().unwrap();
+                            handled.store(false, Ordering::SeqCst);
+                            m.take()
+                        };
+                        let failed = failed.filter(|_| !crate::punch::missed_off());
+                        if let (Some(was_up), Some(v)) = (failed, me.upgrade()) {
+                            v.punch_for(id, w, offerer, was_up, false);
+                        }
+                        return;
+                    }
+                }
+            } else {
+                loop {
                 match punch.as_ref().map(|p| p.punch(id, "voice")) {
                     // One punch at a time with a peer: one is running for a connection before
                     // this one (it replaced that one meanwhile). Wait for it to end, then punch
@@ -658,6 +695,7 @@ impl Voice {
                     Some(Ok(hole)) => break hole,
                     None => break None,
                 }
+            }
             };
             let Some(v) = me.upgrade() else { return };
             if !v.current(id, &w) {
@@ -676,11 +714,71 @@ impl Voice {
                     let p = punch.as_ref().unwrap();
                     if offerer {
                         drop(v);
-                        if !p.wait_done(id, "voice", started, Duration::from_secs(8)) {
+                        // An early one: in short steps, not past a failure noted meanwhile (the
+                        // other side's punch after its failure: it has no hole).
+                        let done = if early {
+                            let t = Instant::now();
+                            loop {
+                                if p.wait_done(id, "voice", started, Duration::from_millis(200)) {
+                                    break true;
+                                }
+                                if p.failure_info_since(id, "voice", started) || t.elapsed() >= Duration::from_secs(8) {
+                                    break false;
+                                }
+                            }
+                        } else {
+                            p.wait_done(id, "voice", started, Duration::from_secs(8))
+                        };
+                        if !done {
+                            if early {
+                                // The other side got no hole of its own: no new connection on
+                                // ours (it would not come up), the direct try goes on; give the
+                                // claim (and the hole) back and handle a failure noted meanwhile.
+                                eprintln!("voice: {id} got no hole of its own; going on without ours");
+                                let failed = {
+                                    let mut m = missed.lock().unwrap();
+                                    handled.store(false, Ordering::SeqCst);
+                                    m.take()
+                                };
+                                if let Some(v) = me.upgrade() {
+                                    v.pinned.lock().unwrap().remove(&id);
+                                    if let Some(was_up) = failed.filter(|_| !crate::punch::missed_off()) {
+                                        v.punch_for(id, w, offerer, was_up, false);
+                                    }
+                                }
+                                return;
+                            }
                             eprintln!("voice: {id} did not say its hole is ready; starting over anyway");
                         }
                     } else {
                         p.send_done(id, "voice");
+                        // An early hole: the offerer, with its own, starts over at once (its
+                        // "hi" replaces this connection). One that does not came out without
+                        // a hole: give the claim back (and the hole up) after a while, or at
+                        // once when a failure is noted (its punch after the failure waits for
+                        // ours only a few seconds), and handle it.
+                        if early {
+                            drop(v);
+                            let waiting = || me.upgrade().is_some_and(|v| v.current(id, &w));
+                            let t = Instant::now();
+                            while waiting() && !p.failure_info_since(id, "voice", started) && t.elapsed() < Duration::from_secs(10) {
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                            if waiting() {
+                                eprintln!("voice: {id} did not start over on its hole; going on without ours");
+                                let failed = {
+                                    let mut m = missed.lock().unwrap();
+                                    handled.store(false, Ordering::SeqCst);
+                                    m.take()
+                                };
+                                if let Some(v) = me.upgrade() {
+                                    v.pinned.lock().unwrap().remove(&id);
+                                    if let Some(was_up) = failed.filter(|_| !crate::punch::missed_off()) {
+                                        v.punch_for(id, w, offerer, was_up, false);
+                                    }
+                                }
+                            }
+                        }
                         return;
                     }
                 }
@@ -891,8 +989,13 @@ impl Voice {
         if std::env::var_os("STREAMER_DEBUG_VOICE_NO_SEND").is_none() {
             tee_pad.link(&queue.static_pad("sink").unwrap()).map_err(|e| format!("voice {id}: {e:?}"))?;
         }
-        peers.insert(id, Peer { webrtc, up, offerer, handled: Arc::default(), hole: ice.pinned, send: vec![queue, pay], tee_pad, recv, level, link });
+        let early = ice.pinned.is_none().then(|| webrtc.clone());
+        peers.insert(id, Peer { webrtc, up, offerer, handled: Arc::default(), missed: Arc::default(), hole: ice.pinned, send: vec![queue, pay], tee_pad, recv, level, link });
         eprintln!("voice: connecting with {id} ({})", if offerer { "offering" } else { "answering" });
+        // Not on a punched hole: punch at once beside the direct try, if the NAT kinds say so.
+        if let (Some(w), Some(v)) = (early, self.me.lock().unwrap().upgrade()) {
+            v.punch_for(id, w, offerer, false, true);
+        }
         Ok(())
     }
 
@@ -1058,7 +1161,7 @@ impl Voice {
                 let up = matches!(webrtc.property::<State>("ice-connection-state"), State::Connected | State::Completed);
                 let link = if up {
                     if *hole && !no_hole { Link::Punched } else { Link::Direct }
-                } else if puncher.as_ref().is_some_and(|x| x.busy(*id, "voice")) {
+                } else if puncher.as_ref().is_some_and(|x| x.probing(*id, "voice")) {
                     Link::Punching
                 } else {
                     Link::Connecting

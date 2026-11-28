@@ -141,6 +141,8 @@ pub struct Session {
     voice_join: Mutex<()>,
     /// Punches holes to members whose direct connection failed.
     pub puncher: Arc<crate::punch::Puncher>,
+    /// Ourselves, for work started where only `&self` is at hand.
+    me: std::sync::OnceLock<std::sync::Weak<Session>>,
 }
 
 impl Session {
@@ -197,7 +199,9 @@ impl Session {
             state: Mutex::new(State { peers: peers.clone(), ..Default::default() }),
             events: tx,
             voice_join: Mutex::new(()),
+            me: Default::default(),
         });
+        let _ = s.me.set(Arc::downgrade(&s));
         let _ = s.events.send(Event::Peers(peers));
         {
             let weak = Arc::downgrade(&s);
@@ -317,7 +321,9 @@ impl Session {
             }
         } else if slot == crate::punch::watch_slot(from) {
             let w = self.state.lock().unwrap().watches.get(&from).cloned();
-            if let Some(w) = w.filter(|w| !w.viewer.connected()) {
+            // Not a connection on a punched hole: it is coming up on it (its failure, if it
+            // comes, is final), and joining would give it up.
+            if let Some(w) = w.filter(|w| !w.viewer.connected() && !w.viewer.on_hole()) {
                 eprintln!("viewer: {from} started punching; joining in");
                 let conn = w.viewer.webrtc();
                 self.watch_failed(w, conn, false);
@@ -330,6 +336,12 @@ impl Session {
     /// again on its hole and asks us to start over ("restart"). One that worked: as before
     /// (nothing; the viewer sees the stream stop). STREAMER_DEBUG_PUNCH_OFF: no punching.
     fn viewer_failed(self: &Arc<Self>, viewer: PeerId, w: gst::Element, was_up: bool) {
+        self.punch_for_viewer(viewer, w, was_up, false);
+    }
+
+    /// `viewer_failed`, or (`early`) a punch at the start of the connection when the NAT kinds
+    /// say so (`Puncher::punch_early`); when they do not, the direct try goes on.
+    fn punch_for_viewer(self: &Arc<Self>, viewer: PeerId, w: gst::Element, was_up: bool, early: bool) {
         if was_up || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
             return;
         }
@@ -337,12 +349,29 @@ impl Session {
         std::thread::spawn(move || {
             let Some(s) = me.upgrade() else { return };
             let Some(host) = s.host() else { return };
-            let Some(punching) = host.claim_viewer(viewer, &w) else { return };
+            // Held by an early punch: the failure is noted in the same step, and handled when
+            // that punch ends without a hole.
+            let Some(punching) = host.claim_viewer(viewer, &w, (!early).then_some(was_up)) else { return };
             let (puncher, slot) = (s.puncher.clone(), crate::punch::watch_slot(s.id));
             drop(s);
             let current = || host.viewer_connection(viewer).is_some_and(|(c, _)| c == w);
-            punching.store(true, Ordering::SeqCst);
-            let hole = puncher.punch_waiting(viewer, &slot, current);
+            let started = std::time::Instant::now();
+            // Not shown as punching for an early one (most come to nothing at once).
+            punching.store(!early, Ordering::SeqCst);
+            let hole = if early {
+                match puncher.punch_early(viewer, &slot) {
+                    Ok(Some(hole)) => Some(hole),
+                    _ => {
+                        punching.store(false, Ordering::SeqCst);
+                        if let (Some(was_up), Some(s)) = (host.unclaim_viewer(viewer, &w).filter(|_| !crate::punch::missed_off()), me.upgrade()) {
+                            s.punch_for_viewer(viewer, w, was_up, false);
+                        }
+                        return;
+                    }
+                }
+            } else {
+                puncher.punch_waiting(viewer, &slot, current)
+            };
             punching.store(false, Ordering::SeqCst);
             // Not for a connection that came up meanwhile: a later one would take a hole the
             // viewer does not use.
@@ -350,6 +379,28 @@ impl Session {
             if let Some(hole) = hole.filter(|_| current() && !up) {
                 host.set_pinned(viewer, hole);
                 puncher.send_done(viewer, &slot);
+                // An early hole: the viewer, with its own, restarts at once (this branch is
+                // replaced). One that does not came out without a hole (one side's punch
+                // only): give the claim back after a while, and handle a failure told
+                // meanwhile, so the punch after the failure can still bring us together.
+                if early {
+                    let waiting = || host.viewer_connection(viewer).is_some_and(|(c, up)| c == w && !up);
+                    let t = std::time::Instant::now();
+                    // Not past the viewer's punch after its failure: it means the viewer has
+                    // no hole, and its punch waits for ours only a few seconds. (Not our own
+                    // failure: an easy + hard pair's direct try fails meanwhile as a rule.)
+                    while waiting() && !puncher.failure_info_since(viewer, &slot, started) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    if waiting() {
+                        eprintln!("host: viewer {viewer} did not start over on its hole; waiting for its failure as usual");
+                        host.unpin(viewer, &w);
+                        let failed = host.unclaim_viewer(viewer, &w).filter(|_| !crate::punch::missed_off());
+                        if let (Some(was_up), Some(s)) = (failed, me.upgrade()) {
+                            s.punch_for_viewer(viewer, w, was_up, false);
+                        }
+                    }
+                }
             }
         });
     }
@@ -359,28 +410,79 @@ impl Session {
     /// again on it (the window and decoder stay) and the streamer asked to start over.
     /// One that worked, or no hole: as before (the watch shows no connection).
     fn watch_failed(self: &Arc<Self>, w: Arc<Watch>, conn: gst::Element, was_up: bool) {
+        self.punch_for_watch(w, conn, was_up, false);
+    }
+
+    /// `watch_failed`, or (`early`) a punch at the start of the watch when the NAT kinds say
+    /// so; when they do not, the direct try goes on (its failure is handled when it comes).
+    fn punch_for_watch(self: &Arc<Self>, w: Arc<Watch>, conn: gst::Element, was_up: bool, early: bool) {
         let me = Arc::downgrade(self);
         std::thread::spawn(move || {
             let Some(s) = me.upgrade() else { return };
             let streamer = w.streamer;
             let mine = |s: &Session| s.state.lock().unwrap().watches.get(&streamer).is_some_and(|x| Arc::ptr_eq(x, &w)) && w.viewer.webrtc() == conn;
-            if !mine(&s) || !w.viewer.claim(&conn) {
+            if !mine(&s) {
+                return;
+            }
+            // Held by an early punch: the failure is noted in the same step, and handled when
+            // that punch ends without a hole.
+            if !w.viewer.claim_or_note(&conn, (!early).then_some(was_up)) {
                 return;
             }
             // A connection on a punched hole already: punching again would go round and round.
             if was_up || w.viewer.on_hole() || std::env::var_os("STREAMER_DEBUG_PUNCH_OFF").is_some() {
-                w.viewer.give_up();
+                if early {
+                    w.viewer.unclaim();
+                } else {
+                    w.viewer.give_up();
+                }
                 return;
             }
             let (puncher, slot) = (s.puncher.clone(), crate::punch::watch_slot(streamer));
             drop(s);
             let current = || me.upgrade().is_some_and(|s| mine(&s));
             let started = std::time::Instant::now();
-            w.viewer.punching.store(true, Ordering::SeqCst);
-            let hole = puncher.punch_waiting(streamer, &slot, current);
+            // Not shown as punching for an early one: most come to nothing at once (a direct
+            // connection may work), and the UI must not flash for them.
+            w.viewer.punching.store(!early, Ordering::SeqCst);
+            let hole = if early {
+                match puncher.punch_early(streamer, &slot) {
+                    Ok(Some(hole)) => Some(hole),
+                    _ => {
+                        if let (Some(was_up), Some(s)) = (w.viewer.unclaim_taking_missed().filter(|_| !crate::punch::missed_off()), me.upgrade()) {
+                            s.punch_for_watch(w.clone(), conn.clone(), was_up, false);
+                        }
+                        return;
+                    }
+                }
+            } else {
+                puncher.punch_waiting(streamer, &slot, current)
+            };
             let hole = hole.filter(|_| {
                 // The streamer keeps its hole first, or its new connection would not use it.
-                if !puncher.wait_done(streamer, &slot, started, Duration::from_secs(8)) {
+                // An early one: in short steps, not past a failure noted meanwhile (the
+                // streamer's punch after its failure: it has no hole).
+                let done = if early {
+                    let t = std::time::Instant::now();
+                    loop {
+                        if puncher.wait_done(streamer, &slot, started, Duration::from_millis(200)) {
+                            break true;
+                        }
+                        if puncher.failure_info_since(streamer, &slot, started) || t.elapsed() >= Duration::from_secs(8) {
+                            break false;
+                        }
+                    }
+                } else {
+                    puncher.wait_done(streamer, &slot, started, Duration::from_secs(8))
+                };
+                if !done {
+                    // An early punch: the streamer got no hole (one side's punch only), so
+                    // its new connection would not come on ours; the direct try goes on, and
+                    // the punch after its failure is still to come.
+                    if early {
+                        eprintln!("viewer: {streamer} got no hole of its own; going on without ours");
+                        return false;
+                    }
                     eprintln!("viewer: {streamer} did not say its hole is ready; starting over anyway");
                 }
                 current()
@@ -399,7 +501,15 @@ impl Session {
             // No hole; or media came through it before it failed (it came up and broke while
             // we punched): its branches are built, so it is not replaced.
             let Some(hole) = hole.filter(|_| !w.viewer.media_came()) else {
-                w.viewer.give_up();
+                if early {
+                    // Give the claim back; a failure told meanwhile is handled now.
+                    let failed = w.viewer.unclaim_taking_missed().filter(|_| !crate::punch::missed_off());
+                    if let (Some(was_up), Some(s)) = (failed, me.upgrade()) {
+                        s.punch_for_watch(w.clone(), conn.clone(), was_up, false);
+                    }
+                } else {
+                    w.viewer.give_up();
+                }
                 return;
             };
             eprintln!("viewer: connecting with {streamer} again through a punched hole (local port {})", hole.port);
@@ -411,6 +521,10 @@ impl Session {
                 }
             }
         });
+    }
+
+    fn me_arc(&self) -> Option<Arc<Session>> {
+        self.me.get().and_then(|w| w.upgrade())
     }
 
     /// Starts streaming with `cfg`. The encoder only runs while someone watches.
@@ -428,6 +542,10 @@ impl Session {
         self.client.send(ClientMsg::SetStreaming { streaming: true });
         self.set_streaming_flag(true);
         let me = Arc::downgrade(self);
+        {
+            let (puncher, slot) = (self.puncher.clone(), crate::punch::watch_slot(self.id));
+            host.on_probing(Arc::new(move |viewer| puncher.probing(viewer, &slot)));
+        }
         host.on_viewer_failed(Arc::new(move |viewer, w, was_up| {
             if let Some(s) = me.upgrade() {
                 s.viewer_failed(viewer, w, was_up);
@@ -525,6 +643,8 @@ impl Session {
             }));
         }
         self.client.send(ClientMsg::Subscribe { streamer, quality });
+        // Punch at once beside the direct try, if the NAT kinds say so.
+        self.punch_for_watch(w.clone(), w.viewer.webrtc(), false, true);
         // Clock sync for latency figures; also notices a closed window.
         let (weak, w2) = (Arc::downgrade(self), w.clone());
         std::thread::spawn(move || {
@@ -924,6 +1044,11 @@ impl Session {
         match host.add_viewer(viewer, out.clone(), want) {
             Ok(()) => {
                 self.state.lock().unwrap().viewers.insert(viewer, out);
+                // Punch at once beside the direct try, if the NAT kinds say so (not for a
+                // branch on a punched hole: `claim_viewer` leaves those).
+                if let (Some(s), Some((w, _))) = (self.me_arc(), host.viewer_connection(viewer)) {
+                    s.punch_for_viewer(viewer, w, false, true);
+                }
                 let _ = self.events.send(Event::ViewerJoined { viewer, quality: want.map(|w| w.clamp_to(host.ceiling())) });
             }
             Err(e) => {

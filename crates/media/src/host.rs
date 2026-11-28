@@ -53,6 +53,8 @@ pub struct Host {
     /// Holes punched for viewers, for their next connection (good for a moment only).
     pinned: Mutex<HashMap<u64, (crate::punch::Pinned, std::time::Instant)>>,
     on_viewer_failed: Arc<Mutex<Option<ViewerFailHook>>>,
+    /// Tells whether a punch with a viewer is probing now (an early one too), for the UI.
+    probing: Mutex<Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>>,
 }
 
 /// The capture failed (its window was closed): the stream cannot go on with it. Told once,
@@ -169,6 +171,10 @@ struct Branch {
     punching: Arc<AtomicBool>,
     /// The viewer's "restart" was taken (once per branch).
     restarted: AtomicBool,
+    /// A failure told while an early punch held `handled` (its `was_up`).
+    missed: Mutex<Option<bool>>,
+    /// Its connection's failure was told (not only an early punch holding it).
+    failure_seen: AtomicBool,
 }
 
 /// Told when the connection `w` with viewer `id` fails (`was_up`: it had worked).
@@ -1087,6 +1093,7 @@ impl Host {
             lost,
             pinned: Mutex::default(),
             on_viewer_failed: Arc::default(),
+            probing: Mutex::default(),
         })
     }
 
@@ -1686,6 +1693,11 @@ impl Host {
         Ok(())
     }
 
+    /// `f(viewer)`: whether a punch with that viewer is probing now (shown as punching).
+    pub fn on_probing(&self, f: Arc<dyn Fn(u64) -> bool + Send + Sync>) {
+        *self.probing.lock().unwrap() = Some(f);
+    }
+
     /// `f(viewer, connection, was_up)` when a connection with a viewer fails.
     pub fn on_viewer_failed(&self, f: ViewerFailHook) {
         *self.on_viewer_failed.lock().unwrap() = Some(f);
@@ -1694,11 +1706,49 @@ impl Host {
     /// Takes the failure of connection `w` with `id` to punch for: its "punching" flag, or
     /// None when `w` is no longer that viewer's connection, its failure is handled already,
     /// or it was on a punched hole already (punching again would go round and round).
-    pub fn claim_viewer(&self, id: u64, w: &gst::Element) -> Option<Arc<AtomicBool>> {
+    /// `note`: a failure's `was_up` (None for an early punch): kept for `unclaim_viewer` when
+    /// another holds the claim, in the same step (the viewers lock).
+    pub fn claim_viewer(&self, id: u64, w: &gst::Element, note: Option<bool>) -> Option<Arc<AtomicBool>> {
         let viewers = self.viewers.lock().unwrap();
         let b = viewers.get(&id).filter(|b| b.webrtc == *w)?;
-        let first = !b.handled.swap(true, Ordering::SeqCst);
-        (first && b.hole.is_none()).then(|| b.punching.clone())
+        if note.is_some() {
+            b.failure_seen.store(true, Ordering::SeqCst);
+        }
+        if b.hole.is_some() {
+            // On a hole already: no punch for it (and no claim, so nothing shows as held).
+            return None;
+        }
+        if b.handled.swap(true, Ordering::SeqCst) {
+            if let Some(was_up) = note {
+                *b.missed.lock().unwrap() = Some(was_up);
+            }
+            return None;
+        }
+        Some(b.punching.clone())
+    }
+
+    /// Gives back the claim on connection `w` with `id` (an early punch was not needed): its
+    /// failure is handled when it comes.
+    /// Returns a failure of it told meanwhile (`note_missed`), to handle now.
+    pub fn unclaim_viewer(&self, id: u64, w: &gst::Element) -> Option<bool> {
+        let viewers = self.viewers.lock().unwrap();
+        let b = viewers.get(&id).filter(|b| b.webrtc == *w)?;
+        b.handled.store(false, Ordering::SeqCst);
+        let missed = b.missed.lock().unwrap().take();
+        missed
+    }
+
+    /// Whether a failure of connection `w` with `id` was noted while held (`claim_viewer`).
+    pub fn missed_noted(&self, id: u64, w: &gst::Element) -> bool {
+        self.viewers.lock().unwrap().get(&id).filter(|b| b.webrtc == *w).is_some_and(|b| b.missed.lock().unwrap().is_some())
+    }
+
+    /// A failure of connection `w` with `id` came while its failure was held (an early
+    /// punch): kept for `unclaim_viewer`.
+    pub fn note_missed(&self, id: u64, w: &gst::Element, was_up: bool) {
+        if let Some(b) = self.viewers.lock().unwrap().get(&id).filter(|b| b.webrtc == *w) {
+            *b.missed.lock().unwrap() = Some(was_up);
+        }
     }
 
     /// The connection with viewer `id` now, and whether it is up.
@@ -1707,6 +1757,16 @@ impl Host {
         let w = self.viewers.lock().unwrap().get(&id).map(|b| b.webrtc.clone())?;
         let up = matches!(w.property::<State>("ice-connection-state"), State::Connected | State::Completed);
         Some((w, up))
+    }
+
+    /// Drops a hole kept for viewer `id` (one it did not use), unless its "restart" was taken
+    /// meanwhile (that one builds the new branch on the hole): checked and done under the
+    /// viewers lock, as `restart_viewer` takes it.
+    pub fn unpin(&self, id: u64, w: &gst::Element) {
+        let viewers = self.viewers.lock().unwrap();
+        if viewers.get(&id).is_some_and(|b| b.webrtc == *w && !b.restarted.load(Ordering::SeqCst)) {
+            self.pinned.lock().unwrap().remove(&id);
+        }
     }
 
     /// Keeps a hole punched for viewer `id` for its next connection (`restart_viewer`).
@@ -1731,7 +1791,12 @@ impl Host {
             // Only after our side of it failed too (and so punched), once per branch: a
             // viewer cannot make us take its branch down again and again.
             // Not while our punch for it runs either (its hole is not kept yet).
-            if !b.handled.load(Ordering::SeqCst) || b.punching.load(Ordering::SeqCst) || b.restarted.swap(true, Ordering::SeqCst) {
+            // And only with a hole kept for it (our punch for it came through): a viewer
+            // cannot make us take a healthy branch down while an early punch holds it.
+            let kept = self.pinned.lock().unwrap().get(&id).is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(15));
+            // (or after a real failure of it, as before: a viewer whose punch came through
+            // while ours did not gets its try).
+            if !b.handled.load(Ordering::SeqCst) || b.punching.load(Ordering::SeqCst) || !(kept || b.failure_seen.load(Ordering::SeqCst)) || b.restarted.swap(true, Ordering::SeqCst) {
                 return Err(format!("viewer {id}: restart refused (not failed here, or done already)"));
             }
             (b.webrtc.clone(), b.want)
@@ -1749,19 +1814,20 @@ impl Host {
         use crate::viewer::Link;
         use gst_webrtc::WebRTCICEConnectionState as State;
         let no_hole = std::env::var_os("STREAMER_DEBUG_LINK_NO_HOLE").is_some();
+        let probing = self.probing.lock().unwrap().clone();
         // The elements' state is read outside the lock (one viewer's busy element must not
         // hold up the others).
-        let branches: Vec<_> = self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone(), b.hole.is_some(), b.punching.clone(), b.handled.clone())).collect();
+        let branches: Vec<_> = self.viewers.lock().unwrap().iter().map(|(id, b)| (*id, b.webrtc.clone(), b.hole.is_some(), b.punching.clone(), b.failure_seen.load(Ordering::SeqCst))).collect();
         branches
             .into_iter()
-            .map(|(id, webrtc, hole, punching, handled)| {
+            .map(|(id, webrtc, hole, punching, failure_seen)| {
                 let state = webrtc.property::<State>("ice-connection-state");
                 let up = matches!(state, State::Connected | State::Completed);
                 let link = if up {
                     if hole && !no_hole { Link::Punched } else { Link::Direct }
-                } else if punching.load(Ordering::SeqCst) {
+                } else if punching.load(Ordering::SeqCst) || probing.as_ref().is_some_and(|f| f(id)) {
                     Link::Punching
-                } else if handled.load(Ordering::SeqCst) || state == State::Failed {
+                } else if failure_seen || state == State::Failed {
                     // Failed, and no punch for it now: nothing more to come for this one.
                     Link::Failed
                 } else {
@@ -1968,6 +2034,8 @@ impl Host {
             handled: Arc::default(),
             punching: Arc::default(),
             restarted: AtomicBool::new(false),
+            missed: Mutex::default(),
+            failure_seen: AtomicBool::new(false),
         };
         // Between the queue and the payloader, so dropped frames leave no gaps in RTP
         // sequence numbers.

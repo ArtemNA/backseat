@@ -67,6 +67,8 @@ pub struct Viewer {
     hole: Mutex<Option<crate::punch::Pinned>>,
     /// The current connection's failure is being (or was) handled.
     handled: std::sync::atomic::AtomicBool,
+    /// A failure of the current connection told while an early punch held `handled`.
+    missed: Mutex<Option<bool>>,
     on_failed: Arc<Mutex<Option<FailHook>>>,
     /// The ICE settings the watch started with.
     ice: crate::config::IceConfig,
@@ -370,6 +372,7 @@ impl Viewer {
             setup,
             hole: Mutex::default(),
             handled: Default::default(),
+            missed: Mutex::default(),
             on_failed,
             ice: cfg.ice.clone(),
             media_came,
@@ -512,6 +515,44 @@ impl Viewer {
         self.media_came.load(Ordering::SeqCst)
     }
 
+    /// A failure of connection `w` came while its failure was held (an early punch): kept
+    /// for `take_missed`.
+    pub fn note_missed(&self, w: &gst::Element, was_up: bool) {
+        let cur = self.webrtc.lock().unwrap();
+        if *cur == *w {
+            *self.missed.lock().unwrap() = Some(was_up);
+        }
+    }
+
+    /// `claim`, or when another holds it, `note_missed` with `note` (its `was_up`) in the same
+    /// step: an early punch giving the claim back (`unclaim_taking_missed`, same lock) always
+    /// sees the note.
+    pub fn claim_or_note(&self, w: &gst::Element, note: Option<bool>) -> bool {
+        let cur = self.webrtc.lock().unwrap();
+        if *cur != *w {
+            return false;
+        }
+        if self.handled.swap(true, Ordering::SeqCst) {
+            if let Some(was_up) = note {
+                *self.missed.lock().unwrap() = Some(was_up);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Whether a failure of the current connection was noted while held.
+    pub fn missed_noted(&self) -> bool {
+        self.missed.lock().unwrap().is_some()
+    }
+
+    /// Gives back the claim and returns a failure noted meanwhile (its `was_up`).
+    pub fn unclaim_taking_missed(&self) -> Option<bool> {
+        let _cur = self.webrtc.lock().unwrap();
+        self.handled.store(false, Ordering::SeqCst);
+        self.missed.lock().unwrap().take()
+    }
+
     /// The current connection is on a punched hole.
     pub fn on_hole(&self) -> bool {
         self.hole.lock().unwrap().is_some()
@@ -551,6 +592,7 @@ impl Viewer {
             let mut cur = self.webrtc.lock().unwrap();
             *self.hole.lock().unwrap() = ice.pinned;
             self.handled.store(false, Ordering::SeqCst);
+            *self.missed.lock().unwrap() = None;
             self.ice_failed.store(false, Ordering::SeqCst);
             self.offered.store(false, Ordering::SeqCst);
             std::mem::replace(&mut *cur, new.clone())

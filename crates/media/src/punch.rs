@@ -152,6 +152,12 @@ fn kind_of(sock: &UdpSocket, rng: &mut Rng) -> Option<Kind> {
     Some(if b != a { Kind::Hard(ip) } else { Kind::Easy(a) })
 }
 
+/// Tests only: STREAMER_DEBUG_NO_MISSED: a failure told while an early punch ran is dropped
+/// (the spoiled variant).
+pub fn missed_off() -> bool {
+    std::env::var_os("STREAMER_DEBUG_NO_MISSED").is_some()
+}
+
 fn info_text(k: Kind) -> String {
     match k {
         Kind::Easy(a) => format!("easy {a}"),
@@ -330,6 +336,11 @@ pub struct Puncher {
     failed: Mutex<HashMap<PeerId, (u32, Instant)>>,
     /// Punches running now: (peer, slot).
     running: Mutex<std::collections::HashSet<(PeerId, String)>>,
+    /// Of those, the early ones; and a failure info that came meanwhile (joined after).
+    early_running: Mutex<std::collections::HashSet<(PeerId, String)>>,
+    join_after: Mutex<std::collections::HashSet<(PeerId, String)>>,
+    /// Of those, the ones probing now (past the NAT kind query).
+    probing: Mutex<std::collections::HashSet<(PeerId, String)>>,
     /// Told when a peer's "info" comes and no punch with it for that slot is running: the
     /// other side's connection failed first, and ours may start punching now instead of
     /// waiting for its own failure (more than INFO_WAIT apart, neither side punched).
@@ -348,7 +359,7 @@ impl Drop for Running<'_> {
 
 impl Puncher {
     pub fn new(me: PeerId, send: Send) -> Arc<Self> {
-        Arc::new(Self { me, send, heard: Mutex::default(), heard_cv: std::sync::Condvar::new(), failed: Mutex::default(), running: Mutex::default(), on_info: Mutex::default() })
+        Arc::new(Self { me, send, heard: Mutex::default(), heard_cv: std::sync::Condvar::new(), failed: Mutex::default(), running: Mutex::default(), early_running: Mutex::default(), join_after: Mutex::default(), probing: Mutex::default(), on_info: Mutex::default() })
     }
 
     /// `f(peer, slot)` when a peer's "info" comes for a slot of `class` ("voice" or "watch")
@@ -359,7 +370,10 @@ impl Puncher {
 
     /// A "p/" message from `from` (the "p/" taken off `kind`): "info:<slot>" or "done:<slot>".
     pub fn on_message(&self, from: PeerId, kind: &str, payload: &str) {
-        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done") && slot_ok(slot, self.me, from));
+        // "early:<slot>": the info of a punch at the start of a connection (`punch_early`),
+        // its own kind: nobody joins it (only "info", a failure, is joined), an early punch
+        // takes only it, and older versions drop it.
+        let known = kind.split_once(':').is_some_and(|(k, slot)| (k == "info" || k == "done" || k == "early") && slot_ok(slot, self.me, from));
         if !known || payload.len() > 100 {
             return;
         }
@@ -375,7 +389,14 @@ impl Puncher {
             let hook = self.on_info.lock().unwrap().get(slot_class(slot)).cloned();
             // STREAMER_DEBUG_PUNCH_NO_JOIN: we wait for our own failure (the spoiled variant).
             let join = std::env::var_os("STREAMER_DEBUG_PUNCH_NO_JOIN").is_none();
-            if let (Some(f), false, true) = (hook, self.busy(from, slot), join) {
+            let key = (from, slot.to_string());
+            if self.busy(from, slot) {
+                // Our early punch for it runs: the other side's direct try failed; join it
+                // once ours ends without a hole.
+                if self.early_running.lock().unwrap().contains(&key) {
+                    self.join_after.lock().unwrap().insert(key);
+                }
+            } else if let (Some(f), true) = (hook, join) {
                 f(from, slot);
             }
         }
@@ -400,6 +421,18 @@ impl Puncher {
         }
     }
 
+    /// Whether `peer` started a punch after a failure for `slot` since `since` (its "info"):
+    /// its connection failed and it got no hole of its own. What ends a wait after our early
+    /// hole (not our own failure: one for an easy + hard pair is expected meanwhile).
+    pub fn failure_info_since(&self, peer: PeerId, slot: &str, since: Instant) -> bool {
+        self.heard.lock().unwrap().get(&(peer, format!("info:{slot}"))).is_some_and(|(_, at)| *at >= since)
+    }
+
+    /// Whether a punch with `peer` for `slot` is probing now (what the UI shows as punching).
+    pub fn probing(&self, peer: PeerId, slot: &str) -> bool {
+        self.probing.lock().unwrap().contains(&(peer, slot.to_string()))
+    }
+
     /// Whether a punch with `peer` for `slot` is running.
     pub fn busy(&self, peer: PeerId, slot: &str) -> bool {
         self.running.lock().unwrap().contains(&(peer, slot.to_string()))
@@ -419,19 +452,56 @@ impl Puncher {
     /// their connection failed). Blocks up to ~25 s; None when it did not work, Busy when one
     /// is running already. The sockets are closed on return, the port is free for the ICE agent.
     pub fn punch(&self, peer: PeerId, slot: &str) -> Result<Option<Pinned>, Busy> {
+        self.punch_with(peer, slot, false)
+    }
+
+    /// A punch at the start of a connection, beside the direct try: the two sides tell each
+    /// other their NAT kinds (a STUN query, about a second) and punch at once only when one
+    /// keeps ports and the other changes them (a direct connection between those almost never
+    /// comes up); else None at once, and the direct try goes on (a punch after it fails is
+    /// still the fallback). Fresh each time: a NAT that became easier gets a direct try.
+    /// STREAMER_DEBUG_PUNCH_NO_EARLY: never (the spoiled variant).
+    pub fn punch_early(&self, peer: PeerId, slot: &str) -> Result<Option<Pinned>, Busy> {
+        if std::env::var_os("STREAMER_DEBUG_PUNCH_NO_EARLY").is_some() {
+            return Ok(None);
+        }
+        self.punch_with(peer, slot, true)
+    }
+
+    fn punch_with(&self, peer: PeerId, slot: &str, early: bool) -> Result<Option<Pinned>, Busy> {
         let key = (peer, slot.to_string());
         if !self.running.lock().unwrap().insert(key.clone()) {
             return Err(Busy);
         }
-        let guard = Running(self, key);
+        let guard = Running(self, key.clone());
         if let Some((n, at)) = self.failed.lock().unwrap().get(&peer).copied() {
             if n >= GIVE_UP_AFTER && at.elapsed() < GIVE_UP_FOR {
                 eprintln!("punch: {slot} with {peer}: not again yet ({n} in a row did not come through)");
                 return Ok(None);
             }
         }
-        let (got, tried) = self.punch_once(peer, slot);
+        if early {
+            self.early_running.lock().unwrap().insert(key.clone());
+            self.join_after.lock().unwrap().remove(&key);
+        }
+        let (got, tried) = self.punch_once(peer, slot, early);
+        // `running` first: an info coming after this is joined at once (not busy); one that
+        // came while it ran was marked in `join_after`.
         drop(guard);
+        let join = early && {
+            self.early_running.lock().unwrap().remove(&key);
+            self.join_after.lock().unwrap().remove(&key)
+        };
+        // A failure info that came while our early punch ran: join it now (on its own thread:
+        // the hook starts the failure handling, which waits for our caller to give the
+        // connection back). With a hole of ours too: the other side has none, and the hook
+        // notes that, so our wait for its new connection ends at once.
+        if join && std::env::var_os("STREAMER_DEBUG_PUNCH_NO_JOIN").is_none() {
+            if let Some(f) = self.on_info.lock().unwrap().get(slot_class(slot)).cloned() {
+                let slot = slot.to_string();
+                std::thread::spawn(move || f(peer, &slot));
+            }
+        }
         let mut f = self.failed.lock().unwrap();
         match got {
             Some(_) => {
@@ -439,7 +509,9 @@ impl Puncher {
             }
             // Only probing that came to nothing counts (not a STUN server or a peer that did
             // not answer: those say nothing about whether a hole can be made).
-            None if tried => {
+            // An early punch does not count: the punch after the failure that may follow is
+            // the real try (else one failed connection would stop punching with this peer).
+            None if tried && !early => {
                 let e = f.entry(peer).or_insert((0, Instant::now()));
                 *e = (e.0 + 1, Instant::now());
             }
@@ -469,7 +541,7 @@ impl Puncher {
     }
 
     /// The hole, and whether probing ran at all.
-    fn punch_once(&self, peer: PeerId, slot: &str) -> (Option<Pinned>, bool) {
+    fn punch_once(&self, peer: PeerId, slot: &str, early: bool) -> (Option<Pinned>, bool) {
         let mut rng = Rng::new();
         // Theirs counts if it came lately: they may have started a moment before us. Older
         // ones are from an earlier round and name a socket long closed.
@@ -479,8 +551,11 @@ impl Puncher {
             eprintln!("punch: {slot} with {peer}: no answer from the STUN servers");
             return (None, false);
         };
-        (self.send)(peer, &format!("info:{slot}"), &info_text(mine));
-        let Some(theirs) = self.wait_for(peer, &format!("info:{slot}"), fresh, INFO_WAIT).and_then(|p| parse_info(&p)) else {
+        let kind = if early { "early" } else { "info" };
+        (self.send)(peer, &format!("{kind}:{slot}"), &info_text(mine));
+        // Each kind waits for its own: a punch after a failure never takes an early info (it
+        // named a socket of an early punch, closed since), nor the other way round.
+        let Some(theirs) = self.wait_for(peer, &format!("{kind}:{slot}"), fresh, INFO_WAIT).and_then(|p| parse_info(&p)) else {
             eprintln!("punch: {slot} with {peer}: the other side did not answer");
             return (None, false);
         };
@@ -492,6 +567,35 @@ impl Puncher {
             eprintln!("punch: {slot} with {peer}: the same public address (one network); no hole to punch");
             return (None, false);
         }
+        let pair = matches!((mine, theirs), (Kind::Easy(_), Kind::Hard(_)) | (Kind::Hard(_), Kind::Easy(_)));
+        if early && !pair {
+            eprintln!("punch: {slot} with {peer}: {} to {}: a direct connection may work; punching only if it fails", kind_name(mine), kind_name(theirs));
+            return (None, false);
+        }
+        if early {
+            eprintln!("punch: {slot} with {peer}: {} to {}: punching at once", kind_name(mine), kind_name(theirs));
+            // Tests only: STREAMER_DEBUG_PUNCH_EARLY_SLOW: probing starts 10 s late (the direct
+            // try fails meanwhile; the early hole must still be used).
+            if std::env::var_os("STREAMER_DEBUG_PUNCH_EARLY_SLOW").is_some() {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            // Tests only: STREAMER_DEBUG_PUNCH_EARLY_FAIL: an early punch that takes 12 s and
+            // brings nothing (the direct try fails meanwhile; the fallback must follow).
+            if std::env::var_os("STREAMER_DEBUG_PUNCH_EARLY_FAIL").is_some() {
+                std::thread::sleep(Duration::from_secs(12));
+                eprintln!("punch: {slot} with {peer}: early punch failed (test)");
+                return (None, false);
+            }
+        }
+        let key = (peer, slot.to_string());
+        self.probing.lock().unwrap().insert(key.clone());
+        struct Probing<'a>(&'a Puncher, (PeerId, String));
+        impl Drop for Probing<'_> {
+            fn drop(&mut self) {
+                self.0.probing.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _probing = Probing(self, key);
         let until = Instant::now() + PUNCH_FOR;
         let t0 = Instant::now();
         let got = match (mine, theirs) {
@@ -510,6 +614,9 @@ impl Puncher {
                 return (None, false);
             }
         };
+        // Tests only: STREAMER_DEBUG_PUNCH_EARLY_DROP: an early hole is dropped here (one side's
+        // early punch came through, ours not).
+        let got = got.filter(|_| !(early && std::env::var_os("STREAMER_DEBUG_PUNCH_EARLY_DROP").is_some()));
         match got {
             Some(p) => eprintln!("punch: {slot} with {peer}: through in {} ms ({:?} to {:?}), local port {}", t0.elapsed().as_millis(), kind_name(mine), kind_name(theirs), p.port),
             None => eprintln!("punch: {slot} with {peer}: nothing came through in {} s ({:?} to {:?})", PUNCH_FOR.as_secs(), kind_name(mine), kind_name(theirs)),
